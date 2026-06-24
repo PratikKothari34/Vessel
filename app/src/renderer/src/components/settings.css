@@ -1,0 +1,28 @@
+.settings-panel { max-width: 560px; }
+
+.settings-status {
+  display: flex; align-items: center; gap: 10px;
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.04em;
+  padding: 12px 16px; border-radius: 8px; margin-bottom: 22px;
+  border: 1px solid var(--line);
+}
+.settings-status .dot { width: 8px; height: 8px; border-radius: 50%; }
+.settings-status.ok { color: var(--ok); background: rgba(127, 191, 127, 0.06); border-color: rgba(127, 191, 127, 0.2); }
+.settings-status.ok .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.settings-status.down { color: var(--danger); background: rgba(213, 106, 90, 0.06); border-color: rgba(213, 106, 90, 0.2); }
+.settings-status.down .dot { background: var(--danger); }
+
+.settings-table { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 24px; }
+.settings-row { display: flex; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.settings-row:last-child { border-bottom: none; }
+.settings-row:nth-child(odd) { background: var(--surface); }
+.settings-key { font-size: 13px; color: var(--text-dim); }
+.settings-val { font-family: var(--font-mono); font-size: 12px; color: var(--text-bright); }
+
+.settings-note { font-size: 13px; color: var(--text-dim); line-height: 1.7; }
+.settings-note p { margin-top: 8px; }
+.settings-note code {
+  font-family: var(--font-mono); font-size: 11.5px;
+  background: var(--ink-850); border: 1px solid var(--line);
+  padding: 1px 6px; border-radius: 4px; color: var(--ember-400);
+}

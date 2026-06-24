@@ -1,0 +1,107 @@
+/* ── App shell + topbar ─────────────────────────────────────────────────── */
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background:
+    linear-gradient(180deg, var(--ink-850), var(--ink-900));
+}
+
+.app-topbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 56px;
+  padding: 0 22px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(10, 10, 17, 0.7);
+  backdrop-filter: blur(12px);
+  flex-shrink: 0;
+  z-index: 20;
+}
+
+.brand { display: flex; align-items: center; gap: 11px; cursor: pointer; }
+.brand-mark {
+  width: 13px; height: 13px; border-radius: 2px;
+  background: var(--ember-600);
+  box-shadow: 0 0 14px var(--ember-glow);
+  transform: rotate(45deg);
+  transition: transform 0.4s var(--ease);
+}
+.brand:hover .brand-mark { transform: rotate(135deg); }
+.brand-name {
+  font-family: var(--font-display);
+  font-size: 21px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-bright);
+}
+.brand-name em { color: var(--ember-500); font-style: normal; font-weight: 500; }
+
+.topbar-spacer { flex: 1; }
+
+.health-pill {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: var(--surface);
+}
+.health-pill .dot { width: 7px; height: 7px; border-radius: 50%; }
+.health-pill.ok .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); animation: pulse-dot 2.4s infinite; }
+.health-pill.down .dot { background: var(--danger); }
+.health-pill.ok { color: var(--text-base); }
+.sync-tag {
+  font-size: 9px; letter-spacing: 0.14em;
+  color: var(--steel-400);
+  border-left: 1px solid var(--line-strong);
+  padding-left: 8px; margin-left: 2px;
+}
+
+.app-body { flex: 1; overflow: hidden; position: relative; }
+
+/* ── Overlay scaffold (editor + settings + memory inspector) ─────────────── */
+.overlay-backdrop {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(5, 5, 9, 0.72);
+  backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 40px;
+  animation: fade 0.2s var(--ease);
+}
+.overlay-panel {
+  width: 100%;
+  background: var(--ink-800);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  box-shadow: 0 40px 120px rgba(0, 0, 0, 0.6), 0 0 0 1px var(--line);
+  max-height: 88vh;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  animation: rise 0.35s var(--ease);
+}
+.overlay-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 22px 26px;
+  border-bottom: 1px solid var(--line);
+}
+.overlay-title { font-family: var(--font-display); font-size: 26px; font-weight: 600; color: var(--text-bright); }
+.overlay-close {
+  width: 34px; height: 34px; border-radius: 50%;
+  border: 1px solid var(--line-strong); background: transparent;
+  color: var(--text-dim); cursor: pointer; font-size: 16px;
+  transition: all 0.2s var(--ease);
+  display: flex; align-items: center; justify-content: center;
+}
+.overlay-close:hover { color: var(--text-bright); border-color: var(--danger); background: rgba(213, 106, 90, 0.1); }
+.overlay-body { padding: 26px; overflow-y: auto; }
+.overlay-foot {
+  display: flex; align-items: center; gap: 12px;
+  padding: 18px 26px;
+  border-top: 1px solid var(--line);
+}

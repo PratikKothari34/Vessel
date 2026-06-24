@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+app/node_modules/
+
+# Env / secrets (Turso URL + auth token live here)
+.env
+.env.local
+app/.env
+
+# Local libSQL database + embedded-replica artifacts
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+data/
+local-replica*
+
+# Build output
+out/
+dist/
+app/out/
+app/dist/
+
+# Logs / OS cruft
+*.log
+.DS_Store
+Thumbs.db
+
+# Claude config (not version-controlled)
+.claude/
