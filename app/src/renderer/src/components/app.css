@@ -98,7 +98,7 @@
   transition: all 0.2s var(--ease);
   display: flex; align-items: center; justify-content: center;
 }
-.overlay-close:hover { color: var(--text-bright); border-color: var(--danger); background: rgba(213, 106, 90, 0.1); }
+.overlay-close:hover { color: var(--text-bright); border-color: var(--danger); background: rgba(255, 180, 171, 0.1); }
 .overlay-body { padding: 26px; overflow-y: auto; }
 .overlay-foot {
   display: flex; align-items: center; gap: 12px;

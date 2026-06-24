@@ -24,7 +24,7 @@
 .mem-snippet {
   display: flex; gap: 12px; align-items: flex-start;
   padding: 12px 14px; border-radius: 6px; margin-bottom: 8px;
-  background: var(--ember-faint); border: 1px solid rgba(244, 126, 31, 0.18);
+  background: var(--ember-faint); border: 1px solid rgba(168, 85, 247, 0.18);
 }
 .mem-score {
   font-family: var(--font-mono); font-size: 11px; font-weight: 600;

@@ -12,8 +12,13 @@ export default function CharacterEditor({ character, onClose, onSave, onDelete }
   const editing = character && character.id;
   const [name, setName] = useState(character?.name || '');
   const [avatar, setAvatar] = useState(character?.avatar || '');
+  const [tagline, setTagline] = useState(character?.tagline || '');
+  const [about, setAbout] = useState(character?.about || '');
   const [persona, setPersona] = useState(character?.persona || '');
   const [greeting, setGreeting] = useState(character?.greeting || '');
+  // chat starters: one per line in the textarea; tags: comma-separated.
+  const [startersText, setStartersText] = useState((character?.chatStarters || []).join('\n'));
+  const [tagsText, setTagsText] = useState((character?.tags || []).join(', '));
   const [sampling, setSampling] = useState(character?.sampling || {});
   const [responseStyle, setResponseStyle] = useState(character?.responseStyle || 'balanced');
   const [saving, setSaving] = useState(false);
@@ -24,8 +29,10 @@ export default function CharacterEditor({ character, onClose, onSave, onDelete }
   const save = async () => {
     if (!name.trim()) { setErr('Name is required.'); return; }
     setSaving(true); setErr(null);
+    const chatStarters = startersText.split('\n').map((s) => s.trim()).filter(Boolean);
+    const tags = tagsText.split(',').map((s) => s.trim()).filter(Boolean);
     try {
-      await onSave({ name, avatar, persona, greeting, sampling, responseStyle });
+      await onSave({ name, avatar, tagline, about, persona, greeting, chatStarters, tags, sampling, responseStyle });
     } catch (e) { setErr(e.message); setSaving(false); }
   };
 
@@ -75,17 +82,43 @@ export default function CharacterEditor({ character, onClose, onSave, onDelete }
             <label className="field-label">Name</label>
             <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Aria Vance" autoFocus />
 
-            <label className="field-label" style={{ marginTop: 18 }}>Persona</label>
+            <label className="field-label" style={{ marginTop: 18 }}>Tagline</label>
+            <input
+              className="input" value={tagline} onChange={(e) => setTagline(e.target.value)}
+              placeholder="Short hook shown on the card. e.g. A billionaire interested in you"
+            />
+
+            <label className="field-label" style={{ marginTop: 18 }}>Tags <span className="field-hint">comma-separated</span></label>
+            <input
+              className="input" value={tagsText} onChange={(e) => setTagsText(e.target.value)}
+              placeholder="Romance, Lifestyle, Drama"
+            />
+
+            <label className="field-label" style={{ marginTop: 18 }}>Persona <span className="field-hint">defines behavior</span></label>
             <textarea
               className="textarea" value={persona} onChange={(e) => setPersona(e.target.value)}
               placeholder="Who is this character? Personality, voice, backstory, quirks, the world they inhabit…"
-              style={{ minHeight: 180 }}
+              style={{ minHeight: 160 }}
+            />
+
+            <label className="field-label" style={{ marginTop: 18 }}>About <span className="field-hint">public blurb, optional</span></label>
+            <textarea
+              className="textarea" value={about} onChange={(e) => setAbout(e.target.value)}
+              placeholder="A short description shown on the character's profile."
+              style={{ minHeight: 70 }}
             />
 
             <label className="field-label" style={{ marginTop: 18 }}>Opening greeting</label>
             <textarea
               className="textarea" value={greeting} onChange={(e) => setGreeting(e.target.value)}
               placeholder='The first line they say when a scenario begins. e.g. "You again."'
+              style={{ minHeight: 80 }}
+            />
+
+            <label className="field-label" style={{ marginTop: 18 }}>Chat starters <span className="field-hint">one per line</span></label>
+            <textarea
+              className="textarea" value={startersText} onChange={(e) => setStartersText(e.target.value)}
+              placeholder={"Suggested openers shown on a new chat.\nWhat's your favorite movie?\nTell me about your day."}
               style={{ minHeight: 90 }}
             />
 

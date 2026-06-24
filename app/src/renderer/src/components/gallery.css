@@ -57,7 +57,13 @@
 }
 .card-tagline {
   font-size: 13px; color: var(--text-dim); line-height: 1.6;
-  min-height: 62px; margin-bottom: 16px;
+  min-height: 48px; margin-bottom: 10px;
+}
+.card-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; min-height: 22px; }
+.card-tag {
+  font-size: 10px; color: var(--ember-400);
+  background: var(--ember-faint); border: 1px solid rgba(168, 85, 247, 0.2);
+  padding: 2px 9px; border-radius: 99px; letter-spacing: 0.02em;
 }
 .card-foot { border-top: 1px solid var(--line); padding-top: 14px; }
 .card-cta {

@@ -9,7 +9,7 @@
 .settings-status .dot { width: 8px; height: 8px; border-radius: 50%; }
 .settings-status.ok { color: var(--ok); background: rgba(127, 191, 127, 0.06); border-color: rgba(127, 191, 127, 0.2); }
 .settings-status.ok .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
-.settings-status.down { color: var(--danger); background: rgba(213, 106, 90, 0.06); border-color: rgba(213, 106, 90, 0.2); }
+.settings-status.down { color: var(--danger); background: rgba(255, 180, 171, 0.06); border-color: rgba(255, 180, 171, 0.2); }
 .settings-status.down .dot { background: var(--danger); }
 
 .settings-table { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 24px; }

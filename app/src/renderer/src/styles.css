@@ -1,58 +1,57 @@
 /* ============================================================================
-   Scenario Chat — "Neon-Noir Dossier"
-   A private terminal for fictional personas. Ink-black depths, ember lamplight,
-   cold steel accents. Cinematic, literary, classified-file precision.
+   Scenario Chat — "Synthetic Narrative"
+   Material-3 dark: violet primary, cyan secondary, amber tertiary, on near-black
+   surfaces. Premium, calm, modern. (Palette adopted from the Stitch design.)
    ============================================================================ */
 
-@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=Geist+Mono:wght@400;500;600&family=Geist:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
 :root {
-  /* ── Ink (backgrounds, depth) ── */
-  --ink-900: #07070b;
-  --ink-850: #0a0a11;
-  --ink-800: #0e0e17;
-  --ink-750: #13131f;
-  --ink-700: #191926;
-  --ink-650: #20202f;
-  --ink-600: #2a2a3c;
+  /* ── Ink / surfaces (near-black, layered) ── */
+  --ink-900: #0c0e12;  /* surface-container-lowest — deepest */
+  --ink-850: #111317;  /* background / surface */
+  --ink-800: #1a1c20;  /* surface-container-low */
+  --ink-750: #1a1d23;  /* surface-card */
+  --ink-700: #1e2024;  /* surface-container */
+  --ink-650: #282a2e;  /* surface-container-high */
+  --ink-600: #333539;  /* surface-container-highest */
 
-  /* ── Ember (primary accent — lamplight) ── */
-  --ember-400: #ffb877;
-  --ember-500: #ff9d4d;
-  --ember-600: #f47e1f;
-  --ember-glow: rgba(244, 126, 31, 0.22);
-  --ember-faint: rgba(244, 126, 31, 0.08);
+  /* ── Violet (primary accent) ── */
+  --ember-400: #ddb7ff;  /* primary (light text/icon on dark) */
+  --ember-500: #c98dff;  /* mid */
+  --ember-600: #b76dff;  /* primary-container (buttons) */
+  --ember-glow: rgba(168, 85, 247, 0.28);
+  --ember-faint: rgba(168, 85, 247, 0.10);
 
-  /* ── Steel (secondary accent — cold) ── */
-  --steel-300: #9fc3d6;
-  --steel-400: #6ba3bf;
-  --steel-500: #4682a0;
+  /* ── Cyan (secondary accent — cold) ── */
+  --steel-300: #a2eeff;
+  --steel-400: #5de6ff;
+  --steel-500: #2fd9f4;
 
   /* ── Text ── */
-  --text-bright: #f5f1ea;
-  --text-base: #cbc6bd;
-  --text-dim: #8b8779;
-  --text-faint: #5a574e;
+  --text-bright: #e2e2e8;  /* on-surface */
+  --text-base: #cfc2d6;    /* on-surface-variant */
+  --text-dim: #94a3b8;     /* text-muted */
+  --text-faint: #6b6473;
 
   /* ── Lines & surfaces ── */
-  --line: rgba(245, 241, 234, 0.07);
-  --line-strong: rgba(245, 241, 234, 0.14);
-  --surface: rgba(245, 241, 234, 0.025);
-  --surface-hi: rgba(245, 241, 234, 0.05);
+  --line: #2d3139;                          /* border-subtle */
+  --line-strong: #4d4354;                   /* outline-variant */
+  --surface: rgba(226, 226, 232, 0.025);
+  --surface-hi: rgba(226, 226, 232, 0.05);
 
   /* ── Status ── */
-  --ok: #7fbf7f;
-  --warn: #e0b252;
-  --danger: #d56a5a;
+  --ok: #7fd1a0;
+  --warn: #fabc4e;   /* tertiary (amber) */
+  --danger: #ffb4ab; /* error */
 
-  /* ── Type ── */
-  --font-display: 'Cormorant Garamond', Georgia, serif;
-  --font-mono: 'Geist Mono', 'SF Mono', monospace;
-  --font-body: 'Geist', -apple-system, sans-serif;
+  /* ── Type (Inter) ── */
+  --font-display: 'Inter', 'Segoe UI', sans-serif;
+  --font-mono: 'Inter', 'Segoe UI', sans-serif;
+  --font-body: 'Inter', 'Segoe UI', sans-serif;
 
   /* ── Motion ── */
   --ease: cubic-bezier(0.22, 1, 0.36, 1);
-  --ease-sharp: cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -63,13 +62,13 @@ body {
   font-family: var(--font-body);
   background: var(--ink-900);
   color: var(--text-base);
-  font-weight: 300;
+  font-weight: 400;
   letter-spacing: 0.01em;
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
 }
 
-/* Atmospheric base: vignette + faint ember pool + film grain */
+/* Atmospheric base: vignette + faint violet pool + film grain */
 body::before {
   content: '';
   position: fixed;
@@ -78,7 +77,7 @@ body::before {
   z-index: 0;
   background:
     radial-gradient(120% 80% at 18% 0%, var(--ember-faint), transparent 55%),
-    radial-gradient(100% 90% at 100% 100%, rgba(70, 130, 160, 0.05), transparent 50%),
+    radial-gradient(100% 90% at 100% 100%, rgba(93, 230, 255, 0.05), transparent 50%),
     radial-gradient(140% 120% at 50% 50%, transparent 40%, rgba(0, 0, 0, 0.55) 100%);
 }
 
@@ -120,16 +119,15 @@ body::after {
 }
 
 .btn {
-  font-family: var(--font-mono);
-  font-size: 11px;
+  font-family: var(--font-body);
+  font-size: 13px;
   font-weight: 500;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  letter-spacing: 0.01em;
   color: var(--text-base);
   background: var(--surface);
   border: 1px solid var(--line-strong);
   padding: 9px 16px;
-  border-radius: 3px;
+  border-radius: 9px;
   cursor: pointer;
   transition: all 0.25s var(--ease);
   display: inline-flex;
@@ -154,7 +152,7 @@ body::after {
 }
 .btn-ghost { background: transparent; border-color: transparent; }
 .btn-ghost:hover { background: var(--surface-hi); border-color: var(--line); }
-.btn-danger:hover { border-color: var(--danger); color: var(--danger); background: rgba(213, 106, 90, 0.08); }
+.btn-danger:hover { border-color: var(--danger); color: var(--danger); background: rgba(255, 180, 171, 0.08); }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .field-label {
@@ -171,11 +169,11 @@ body::after {
   width: 100%;
   font-family: var(--font-body);
   font-size: 14px;
-  font-weight: 300;
+  font-weight: 400;
   color: var(--text-bright);
   background: var(--ink-850);
   border: 1px solid var(--line-strong);
-  border-radius: 4px;
+  border-radius: 9px;
   padding: 12px 14px;
   transition: border-color 0.2s var(--ease), box-shadow 0.2s var(--ease);
   resize: vertical;

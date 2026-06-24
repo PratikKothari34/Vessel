@@ -140,14 +140,17 @@ async function initSchema(db) {
 
 // Additive migrations for existing DBs. Each is guarded so re-running is safe.
 async function runMigrations(db) {
-  // responseStyle on characters (narration vs dialogue control).
   const cols = await db.execute(`PRAGMA table_info(characters);`);
-  const hasStyle = cols.rows.some((r) => r.name === 'response_style');
-  if (!hasStyle) {
-    await db.execute(
-      `ALTER TABLE characters ADD COLUMN response_style TEXT DEFAULT 'balanced';`
-    );
-  }
+  const has = (name) => cols.rows.some((r) => r.name === name);
+  const addCol = async (name, ddl) => { if (!has(name)) await db.execute(`ALTER TABLE characters ADD COLUMN ${ddl};`); };
+
+  // narration vs dialogue control
+  await addCol('response_style', `response_style TEXT DEFAULT 'balanced'`);
+  // c.ai-style profile fields
+  await addCol('tagline', `tagline TEXT DEFAULT ''`);        // short hook under the name
+  await addCol('about', `about TEXT DEFAULT ''`);            // longer public blurb
+  await addCol('chat_starters', `chat_starters TEXT DEFAULT '[]'`); // JSON array of opening prompts
+  await addCol('tags', `tags TEXT DEFAULT '[]'`);           // JSON array of category labels
 }
 
 // Initialise once. On a synced client, pull the remote state before creating

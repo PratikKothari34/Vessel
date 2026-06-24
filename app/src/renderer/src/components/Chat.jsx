@@ -37,9 +37,15 @@ export default function Chat({ character, conversationId, onBack, onConversation
   useEffect(() => { refreshConversations(); }, [refreshConversations]);
 
   // Load the active conversation's turns (with variant metadata on the last one).
+  // Greeting shown as the character's opening line. It's display-only (never a
+  // stored turn), so we prepend it to every view of this character's chats.
+  const greetingMsg = character.greeting
+    ? [{ role: 'assistant', content: character.greeting, greeting: true }]
+    : [];
+
   const loadConversation = useCallback(async (id) => {
     if (!id) {
-      setMessages(character.greeting ? [{ role: 'assistant', content: character.greeting }] : []);
+      setMessages([...greetingMsg]);
       return;
     }
     try {
@@ -52,8 +58,9 @@ export default function Chat({ character, conversationId, onBack, onConversation
         variants: t.variants || null,
         activeIndex: t.activeIndex ?? 0,
       }));
-      setMessages([...archived, ...verbatim]);
+      setMessages([...greetingMsg, ...archived, ...verbatim]);
     } catch { setMessages([]); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [character]);
 
   useEffect(() => {
@@ -168,7 +175,7 @@ export default function Chat({ character, conversationId, onBack, onConversation
     if (streaming) stop();
     setConvId(null);
     onConversation && onConversation(null);
-    setMessages(character.greeting ? [{ role: 'assistant', content: character.greeting }] : []);
+    setMessages([...greetingMsg]);
     setRecalled([]);
     inputRef.current?.focus();
   };
@@ -279,7 +286,10 @@ export default function Chat({ character, conversationId, onBack, onConversation
         </div>
 
         <footer className="chat-input-bar">
-          {!streaming && lastAssistantIndex === messages.length - 1 && messages.length > 0 && (
+          {/* Regenerate only when the last message is a REAL persisted assistant
+              turn (not the display-only greeting). */}
+          {!streaming && lastAssistantIndex === messages.length - 1 &&
+            messages.length > 0 && !messages[lastAssistantIndex].greeting && (
             <button className="btn btn-ghost regen" onClick={() => send(true)} title="Generate another variant">
               ↻ Regenerate
             </button>

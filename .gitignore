@@ -26,5 +26,9 @@ app/dist/
 .DS_Store
 Thumbs.db
 
+# Archives / generated design output (e.g. Stitch UI exports)
+*.zip
+stitch_*/
+
 # Claude config (not version-controlled)
 .claude/

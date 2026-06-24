@@ -1,6 +1,6 @@
 import React from 'react';
 
-// Render roleplay prose: "quoted dialogue" gets ember emphasis, *actions* and
+// Render roleplay prose: "quoted dialogue" gets accent emphasis, *actions* and
 // _narration_ get italic dim styling. Keeps the cinematic feel without a full
 // markdown engine.
 export default function MessageText({ text }) {
