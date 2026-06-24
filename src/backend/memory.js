@@ -195,8 +195,9 @@ async function retrieve(conversationId, queryText, k = RETRIEVE_K) {
   // turns, so pull extra then filter by conversation_id below.
   // NOTE: vector_top_k's k MUST be a literal integer — a bound `?` param is
   // rejected ("third parameter (k) must be a non-negative integer"). fetchK is
-  // an internally-computed int (never user input), so inlining it is safe.
-  const fetchK = Math.max(Math.min(k, 1000) * 8, 32);
+  // never user input; we still coerce to a bounded integer so the inlined value
+  // can only ever be a safe number (defense in depth against SQL injection).
+  const fetchK = Math.trunc(Math.max(Math.min(Number(k) || RETRIEVE_K, 1000) * 8, 32));
 
   const res = await db.execute({
     sql: `
@@ -308,19 +309,6 @@ async function getLastAssistantTurn(conversationId) {
   return row && row.role === 'assistant' ? { id: Number(row.id), content: row.content } : null;
 }
 
-// The user message that prompted the last assistant turn (for re-rolling).
-async function getUserBeforeLastAssistant(conversationId) {
-  const db = await getDb();
-  const res = await db.execute({
-    sql: 'SELECT role, content FROM turns WHERE conversation_id = ? ORDER BY id DESC LIMIT 2',
-    args: [conversationId],
-  });
-  // rows[0] = assistant, rows[1] = the user turn before it.
-  if (res.rows.length >= 2 && res.rows[0].role === 'assistant' && res.rows[1].role === 'user') {
-    return { role: 'user', content: res.rows[1].content };
-  }
-  return null;
-}
 
 // Ensure a turn has at least its current content registered as a variant.
 // (Older turns created before variants existed get back-filled lazily.)
@@ -582,17 +570,11 @@ module.exports = {
   recordRegeneration,
   acquireLock,
   getLastAssistantTurn,
-  getUserBeforeLastAssistant,
   setActiveVariant,
-  getVariants,
   listConversations,
   getConversation,
   setTitle,
   deleteConversation,
-  // exported for testing
-  embed,
-  retrieve,
-  summarize,
   _config: {
     SUMMARIZER_MODEL, SUMMARIZER_NUM_CTX, EMBED_MODEL, EMBED_NUM_GPU,
     VERBATIM_TURNS, SUMMARIZE_THRESHOLD, RETRIEVE_K, RETRIEVE_MIN_SCORE,

@@ -74,11 +74,26 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
 
-  // Open external links in the system browser, not the app window.
+  // Open external links in the system browser — but ONLY safe web schemes, so a
+  // compromised renderer can't trigger file://, javascript:, or app-launch URLs.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    try {
+      const u = new URL(url);
+      if (u.protocol === 'https:' || u.protocol === 'http:') shell.openExternal(url);
+    } catch { /* malformed url — ignore */ }
     return { action: 'deny' };
   });
+
+  // Block the main window from navigating away from the app (defense against a
+  // compromised renderer redirecting to a phishing/remote page).
+  const allowedNav = (url) => {
+    if (isDev && process.env.ELECTRON_RENDERER_URL && url.startsWith(process.env.ELECTRON_RENDERER_URL)) return true;
+    return url.startsWith('file://');
+  };
+  mainWindow.webContents.on('will-navigate', (e, url) => {
+    if (!allowedNav(url)) e.preventDefault();
+  });
+  mainWindow.webContents.on('will-attach-webview', (e) => e.preventDefault());
 
   if (isDev && process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);

@@ -106,24 +106,38 @@ export default function Chat({ character, conversationId, onBack, onConversation
       conversationId: convId || undefined,
       regenerate,
       director: director || undefined,
-      messages: regenerate ? [] : storyText ? [{ role: 'user', content: storyText }] : [{ role: 'user', content: '(continue)' }],
+      // Story turn only when there's real text; director-only & regenerate send none.
+      messages: !regenerate && storyText ? [{ role: 'user', content: storyText }] : [],
     };
+
+    // The conversation id this stream belongs to (may be minted server-side and
+    // arrive via onMeta). Captured here so onDone reloads the RIGHT conversation,
+    // not the stale closure value.
+    let streamConvId = convId;
 
     abortRef.current = streamChat(payload, {
       onMeta: (meta) => {
-        if (meta.conversationId && meta.conversationId !== convId) {
-          setConvId(meta.conversationId);
-          onConversation && onConversation(meta.conversationId);
+        if (meta.conversationId) {
+          streamConvId = meta.conversationId;
+          if (meta.conversationId !== convId) {
+            setConvId(meta.conversationId);
+            onConversation && onConversation(meta.conversationId);
+          }
         }
         setRecalled(meta.recalled || []);
       },
       onToken: (_t, full) => setStreamText(full),
-      onDone: async () => {
+      onDone: async (full) => {
         setStreaming(false);
         setStreamText('');
-        // Reload from server so variant metadata (ids, counts) is authoritative.
-        // For a brand-new conversation, the convId-effect below handles reload.
-        if (convId) await loadConversation(convId);
+        // Optimistic append for a new reply (not regenerate, which updates the
+        // existing bubble in place). Immediately reconciled by the reload below,
+        // which carries authoritative variant ids/counts. The append is the
+        // fallback shown if the reload fails.
+        if (!regenerate && full && full.trim()) {
+          setMessages((m) => [...m, { role: 'assistant', content: full.trim() }]);
+        }
+        if (streamConvId) await loadConversation(streamConvId);
         refreshConversations();
       },
       onError: (msg) => {
@@ -133,12 +147,6 @@ export default function Chat({ character, conversationId, onBack, onConversation
       },
     });
   };
-
-  // After convId is first set by onMeta on a brand-new conversation, reload.
-  useEffect(() => {
-    if (convId && !streaming) loadConversation(convId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [convId]);
 
   const stop = () => { if (abortRef.current) abortRef.current(); setStreaming(false); };
 

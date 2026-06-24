@@ -166,10 +166,16 @@ app.delete('/conversations/:id', async (req, res) => {
 app.post('/chat', async (req, res) => {
   const { messages, conversationId, characterId, regenerate, director } = req.body || {};
   const isRegenerate = Boolean(regenerate);
+  const hasDirector = typeof director === 'string' && director.trim().length > 0;
 
-  if (!Array.isArray(messages) || (messages.length === 0 && !isRegenerate)) {
+  // messages may be empty for a regenerate (re-roll) or a director-only note
+  // (steer + continue without a new user turn). Otherwise require a real message.
+  if (!Array.isArray(messages) || (messages.length === 0 && !isRegenerate && !hasDirector)) {
     return res.status(400).json({ error: 'Invalid input: "messages" must be a non-empty array.' });
   }
+  // A director-only request has no story user turn to record.
+  const directorOnly = hasDirector && !isRegenerate &&
+    !messages.some((m) => m && m.role === 'user' && typeof m.content === 'string' && m.content.trim());
 
   let releaseLock = null;
   let convId = null;
@@ -192,8 +198,10 @@ app.post('/chat', async (req, res) => {
     const directorMsg = buildDirectorMessage(director);
     const leading = [personaMsg, directorMsg].filter(Boolean);
 
-    // Regenerate: keep the assistant turn (we append a variant to it). Rebuild
-    // context up to the user message that prompted it, so the model re-rolls.
+    // Regenerate: keep the assistant turn (we append a variant to it). Build
+    // from the persisted verbatim window, then drop the trailing assistant so the
+    // model re-rolls from the prompting user message. (No incoming turn — the
+    // user message is already in verbatim; passing it again would duplicate it.)
     let contextInput = messages;
     if (isRegenerate) {
       const lastAssistant = await memory.getLastAssistantTurn(convId);
@@ -201,11 +209,11 @@ app.post('/chat', async (req, res) => {
         if (releaseLock) releaseLock();
         return res.status(400).json({ error: 'Nothing to regenerate: this conversation has no previous reply.' });
       }
-      const priorUser = await memory.getUserBeforeLastAssistant(convId);
-      // Exclude the last assistant turn from the rebuilt window by passing the
-      // prior user message as the incoming turn (buildContext appends it once).
-      contextInput = priorUser ? [priorUser] : [];
+      contextInput = [];
     }
+
+    // Director-only: no new user turn — just steer + continue from current state.
+    if (directorOnly) contextInput = [];
 
     const built = await memory.buildContext(convId, contextInput, leading);
     // On regenerate, drop the last assistant turn from the outbound window so the
@@ -215,7 +223,8 @@ app.post('/chat', async (req, res) => {
       if (lastIdx !== -1) built.messages.splice(built.messages.length - 1 - lastIdx, 1);
     }
     outboundMessages = built.messages;
-    latestUser = built.latestUser;
+    // directorOnly has no story user turn to record afterwards.
+    latestUser = directorOnly ? null : built.latestUser;
     retrieved = built.retrieved || [];
 
     if (!outboundMessages.some((m) => m.role !== 'system')) {
