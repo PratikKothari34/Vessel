@@ -23,3 +23,16 @@
 .slider::-webkit-slider-thumb:hover { box-shadow: 0 0 0 6px var(--ember-faint); }
 
 .editor-err { color: var(--danger); font-size: 13px; }
+
+.style-options { display: flex; gap: 8px; }
+.style-opt {
+  flex: 1; display: flex; flex-direction: column; gap: 4px; text-align: left;
+  padding: 11px 12px; border-radius: 8px; cursor: pointer;
+  background: var(--ink-850); border: 1px solid var(--line-strong);
+  transition: all 0.2s var(--ease);
+}
+.style-opt:hover { border-color: var(--steel-500); }
+.style-opt.active { border-color: var(--ember-600); background: var(--ember-faint); }
+.style-opt-t { font-size: 13px; color: var(--text-bright); font-weight: 400; }
+.style-opt-d { font-size: 10.5px; color: var(--text-faint); line-height: 1.4; }
+.style-opt.active .style-opt-t { color: var(--ember-400); }

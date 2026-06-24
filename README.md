@@ -11,6 +11,13 @@ Optional encrypted cloud backup + multi-device sync via [Turso](https://turso.te
   switch between them like character.ai.
 - **Long-term memory** — small fast live window + rolling summary + native vector
   retrieval, so long stories stay coherent without slowing down.
+- **Swipe variants** — regenerate a reply to get alternates; swipe `◀ 2/3 ▶`
+  between them. All variants persist; the one you pick becomes canonical for memory.
+- **Director / OOC mode** — steer the AI with out-of-character instructions
+  (e.g. "focus on dialogue, less narration") via the ◈ toggle or a `//` prefix.
+  Director notes guide behavior but are never written into the story or memory.
+- **Response style** — per-character setting (balanced / dialogue-first /
+  light-narration) to stop the model from only narrating instead of speaking.
 - **Local-first storage** — SQLite (libSQL) on disk; cloud sync is opt-in.
 
 ---

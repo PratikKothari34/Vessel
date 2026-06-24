@@ -99,6 +99,23 @@ async function initSchema(db) {
     `CREATE INDEX IF NOT EXISTS turns_conv_idx ON turns(conversation_id, id);`
   );
 
+  // Swipe variants: alternate generations for an assistant turn. The parent
+  // turns.content always mirrors the ACTIVE variant (so memory reads turns
+  // unchanged). Only the latest assistant turn is regenerated in practice, but
+  // variants persist so you can swipe between them after reopening the chat.
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS variants (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      turn_id    INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+      content    TEXT NOT NULL,
+      is_active  INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+  `);
+  await db.execute(
+    `CREATE INDEX IF NOT EXISTS variants_turn_idx ON variants(turn_id, id);`
+  );
+
   // archive: frozen older turns + embedding for retrieval
   await db.execute(`
     CREATE TABLE IF NOT EXISTS archive (
@@ -117,6 +134,20 @@ async function initSchema(db) {
   await db.execute(
     `CREATE INDEX IF NOT EXISTS archive_vec_idx ON archive(libsql_vector_idx(embedding));`
   );
+
+  await runMigrations(db);
+}
+
+// Additive migrations for existing DBs. Each is guarded so re-running is safe.
+async function runMigrations(db) {
+  // responseStyle on characters (narration vs dialogue control).
+  const cols = await db.execute(`PRAGMA table_info(characters);`);
+  const hasStyle = cols.rows.some((r) => r.name === 'response_style');
+  if (!hasStyle) {
+    await db.execute(
+      `ALTER TABLE characters ADD COLUMN response_style TEXT DEFAULT 'balanced';`
+    );
+  }
 }
 
 // Initialise once. On a synced client, pull the remote state before creating

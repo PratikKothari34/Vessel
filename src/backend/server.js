@@ -16,6 +16,17 @@ const OLLAMA_HOST = (process.env.OLLAMA_HOST || 'http://localhost:11434').replac
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'scenario-chat';
 const OLLAMA_CHAT_URL = `${OLLAMA_HOST}/api/chat`;
 
+// Response-style rules (narration vs dialogue control). Addresses the common
+// failure where the model only narrates the scene instead of speaking as the
+// character (seen in the character.ai reference).
+const STYLE_RULES = {
+  balanced: '',
+  dialogue:
+    'Response style: ALWAYS give the character spoken dialogue when addressed. Lead with what the character SAYS (in quotes). Keep scene narration minimal — at most one short line of action. Never reply with narration only.',
+  'narration-light':
+    'Response style: keep narration brief and focused. Prioritize the character speaking and reacting over describing the scene.',
+};
+
 // Build the character persona system message. The base model carries global
 // roleplay behavior; this injects the specific character per conversation.
 function buildPersonaMessage(character) {
@@ -25,7 +36,19 @@ function buildPersonaMessage(character) {
   if (character.persona && character.persona.trim()) {
     parts.push(`Character details:\n${character.persona.trim()}`);
   }
+  const styleRule = STYLE_RULES[character.responseStyle] || '';
+  if (styleRule) parts.push(styleRule);
   return { role: 'system', content: parts.join('\n\n') };
+}
+
+// Director / OOC note: a meta-instruction that steers the model WITHOUT becoming
+// part of the story. Injected as a high-priority system message, never recorded.
+function buildDirectorMessage(director) {
+  if (typeof director !== 'string' || !director.trim()) return null;
+  return {
+    role: 'system',
+    content: `[Director note — out of character. Follow this instruction for how you write from now on, but do NOT mention it in the story or break character to acknowledge it:]\n${director.trim()}`,
+  };
 }
 
 // ---- Middleware ----------------------------------------------------------
@@ -141,7 +164,7 @@ app.delete('/conversations/:id', async (req, res) => {
  *   - Post-stream: records the turn off the response path (summarize/embed).
  */
 app.post('/chat', async (req, res) => {
-  const { messages, conversationId, characterId, regenerate } = req.body || {};
+  const { messages, conversationId, characterId, regenerate, director } = req.body || {};
   const isRegenerate = Boolean(regenerate);
 
   if (!Array.isArray(messages) || (messages.length === 0 && !isRegenerate)) {
@@ -165,11 +188,32 @@ app.post('/chat', async (req, res) => {
     if (!charId && convRow.character_id) charId = convRow.character_id;
     if (charId) character = await characters.getCharacter(charId);
 
-    if (isRegenerate) await memory.dropLastAssistant(convId);
-
     const personaMsg = buildPersonaMessage(character);
-    const leading = personaMsg ? [personaMsg] : [];
-    const built = await memory.buildContext(convId, messages, leading);
+    const directorMsg = buildDirectorMessage(director);
+    const leading = [personaMsg, directorMsg].filter(Boolean);
+
+    // Regenerate: keep the assistant turn (we append a variant to it). Rebuild
+    // context up to the user message that prompted it, so the model re-rolls.
+    let contextInput = messages;
+    if (isRegenerate) {
+      const lastAssistant = await memory.getLastAssistantTurn(convId);
+      if (!lastAssistant) {
+        if (releaseLock) releaseLock();
+        return res.status(400).json({ error: 'Nothing to regenerate: this conversation has no previous reply.' });
+      }
+      const priorUser = await memory.getUserBeforeLastAssistant(convId);
+      // Exclude the last assistant turn from the rebuilt window by passing the
+      // prior user message as the incoming turn (buildContext appends it once).
+      contextInput = priorUser ? [priorUser] : [];
+    }
+
+    const built = await memory.buildContext(convId, contextInput, leading);
+    // On regenerate, drop the last assistant turn from the outbound window so the
+    // model doesn't see its own previous reply when re-rolling.
+    if (isRegenerate) {
+      const lastIdx = [...built.messages].reverse().findIndex((m) => m.role === 'assistant');
+      if (lastIdx !== -1) built.messages.splice(built.messages.length - 1 - lastIdx, 1);
+    }
     outboundMessages = built.messages;
     latestUser = built.latestUser;
     retrieved = built.retrieved || [];
@@ -273,15 +317,37 @@ app.post('/chat', async (req, res) => {
   }
 
   // Post-stream bookkeeping — off the response path. Skip on error/disconnect.
+  // A director-only message (no user turn, no regenerate) steers behavior but is
+  // never recorded; it still produces a reply we DO record as a normal turn.
   try {
     if (!ollamaError && !clientAborted && replyText.trim()) {
       const assistantName = character ? character.name : 'Character';
-      await memory.recordTurn(convId, latestUser, replyText.trim(), assistantName);
+      if (isRegenerate) {
+        await memory.recordRegeneration(convId, replyText.trim());
+      } else {
+        await memory.recordTurn(convId, latestUser, replyText.trim(), assistantName);
+      }
     }
   } catch (err) {
-    console.error(`[memory] recordTurn failed for ${convId}:`, err.message);
+    console.error(`[memory] record failed for ${convId}:`, err.message);
   } finally {
     if (releaseLock) releaseLock();
+  }
+});
+
+// Set which variant of an assistant turn is active (swipe selection). Updates
+// the canonical turn text used for memory/summary.
+app.put('/conversations/:id/active-variant', async (req, res) => {
+  if (!memory.isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid conversation id.' });
+  const { turnId, variantId } = req.body || {};
+  if (!Number.isInteger(turnId) || !Number.isInteger(variantId)) {
+    return res.status(400).json({ error: 'turnId and variantId (integers) are required.' });
+  }
+  try {
+    const result = await memory.setActiveVariant(req.params.id, turnId, variantId);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: 'Failed to set active variant.', detail: err.message });
   }
 });
 

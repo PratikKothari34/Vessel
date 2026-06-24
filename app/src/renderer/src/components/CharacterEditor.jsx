@@ -15,6 +15,7 @@ export default function CharacterEditor({ character, onClose, onSave, onDelete }
   const [persona, setPersona] = useState(character?.persona || '');
   const [greeting, setGreeting] = useState(character?.greeting || '');
   const [sampling, setSampling] = useState(character?.sampling || {});
+  const [responseStyle, setResponseStyle] = useState(character?.responseStyle || 'balanced');
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -24,7 +25,7 @@ export default function CharacterEditor({ character, onClose, onSave, onDelete }
     if (!name.trim()) { setErr('Name is required.'); return; }
     setSaving(true); setErr(null);
     try {
-      await onSave({ name, avatar, persona, greeting, sampling });
+      await onSave({ name, avatar, persona, greeting, sampling, responseStyle });
     } catch (e) { setErr(e.message); setSaving(false); }
   };
 
@@ -87,6 +88,25 @@ export default function CharacterEditor({ character, onClose, onSave, onDelete }
               placeholder='The first line they say when a scenario begins. e.g. "You again."'
               style={{ minHeight: 90 }}
             />
+
+            <label className="field-label" style={{ marginTop: 18 }}>Response style</label>
+            <div className="style-options">
+              {[
+                { v: 'balanced', t: 'Balanced', d: 'Mix of dialogue & narration' },
+                { v: 'dialogue', t: 'Dialogue-first', d: 'Always speaks; minimal narration' },
+                { v: 'narration-light', t: 'Light narration', d: 'Brief scene-setting' },
+              ].map((o) => (
+                <button
+                  key={o.v}
+                  type="button"
+                  className={`style-opt ${responseStyle === o.v ? 'active' : ''}`}
+                  onClick={() => setResponseStyle(o.v)}
+                >
+                  <span className="style-opt-t">{o.t}</span>
+                  <span className="style-opt-d">{o.d}</span>
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 

@@ -34,6 +34,8 @@ export const api = {
   getConversation: (id) => json('GET', `/conversations/${id}`),
   renameConversation: (id, title) => json('PATCH', `/conversations/${id}`, { title }),
   deleteConversation: (id) => json('DELETE', `/conversations/${id}`),
+  setActiveVariant: (id, turnId, variantId) =>
+    json('PUT', `/conversations/${id}/active-variant`, { turnId, variantId }),
 };
 
 /**

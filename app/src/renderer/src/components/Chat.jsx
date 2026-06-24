@@ -6,6 +6,14 @@ import MemoryInspector from './MemoryInspector.jsx';
 import { relTime } from '../lib/util';
 import './chat.css';
 
+// Recognize an inline OOC/director command: leading "//" or "/ooc ".
+function parseDirector(text) {
+  const t = text.trim();
+  if (t.startsWith('//')) return t.slice(2).trim();
+  if (/^\/ooc\b/i.test(t)) return t.replace(/^\/ooc\b/i, '').trim();
+  return null;
+}
+
 export default function Chat({ character, conversationId, onBack, onConversation, onEditCharacter }) {
   const [convId, setConvId] = useState(conversationId);
   const [messages, setMessages] = useState([]);
@@ -16,6 +24,7 @@ export default function Chat({ character, conversationId, onBack, onConversation
   const [recalled, setRecalled] = useState([]);
   const [showMemory, setShowMemory] = useState(false);
   const [error, setError] = useState(null);
+  const [directorMode, setDirectorMode] = useState(false);
 
   const abortRef = useRef(null);
   const scrollRef = useRef(null);
@@ -25,23 +34,33 @@ export default function Chat({ character, conversationId, onBack, onConversation
     try { setConversations(await api.listConversations(character.id)); } catch { /* ignore */ }
   }, [character.id]);
 
-  // Load conversation list + the active conversation's turns.
   useEffect(() => { refreshConversations(); }, [refreshConversations]);
+
+  // Load the active conversation's turns (with variant metadata on the last one).
+  const loadConversation = useCallback(async (id) => {
+    if (!id) {
+      setMessages(character.greeting ? [{ role: 'assistant', content: character.greeting }] : []);
+      return;
+    }
+    try {
+      const c = await api.getConversation(id);
+      const archived = c.archive.map((t) => ({ role: t.role, content: t.content }));
+      const verbatim = c.verbatim.map((t) => ({
+        role: t.role,
+        content: t.content,
+        turnId: t.turnId,
+        variants: t.variants || null,
+        activeIndex: t.activeIndex ?? 0,
+      }));
+      setMessages([...archived, ...verbatim]);
+    } catch { setMessages([]); }
+  }, [character]);
 
   useEffect(() => {
     setConvId(conversationId);
-    if (conversationId) {
-      api.getConversation(conversationId).then((c) => {
-        const turns = [...c.archive, ...c.verbatim].map((t) => ({ role: t.role, content: t.content }));
-        setMessages(turns);
-      }).catch(() => setMessages([]));
-    } else {
-      // Fresh conversation: seed with the character's greeting.
-      setMessages(character.greeting ? [{ role: 'assistant', content: character.greeting }] : []);
-    }
-  }, [conversationId, character]);
+    loadConversation(conversationId);
+  }, [conversationId, loadConversation]);
 
-  // Autoscroll on new content.
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -49,20 +68,34 @@ export default function Chat({ character, conversationId, onBack, onConversation
 
   const send = (regenerate = false) => {
     if (streaming) return;
-    const text = input.trim();
-    if (!regenerate && !text) return;
+    const raw = input.trim();
+
+    // Director / OOC: either toggle is on, or the message uses a // or /ooc prefix.
+    let director = null;
+    let storyText = raw;
+    if (!regenerate) {
+      const prefixCmd = parseDirector(raw);
+      if (prefixCmd !== null) { director = prefixCmd; storyText = ''; }
+      else if (directorMode) { director = raw; storyText = ''; }
+    }
+
+    if (!regenerate && !director && !storyText) return;
 
     setError(null);
+
     let next = messages;
     if (!regenerate) {
-      next = [...messages, { role: 'user', content: text }];
+      if (director) {
+        // Director note: show a subtle OOC chip, don't add a story user bubble.
+        next = [...messages, { role: 'director', content: director }];
+      } else {
+        next = [...messages, { role: 'user', content: storyText }];
+      }
       setMessages(next);
       setInput('');
+      if (directorMode) setDirectorMode(false);
     } else {
-      // drop last assistant locally for the re-roll
-      next = [...messages];
-      if (next.length && next[next.length - 1].role === 'assistant') next = next.slice(0, -1);
-      setMessages(next);
+      // Regenerate: keep the last assistant bubble; we'll attach a new variant.
     }
 
     setStreaming(true);
@@ -72,7 +105,8 @@ export default function Chat({ character, conversationId, onBack, onConversation
       characterId: character.id,
       conversationId: convId || undefined,
       regenerate,
-      messages: regenerate ? [] : [{ role: 'user', content: text }],
+      director: director || undefined,
+      messages: regenerate ? [] : storyText ? [{ role: 'user', content: storyText }] : [{ role: 'user', content: '(continue)' }],
     };
 
     abortRef.current = streamChat(payload, {
@@ -84,10 +118,12 @@ export default function Chat({ character, conversationId, onBack, onConversation
         setRecalled(meta.recalled || []);
       },
       onToken: (_t, full) => setStreamText(full),
-      onDone: (full) => {
+      onDone: async () => {
         setStreaming(false);
         setStreamText('');
-        if (full.trim()) setMessages((m) => [...m, { role: 'assistant', content: full.trim() }]);
+        // Reload from server so variant metadata (ids, counts) is authoritative.
+        // For a brand-new conversation, the convId-effect below handles reload.
+        if (convId) await loadConversation(convId);
         refreshConversations();
       },
       onError: (msg) => {
@@ -98,7 +134,27 @@ export default function Chat({ character, conversationId, onBack, onConversation
     });
   };
 
+  // After convId is first set by onMeta on a brand-new conversation, reload.
+  useEffect(() => {
+    if (convId && !streaming) loadConversation(convId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [convId]);
+
   const stop = () => { if (abortRef.current) abortRef.current(); setStreaming(false); };
+
+  const swipeVariant = async (msgIndex, dir) => {
+    const msg = messages[msgIndex];
+    if (!msg.variants || !msg.turnId) return;
+    const newIdx = msg.activeIndex + dir;
+    if (newIdx < 0 || newIdx >= msg.variants.length) return;
+    const variant = msg.variants[newIdx];
+    try {
+      await api.setActiveVariant(convId, msg.turnId, variant.id);
+      setMessages((ms) => ms.map((m, i) =>
+        i === msgIndex ? { ...m, content: variant.content, activeIndex: newIdx } : m
+      ));
+    } catch (e) { setError(e.message); }
+  };
 
   const newConversation = () => {
     if (streaming) stop();
@@ -109,10 +165,7 @@ export default function Chat({ character, conversationId, onBack, onConversation
     inputRef.current?.focus();
   };
 
-  const openConversation = (id) => {
-    if (streaming) stop();
-    onConversation && onConversation(id);
-  };
+  const openConversation = (id) => { if (streaming) stop(); onConversation && onConversation(id); };
 
   const deleteConv = async (e, id) => {
     e.stopPropagation();
@@ -125,9 +178,15 @@ export default function Chat({ character, conversationId, onBack, onConversation
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   };
 
+  const lastAssistantIndex = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === 'assistant') return i;
+    return -1;
+  })();
+
+  const directorActive = directorMode || parseDirector(input) !== null;
+
   return (
     <div className="chat-layout">
-      {/* ── History sidebar ── */}
       <aside className="chat-rail">
         <button className="rail-back btn btn-ghost" onClick={onBack}>← All characters</button>
 
@@ -145,11 +204,7 @@ export default function Chat({ character, conversationId, onBack, onConversation
           <p className="kicker rail-list-head">Scenarios</p>
           {conversations.length === 0 && <p className="rail-empty">No saved scenarios.</p>}
           {conversations.map((c) => (
-            <div
-              key={c.id}
-              className={`rail-item ${c.id === convId ? 'active' : ''}`}
-              onClick={() => openConversation(c.id)}
-            >
+            <div key={c.id} className={`rail-item ${c.id === convId ? 'active' : ''}`} onClick={() => openConversation(c.id)}>
               <div className="rail-item-main">
                 <span className="rail-item-title">{c.title || 'Untitled scenario'}</span>
                 <span className="rail-item-preview">{c.preview || '…'}</span>
@@ -163,36 +218,50 @@ export default function Chat({ character, conversationId, onBack, onConversation
         </div>
       </aside>
 
-      {/* ── Conversation column ── */}
       <section className="chat-main">
         <header className="chat-head">
           <div className="chat-head-title">
             <Avatar character={character} size={32} />
             <span>{character.name}</span>
           </div>
-          <button className="btn btn-ghost" onClick={() => setShowMemory(true)} disabled={!convId}>
-            ◆ Memory
-          </button>
+          <button className="btn btn-ghost" onClick={() => setShowMemory(true)} disabled={!convId}>◆ Memory</button>
         </header>
 
         <div className="chat-stream" ref={scrollRef}>
           <div className="stream-inner">
-            {messages.map((m, i) => (
-              <div key={i} className={`msg-row ${m.role}`} style={{ animationDelay: `${Math.min(i, 6) * 30}ms` }}>
-                {m.role === 'assistant' && <Avatar character={character} size={36} />}
-                <div className={`bubble ${m.role}`}>
-                  <MessageText text={m.content} />
+            {messages.map((m, i) => {
+              if (m.role === 'director') {
+                return (
+                  <div key={i} className="director-chip">
+                    <span className="director-tag">Director</span>
+                    {m.content}
+                  </div>
+                );
+              }
+              const isLastAssistant = i === lastAssistantIndex;
+              const hasVariants = isLastAssistant && m.variants && m.variants.length > 1;
+              return (
+                <div key={i} className={`msg-row ${m.role}`} style={{ animationDelay: `${Math.min(i, 6) * 30}ms` }}>
+                  {m.role === 'assistant' && <Avatar character={character} size={36} />}
+                  <div className={`bubble ${m.role}`}>
+                    <MessageText text={m.content} />
+                    {hasVariants && (
+                      <div className="variant-bar">
+                        <button className="variant-arrow" disabled={m.activeIndex === 0 || streaming} onClick={() => swipeVariant(i, -1)}>◀</button>
+                        <span className="variant-count">{m.activeIndex + 1} / {m.variants.length}</span>
+                        <button className="variant-arrow" disabled={m.activeIndex === m.variants.length - 1 || streaming} onClick={() => swipeVariant(i, 1)}>▶</button>
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
 
             {streaming && (
               <div className="msg-row assistant">
                 <Avatar character={character} size={36} />
                 <div className="bubble assistant">
-                  {streamText ? <MessageText text={streamText} /> : (
-                    <div className="typing"><span /><span /><span /></div>
-                  )}
+                  {streamText ? <MessageText text={streamText} /> : <div className="typing"><span /><span /><span /></div>}
                 </div>
               </div>
             )}
@@ -202,16 +271,25 @@ export default function Chat({ character, conversationId, onBack, onConversation
         </div>
 
         <footer className="chat-input-bar">
-          {!streaming && messages.length > 0 && messages[messages.length - 1].role === 'assistant' && (
-            <button className="btn btn-ghost regen" onClick={() => send(true)} title="Regenerate last reply">
+          {!streaming && lastAssistantIndex === messages.length - 1 && messages.length > 0 && (
+            <button className="btn btn-ghost regen" onClick={() => send(true)} title="Generate another variant">
               ↻ Regenerate
             </button>
           )}
-          <div className="input-wrap">
+          <div className={`input-wrap ${directorActive ? 'director' : ''}`}>
+            <button
+              className={`director-toggle ${directorActive ? 'on' : ''}`}
+              onClick={() => setDirectorMode((v) => !v)}
+              title="Director mode — give the AI an out-of-character instruction (or type // before your message)"
+            >
+              ◈
+            </button>
             <textarea
               ref={inputRef}
               className="chat-input"
-              placeholder={`Write the next moment with ${character.name}…`}
+              placeholder={directorActive
+                ? 'Director note to the AI (out of character)…'
+                : `Write the next moment with ${character.name}…  (// for director)`}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKey}

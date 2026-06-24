@@ -295,18 +295,92 @@ function alreadyLast(verbatim, msg) {
   return last && last.role === msg.role && last.content === msg.content;
 }
 
-// Remove the most recent assistant turn (regenerate/rephrase).
-async function dropLastAssistant(conversationId) {
+// ---- Variants (swipe between alternate generations) ---------------------
+
+// The last assistant turn row, or null.
+async function getLastAssistantTurn(conversationId) {
   const db = await getDb();
   const res = await db.execute({
-    sql: 'SELECT id, role FROM turns WHERE conversation_id = ? ORDER BY id DESC LIMIT 1',
+    sql: 'SELECT id, role, content FROM turns WHERE conversation_id = ? ORDER BY id DESC LIMIT 1',
     args: [conversationId],
   });
-  if (res.rows.length && res.rows[0].role === 'assistant') {
-    await db.execute({ sql: 'DELETE FROM turns WHERE id = ?', args: [res.rows[0].id] });
-    return true;
+  const row = res.rows[0];
+  return row && row.role === 'assistant' ? { id: Number(row.id), content: row.content } : null;
+}
+
+// The user message that prompted the last assistant turn (for re-rolling).
+async function getUserBeforeLastAssistant(conversationId) {
+  const db = await getDb();
+  const res = await db.execute({
+    sql: 'SELECT role, content FROM turns WHERE conversation_id = ? ORDER BY id DESC LIMIT 2',
+    args: [conversationId],
+  });
+  // rows[0] = assistant, rows[1] = the user turn before it.
+  if (res.rows.length >= 2 && res.rows[0].role === 'assistant' && res.rows[1].role === 'user') {
+    return { role: 'user', content: res.rows[1].content };
   }
-  return false;
+  return null;
+}
+
+// Ensure a turn has at least its current content registered as a variant.
+// (Older turns created before variants existed get back-filled lazily.)
+async function ensureBaseVariant(turnId, content) {
+  const db = await getDb();
+  const have = await db.execute({ sql: 'SELECT COUNT(*) AS n FROM variants WHERE turn_id = ?', args: [turnId] });
+  if (Number(have.rows[0].n) === 0) {
+    await db.execute({
+      sql: 'INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 1, ?)',
+      args: [turnId, content, nowIso()],
+    });
+  }
+}
+
+// Append a new variant to an assistant turn, make it active, and mirror it into
+// turns.content (so memory/summary read the chosen text). Returns variant info.
+async function appendVariant(turnId, content) {
+  const db = await getDb();
+  await ensureBaseVariant(turnId, content); // no-op if base already exists
+  await db.execute({
+    sql: 'INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 0, ?)',
+    args: [turnId, content, nowIso()],
+  });
+  // Activate the just-inserted variant (highest id for this turn).
+  const last = await db.execute({
+    sql: 'SELECT id FROM variants WHERE turn_id = ? ORDER BY id DESC LIMIT 1', args: [turnId],
+  });
+  const variantId = Number(last.rows[0].id);
+  await db.execute({ sql: 'UPDATE variants SET is_active = 0 WHERE turn_id = ?', args: [turnId] });
+  await db.execute({ sql: 'UPDATE variants SET is_active = 1 WHERE id = ?', args: [variantId] });
+  await db.execute({ sql: 'UPDATE turns SET content = ? WHERE id = ?', args: [content, turnId] });
+  return variantId;
+}
+
+// Pick which variant of a turn is active. Mirrors its text into turns.content.
+async function setActiveVariant(conversationId, turnId, variantId) {
+  const db = await getDb();
+  // Validate the variant belongs to a turn in this conversation.
+  const v = await db.execute({
+    sql: `SELECT v.content FROM variants v JOIN turns t ON t.id = v.turn_id
+          WHERE v.id = ? AND v.turn_id = ? AND t.conversation_id = ?`,
+    args: [variantId, turnId, conversationId],
+  });
+  if (!v.rows.length) throw new Error('Variant not found for this conversation/turn.');
+  await db.execute({ sql: 'UPDATE variants SET is_active = 0 WHERE turn_id = ?', args: [turnId] });
+  await db.execute({ sql: 'UPDATE variants SET is_active = 1 WHERE id = ?', args: [variantId] });
+  await db.execute({ sql: 'UPDATE turns SET content = ? WHERE id = ?', args: [v.rows[0].content, turnId] });
+  return { turnId, variantId, content: v.rows[0].content };
+}
+
+// All variants for a turn, oldest first, with the active index.
+async function getVariants(turnId) {
+  const db = await getDb();
+  const res = await db.execute({
+    sql: 'SELECT id, content, is_active FROM variants WHERE turn_id = ? ORDER BY id ASC',
+    args: [turnId],
+  });
+  const list = res.rows.map((r) => ({ id: Number(r.id), content: r.content, active: Boolean(r.is_active) }));
+  const activeIndex = Math.max(0, list.findIndex((v) => v.active));
+  return { variants: list, activeIndex };
 }
 
 // ---- Post-turn bookkeeping ----------------------------------------------
@@ -329,6 +403,15 @@ async function recordTurn(conversationId, userMessage, assistantReply, assistant
   await db.execute({
     sql: 'INSERT INTO turns (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)',
     args: [conversationId, 'assistant', assistantReply, nowIso()],
+  });
+  // Register this reply as the turn's first (active) variant so swiping works.
+  const newTurn = await db.execute({
+    sql: 'SELECT id FROM turns WHERE conversation_id = ? AND role = ? ORDER BY id DESC LIMIT 1',
+    args: [conversationId, 'assistant'],
+  });
+  await db.execute({
+    sql: 'INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 1, ?)',
+    args: [Number(newTurn.rows[0].id), assistantReply, nowIso()],
   });
   await touchConversation(conversationId);
 
@@ -390,6 +473,17 @@ async function recordTurn(conversationId, userMessage, assistantReply, assistant
   return { archived, summarized: true };
 }
 
+// Record a regenerated reply: append it as a new variant of the LAST assistant
+// turn (no new turn, no re-archiving). Returns the turn + variant ids, or null
+// if there's no assistant turn to regenerate.
+async function recordRegeneration(conversationId, assistantReply) {
+  const last = await getLastAssistantTurn(conversationId);
+  if (!last) return null;
+  const variantId = await appendVariant(last.id, assistantReply);
+  await touchConversation(conversationId);
+  return { turnId: last.id, variantId };
+}
+
 // ---- Read-only introspection (UI sidebar + memory inspector) -------------
 
 async function listConversations(characterId = null) {
@@ -423,7 +517,26 @@ async function getConversation(id) {
   const c = await db.execute({ sql: 'SELECT * FROM conversations WHERE id = ?', args: [id] });
   if (!c.rows.length) return null;
   const row = c.rows[0];
-  const verbatim = await getVerbatim(id);
+  // Verbatim turns WITH ids, so the UI can swipe variants on the last assistant.
+  const vres = await db.execute({
+    sql: 'SELECT id, role, content FROM turns WHERE conversation_id = ? ORDER BY id ASC',
+    args: [id],
+  });
+  const verbatim = [];
+  const lastAssistant = await getLastAssistantTurn(id);
+  for (const t of vres.rows) {
+    const turn = { turnId: Number(t.id), role: t.role, content: t.content };
+    // Attach variants only to the latest assistant turn (the swipeable one).
+    if (lastAssistant && Number(t.id) === lastAssistant.id) {
+      const v = await getVariants(lastAssistant.id);
+      if (v.variants.length > 1) {
+        turn.variants = v.variants;
+        turn.activeIndex = v.activeIndex;
+      }
+    }
+    verbatim.push(turn);
+  }
+
   const arch = await db.execute({
     sql: `SELECT role, content, embedding IS NOT NULL AS has_embedding
           FROM archive WHERE conversation_id = ? ORDER BY id ASC`,
@@ -466,8 +579,12 @@ module.exports = {
   ensureConversation,
   buildContext,
   recordTurn,
+  recordRegeneration,
   acquireLock,
-  dropLastAssistant,
+  getLastAssistantTurn,
+  getUserBeforeLastAssistant,
+  setActiveVariant,
+  getVariants,
   listConversations,
   getConversation,
   setTitle,

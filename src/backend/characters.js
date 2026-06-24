@@ -39,6 +39,11 @@ function cleanSampling(s) {
   return out;
 }
 
+const RESPONSE_STYLES = ['balanced', 'dialogue', 'narration-light'];
+function cleanStyle(s) {
+  return RESPONSE_STYLES.includes(s) ? s : 'balanced';
+}
+
 function rowToCharacter(row) {
   let sampling = {};
   try { sampling = JSON.parse(row.sampling || '{}'); } catch { /* default {} */ }
@@ -49,6 +54,7 @@ function rowToCharacter(row) {
     persona: row.persona || '',
     greeting: row.greeting || '',
     sampling,
+    responseStyle: cleanStyle(row.response_style),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -67,19 +73,19 @@ async function getCharacter(id) {
   return res.rows.length ? rowToCharacter(res.rows[0]) : null;
 }
 
-async function createCharacter({ name, avatar, persona, greeting, sampling }) {
+async function createCharacter({ name, avatar, persona, greeting, sampling, responseStyle }) {
   const clean = String(name || '').trim();
   if (!clean) throw new Error('Character name is required.');
   const db = await getDb();
   const id = newId();
   const ts = nowIso();
   await db.execute({
-    sql: `INSERT INTO characters (id, name, avatar, persona, greeting, sampling, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    sql: `INSERT INTO characters (id, name, avatar, persona, greeting, sampling, response_style, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       id, clean.slice(0, 120), String(avatar || ''),
       String(persona || ''), String(greeting || ''),
-      JSON.stringify(cleanSampling(sampling)), ts, ts,
+      JSON.stringify(cleanSampling(sampling)), cleanStyle(responseStyle), ts, ts,
     ],
   });
   return getCharacter(id);
@@ -95,15 +101,16 @@ async function updateCharacter(id, patch) {
     persona: patch.persona != null ? String(patch.persona) : existing.persona,
     greeting: patch.greeting != null ? String(patch.greeting) : existing.greeting,
     sampling: patch.sampling != null ? cleanSampling(patch.sampling) : existing.sampling,
+    responseStyle: patch.responseStyle != null ? cleanStyle(patch.responseStyle) : existing.responseStyle,
   };
   if (!merged.name) throw new Error('Character name is required.');
   const db = await getDb();
   await db.execute({
-    sql: `UPDATE characters SET name=?, avatar=?, persona=?, greeting=?, sampling=?, updated_at=?
+    sql: `UPDATE characters SET name=?, avatar=?, persona=?, greeting=?, sampling=?, response_style=?, updated_at=?
           WHERE id=?`,
     args: [
       merged.name, merged.avatar, merged.persona, merged.greeting,
-      JSON.stringify(merged.sampling), nowIso(), id,
+      JSON.stringify(merged.sampling), merged.responseStyle, nowIso(), id,
     ],
   });
   return getCharacter(id);
