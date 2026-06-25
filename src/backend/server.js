@@ -409,7 +409,13 @@ function killProcessOnPort(port) {
   }
 }
 
-function listen(retried = false) {
+// A few bind attempts with backoff. One retry is enough for a plain stale
+// listener, but under `node --watch` a restart can race the OLD child: it is
+// still releasing the port when the new child tries to bind. Killing it and
+// retrying a couple more times reliably reclaims the port across that window.
+const MAX_BIND_ATTEMPTS = 4;
+
+function listen(attempt = 0) {
   const server = app.listen(PORT, '127.0.0.1', () => {
     console.log(`Scenario_Chat backend on http://localhost:${PORT}`);
     console.log(`  -> ollama: ${OLLAMA_CHAT_URL} | model: ${OLLAMA_MODEL}`);
@@ -417,10 +423,10 @@ function listen(retried = false) {
     console.log(`  -> memory: summarizer=${memory._config.SUMMARIZER_MODEL}, embedder=${memory._config.EMBED_MODEL}`);
   });
   server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE' && !retried) {
-      console.warn(`Port ${PORT} in use — clearing stale listener and retrying...`);
+    if (err.code === 'EADDRINUSE' && attempt < MAX_BIND_ATTEMPTS - 1) {
+      console.warn(`Port ${PORT} in use — clearing stale listener and retrying (attempt ${attempt + 1}/${MAX_BIND_ATTEMPTS})...`);
       killProcessOnPort(PORT);
-      setTimeout(() => listen(true), 400);
+      setTimeout(() => listen(attempt + 1), 300 * (attempt + 1));
       return;
     }
     console.error('Backend server error:', err.message);
