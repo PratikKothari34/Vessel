@@ -9,7 +9,13 @@ import React from 'react';
 export default function MessageText({ text }) {
   // Split into paragraphs on one-or-more blank lines; drop empty blocks so the
   // model emitting \n\n\n doesn't create oversized gaps.
-  const blocks = String(text || '').split(/\n[ \t]*\n+/).map((b) => b.trim()).filter(Boolean);
+  const rawBlocks = String(text || '').split(/\n[ \t]*\n+/).map((b) => b.trim()).filter(Boolean);
+
+  // Hard guarantee: the 8B model sometimes packs several sentences into one
+  // block with no blank line. Force-split any over-long block at sentence
+  // boundaries so the reply always reads as spaced paragraphs, regardless of
+  // what the model emitted.
+  const blocks = rawBlocks.flatMap(splitLongBlock);
 
   return (
     <div className="msg-text">
@@ -20,6 +26,51 @@ export default function MessageText({ text }) {
       ))}
     </div>
   );
+}
+
+// Force-split an over-long block into shorter paragraphs at sentence boundaries.
+// A block is left untouched if it's short or already contains its own line
+// breaks (the model deliberately formatted it). Sentence ends are only honored
+// when they fall OUTSIDE "quotes" and *action* spans, so dialogue/actions never
+// get torn apart. Sentences are then grouped 2-at-a-time into paragraphs.
+function splitLongBlock(block) {
+  const SOFT_LEN = 240; // chars; below this, leave it alone
+  if (block.length <= SOFT_LEN || block.includes('\n')) return [block];
+
+  // Walk the block, tracking quote/asterisk/underscore depth, and cut after a
+  // sentence terminator only when we're not inside a span.
+  const sentences = [];
+  let start = 0;
+  let inQuote = false;
+  let inStar = false;
+  let inUnder = false;
+  for (let i = 0; i < block.length; i++) {
+    const ch = block[i];
+    if (ch === '"') inQuote = !inQuote;
+    else if (ch === '*' && !inQuote) inStar = !inStar;
+    else if (ch === '_' && !inQuote) inUnder = !inUnder;
+    const open = inQuote || inStar || inUnder;
+    if (!open && (ch === '.' || ch === '!' || ch === '?')) {
+      // consume any run of terminators/closing quote, require a following space
+      let j = i;
+      while (j + 1 < block.length && '.!?"’”'.includes(block[j + 1])) j++;
+      if (j + 1 >= block.length || block[j + 1] === ' ') {
+        sentences.push(block.slice(start, j + 1).trim());
+        start = j + 1;
+        i = j;
+      }
+    }
+  }
+  if (start < block.length) sentences.push(block.slice(start).trim());
+  const clean = sentences.filter(Boolean);
+  if (clean.length <= 1) return [block]; // nothing safe to split on
+
+  // Group two sentences per paragraph so beats stay tight but not choppy.
+  const out = [];
+  for (let i = 0; i < clean.length; i += 2) {
+    out.push(clean.slice(i, i + 2).join(' '));
+  }
+  return out;
 }
 
 // Tokenize a block on quotes and *...* / _..._ spans, preserving single newlines
