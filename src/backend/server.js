@@ -36,6 +36,12 @@ function buildPersonaMessage(character) {
   if (character.persona && character.persona.trim()) {
     parts.push(`Character details:\n${character.persona.trim()}`);
   }
+  // The single most common failure is the model speaking/acting FOR the user.
+  // State the boundary concretely with the character's name — far more reliable
+  // than the abstract global rule alone.
+  parts.push(
+    `Control ONLY ${character.name}. You write ${character.name}'s words, actions, thoughts, and reactions — nothing else. Never write what the user does, says, thinks, or feels: do not describe the user's body, gaze, sensations, or emotions ("a shiver runs down your spine", "you can't look away", "you feel...") — those are the user's to write, not yours. Describe only what ${character.name} perceives and does. End every reply at a point that hands control back to the user, then stop and wait for their response.`,
+  );
   const styleRule = STYLE_RULES[character.responseStyle] || '';
   if (styleRule) parts.push(styleRule);
   return { role: 'system', content: parts.join('\n\n') };
