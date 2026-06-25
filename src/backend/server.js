@@ -19,12 +19,20 @@ const OLLAMA_CHAT_URL = `${OLLAMA_HOST}/api/chat`;
 // Response-style rules (narration vs dialogue control). Addresses the common
 // failure where the model only narrates the scene instead of speaking as the
 // character (seen in the character.ai reference).
+// FORMAT_RULE is appended to EVERY persona message (all styles). The Modelfile
+// SYSTEM also asks for paragraphs, but that instruction sits far from the point
+// of generation and the model dilutes it; restating it concretely in the
+// per-character system message — which lands right before the turn — is what
+// actually makes the model break replies into spaced paragraphs.
+const FORMAT_RULE =
+  'Formatting (REQUIRED): write your reply as 2-4 SHORT paragraphs, each separated by a BLANK LINE. Never answer in a single block. Put spoken dialogue ("in quotes") on its own paragraph, and put actions/narration in separate paragraphs around it. This applies to every reply, even short ones.';
+
 const STYLE_RULES = {
   balanced: '',
   dialogue:
-    'Response style: ALWAYS give the character spoken dialogue when addressed, on its own paragraph. Lead with what the character SAYS (in quotes). Keep narration to a short paragraph of action around the dialogue. Never reply with narration only.',
+    'Response style: ALWAYS give the character spoken dialogue when addressed. Lead with what the character SAYS (in quotes) on its own paragraph. Surround it with short separate paragraphs of action/reaction. Never reply with narration only.',
   'narration-light':
-    'Response style: keep narration brief and focused. Prioritize the character speaking and reacting over describing the scene, while still breaking the reply into a few short paragraphs.',
+    'Response style: keep narration brief and focused. Prioritize the character speaking and reacting over describing the scene.',
 };
 
 // Build the character persona system message. The base model carries global
@@ -44,6 +52,7 @@ function buildPersonaMessage(character) {
   );
   const styleRule = STYLE_RULES[character.responseStyle] || '';
   if (styleRule) parts.push(styleRule);
+  parts.push(FORMAT_RULE);
   return { role: 'system', content: parts.join('\n\n') };
 }
 
