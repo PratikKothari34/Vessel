@@ -22,9 +22,9 @@ const OLLAMA_CHAT_URL = `${OLLAMA_HOST}/api/chat`;
 const STYLE_RULES = {
   balanced: '',
   dialogue:
-    'Response style: ALWAYS give the character spoken dialogue when addressed. Lead with what the character SAYS (in quotes). Keep scene narration minimal — at most one short line of action. Never reply with narration only.',
+    'Response style: ALWAYS give the character spoken dialogue when addressed, on its own paragraph. Lead with what the character SAYS (in quotes). Keep narration to a short paragraph of action around the dialogue. Never reply with narration only.',
   'narration-light':
-    'Response style: keep narration brief and focused. Prioritize the character speaking and reacting over describing the scene.',
+    'Response style: keep narration brief and focused. Prioritize the character speaking and reacting over describing the scene, while still breaking the reply into a few short paragraphs.',
 };
 
 // Build the character persona system message. The base model carries global

@@ -84,7 +84,7 @@
   color: var(--text-bright);
 }
 
-.msg-text p { margin: 0 0 0.5em; }
+.msg-text p { margin: 0 0 0.9em; }
 .msg-text p:last-child { margin-bottom: 0; }
 .rp-dialogue { color: var(--ember-400); font-weight: 400; }
 .rp-action { color: var(--text-dim); font-style: italic; }
