@@ -309,7 +309,6 @@ async function getLastAssistantTurn(conversationId) {
   return row && row.role === 'assistant' ? { id: Number(row.id), content: row.content } : null;
 }
 
-
 // Ensure a turn has at least its current content registered as a variant.
 // (Older turns created before variants existed get back-filled lazily.)
 async function ensureBaseVariant(turnId, content) {

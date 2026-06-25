@@ -33,6 +33,9 @@ export default function CharacterEditor({ character, onClose, onSave, onDelete }
     const tags = tagsText.split(',').map((s) => s.trim()).filter(Boolean);
     try {
       await onSave({ name, avatar, tagline, about, persona, greeting, chatStarters, tags, sampling, responseStyle });
+      // On success the parent unmounts this editor; reset anyway so the button
+      // never gets stuck on "Saving…" if it stays mounted.
+      setSaving(false);
     } catch (e) { setErr(e.message); setSaving(false); }
   };
 

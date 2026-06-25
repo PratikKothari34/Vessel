@@ -1,6 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import { hashHue, initials } from '../lib/util';
 
+// Only allow web image URLs and inline image data. A character's avatar string
+// is untrusted (hand-entered, imported, or synced from another device); without
+// this a crafted value like file:///C:/... could make the app fetch a local
+// file. javascript: can't execute via <img>, but we drop it too for clarity.
+function safeAvatarSrc(src) {
+  if (typeof src !== 'string' || !src.trim()) return null;
+  const s = src.trim();
+  if (/^https?:\/\//i.test(s)) return s;
+  if (/^data:image\//i.test(s)) return s;
+  return null;
+}
+
 // Character avatar: image if provided, else a deterministic tinted glyph.
 // If the image fails to load (dead URL, bad path, offline), fall back to the glyph.
 export default function Avatar({ character, size = 48, ring = false }) {
@@ -23,11 +35,12 @@ export default function Avatar({ character, size = 48, ring = false }) {
     ? { boxShadow: `0 0 0 1px var(--line-strong), 0 0 18px var(--ember-faint)` }
     : {};
 
-  if (character?.avatar && !imgFailed) {
+  const safeSrc = safeAvatarSrc(character?.avatar);
+  if (safeSrc && !imgFailed) {
     return (
       <img
         className="avatar avatar-img"
-        src={character.avatar}
+        src={safeSrc}
         alt={name}
         onError={() => setImgFailed(true)}
         style={{ ...style, ...ringStyle, objectFit: 'cover' }}

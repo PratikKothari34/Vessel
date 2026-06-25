@@ -41,10 +41,6 @@ function keytar() {
   return _keytar;
 }
 
-function isAvailable() {
-  return Boolean(keytar());
-}
-
 /**
  * Resolve the local-DB encryption key (hex string), or null if encryption can't
  * be enabled. Order:
@@ -102,4 +98,4 @@ async function getTursoToken() {
   }
 }
 
-module.exports = { isAvailable, getDbEncryptionKey, getTursoToken };
+module.exports = { getDbEncryptionKey, getTursoToken };

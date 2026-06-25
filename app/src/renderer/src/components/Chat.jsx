@@ -59,7 +59,12 @@ export default function Chat({ character, conversationId, onBack, onConversation
         activeIndex: t.activeIndex ?? 0,
       }));
       setMessages([...greetingMsg, ...archived, ...verbatim]);
-    } catch { setMessages([]); }
+    } catch {
+      // A transient load failure (backend blip) must not wipe the visible chat.
+      // Keep whatever is on screen; the next successful load reconciles it. Only
+      // fall back to the greeting when there's nothing shown yet.
+      setMessages((m) => (m.length ? m : [...greetingMsg]));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [character]);
 

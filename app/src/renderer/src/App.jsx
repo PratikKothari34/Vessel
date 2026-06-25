@@ -43,7 +43,10 @@ export default function App() {
 
   const onSaveCharacter = async (data) => {
     if (editorChar && editorChar.id) {
-      await api.updateCharacter(editorChar.id, data);
+      const updated = await api.updateCharacter(editorChar.id, data);
+      // If the character being edited is the one open in chat, refresh the live
+      // copy so the new persona/greeting/sampling take effect without leaving.
+      if (activeCharacter?.id === updated.id) setActiveCharacter(updated);
     } else {
       await api.createCharacter(data);
     }

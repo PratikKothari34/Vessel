@@ -7,9 +7,18 @@ import React from 'react';
 //   - "quoted dialogue" gets accent emphasis; *actions* / _narration_ get italic
 //     dim styling. Keeps the cinematic feel without a full markdown engine.
 export default function MessageText({ text }) {
+  // Hard guarantee: the 8B model sometimes writes the literal words "blank line"
+  // (or "BLANK LINE") where it should have left an empty line. Strip any such
+  // marker so it never renders as visible text. Match it whether it sits on its
+  // own line or is wedged inline.
+  const cleaned = String(text || '').replace(/^[ \t]*\(?blank ?lines?\)?[ \t]*$/gim, '');
+
   // Split into paragraphs on one-or-more blank lines; drop empty blocks so the
   // model emitting \n\n\n doesn't create oversized gaps.
-  const rawBlocks = String(text || '').split(/\n[ \t]*\n+/).map((b) => b.trim()).filter(Boolean);
+  const rawBlocks = cleaned
+    .split(/\n[ \t]*\n+/)
+    .map((b) => b.trim())
+    .filter((b) => b && !/^\(?blank ?lines?\)?$/i.test(b));
 
   // Hard guarantee: the 8B model sometimes packs several sentences into one
   // block with no blank line. Force-split any over-long block at sentence

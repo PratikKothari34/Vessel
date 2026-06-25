@@ -49,6 +49,16 @@ function cleanStyle(s) {
 const CAP = { avatar: 4096, about: 8000, persona: 16000, greeting: 8000 };
 function cap(v, max) { return String(v == null ? '' : v).slice(0, max); }
 
+// Avatar is rendered into an <img src>. Persist only web image URLs / inline
+// image data; reject anything else (file:, javascript:, etc.) so a hostile or
+// imported value can never make a client fetch a local path. Empty = use the
+// generated glyph fallback.
+function cleanAvatar(v) {
+  const s = cap(v, CAP.avatar).trim();
+  if (/^https?:\/\//i.test(s) || /^data:image\//i.test(s)) return s;
+  return '';
+}
+
 // Normalize a string array (chat starters / tags): trim, drop empties, cap size.
 function cleanList(a, { max = 12, maxLen = 200 } = {}) {
   if (!Array.isArray(a)) return [];
@@ -106,7 +116,7 @@ async function createCharacter({ name, avatar, tagline, about, persona, greeting
             (id, name, avatar, tagline, about, persona, greeting, chat_starters, tags, sampling, response_style, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
-      id, clean.slice(0, 120), cap(avatar, CAP.avatar),
+      id, clean.slice(0, 120), cleanAvatar(avatar),
       cap(tagline, 200), cap(about, CAP.about),
       cap(persona, CAP.persona), cap(greeting, CAP.greeting),
       JSON.stringify(cleanList(chatStarters)), JSON.stringify(cleanList(tags, { maxLen: 40 })),
@@ -122,7 +132,7 @@ async function updateCharacter(id, patch) {
   if (!existing) return null;
   const merged = {
     name: patch.name != null ? String(patch.name).trim().slice(0, 120) : existing.name,
-    avatar: patch.avatar != null ? cap(patch.avatar, CAP.avatar) : existing.avatar,
+    avatar: patch.avatar != null ? cleanAvatar(patch.avatar) : existing.avatar,
     tagline: patch.tagline != null ? cap(patch.tagline, 200) : existing.tagline,
     about: patch.about != null ? cap(patch.about, CAP.about) : existing.about,
     persona: patch.persona != null ? cap(patch.persona, CAP.persona) : existing.persona,
