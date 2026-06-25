@@ -368,14 +368,69 @@ app.put('/conversations/:id/active-variant', async (req, res) => {
 });
 
 // ---- Startup -------------------------------------------------------------
-async function start() {
-  await db.getDb(); // init schema + (optional) initial sync before serving
-  app.listen(PORT, '127.0.0.1', () => {
+// Failsafe for a stale backend left bound to our port (orphaned `--watch`
+// child, a window closed without Ctrl-C, etc.). Find the PID holding the port
+// and kill it, so the next bind attempt succeeds. Cross-platform; only ever
+// targets whatever owns PORT, never anything else.
+function killProcessOnPort(port) {
+  const { execSync } = require('child_process');
+  // Port is always an integer (validated below), so it is safe to interpolate
+  // into these shell strings — there is no path for arbitrary text to reach here.
+  const p = Number(port);
+  if (!Number.isInteger(p) || p <= 0 || p > 65535) return;
+  try {
+    if (process.platform === 'win32') {
+      // We only ever bind 127.0.0.1, so match the LOCAL address column exactly;
+      // this avoids matching a foreign endpoint that happens to use the port.
+      const out = execSync(`netstat -ano -p tcp | findstr "127.0.0.1:${p} " | findstr LISTENING`, {
+        encoding: 'utf8',
+      });
+      const pids = new Set(
+        out
+          .split(/\r?\n/)
+          .map((l) => l.trim().split(/\s+/).pop())
+          .filter((pid) => pid && /^\d+$/.test(pid) && pid !== '0'),
+      );
+      for (const pid of pids) {
+        if (Number(pid) === process.pid) continue;
+        execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' });
+        console.warn(`Freed port ${p}: killed stale process PID ${pid}.`);
+      }
+    } else {
+      const out = execSync(`lsof -ti tcp:${p} -s tcp:LISTEN`, { encoding: 'utf8' });
+      for (const pid of out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)) {
+        if (Number(pid) === process.pid) continue;
+        execSync(`kill -9 ${pid}`, { stdio: 'ignore' });
+        console.warn(`Freed port ${p}: killed stale process PID ${pid}.`);
+      }
+    }
+  } catch {
+    /* nothing listening / tool unavailable — let the retry bind report the real error */
+  }
+}
+
+function listen(retried = false) {
+  const server = app.listen(PORT, '127.0.0.1', () => {
     console.log(`Scenario_Chat backend on http://localhost:${PORT}`);
     console.log(`  -> ollama: ${OLLAMA_CHAT_URL} | model: ${OLLAMA_MODEL}`);
     console.log(`  -> sync: ${db.isSyncEnabled() ? 'enabled' : 'local-only'}`);
     console.log(`  -> memory: summarizer=${memory._config.SUMMARIZER_MODEL}, embedder=${memory._config.EMBED_MODEL}`);
   });
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE' && !retried) {
+      console.warn(`Port ${PORT} in use — clearing stale listener and retrying...`);
+      killProcessOnPort(PORT);
+      setTimeout(() => listen(true), 400);
+      return;
+    }
+    console.error('Backend server error:', err.message);
+    process.exit(1);
+  });
+}
+
+async function start() {
+  await db.getDb(); // init schema + (optional) initial sync before serving
+  listen();
 }
 
 // Flush to cloud on shutdown (no-op when local-only).
