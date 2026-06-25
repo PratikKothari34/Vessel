@@ -80,6 +80,7 @@ app.get('/health', (_req, res) => {
     model: OLLAMA_MODEL,
     ollama: OLLAMA_HOST,
     sync: { enabled: db.isSyncEnabled(), interval: db._config.SYNC_INTERVAL },
+    encryptedAtRest: db.isEncryptedAtRest(),
     memory: {
       summarizer: memory._config.SUMMARIZER_MODEL,
       embedder: memory._config.EMBED_MODEL,
