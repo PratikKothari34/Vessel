@@ -15,6 +15,13 @@ const PORT = process.env.PORT || 3001;
 const OLLAMA_HOST = (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'scenario-chat';
 const OLLAMA_CHAT_URL = `${OLLAMA_HOST}/api/chat`;
+// Default reply-length ceiling (tokens). Bounds runaway "essay" replies even
+// when the model ignores the short-paragraph rule; a character can raise it via
+// its own sampling.num_predict. ~512 tokens ≈ a few tight paragraphs.
+const DEFAULT_NUM_PREDICT = (() => {
+  const v = parseInt(process.env.MAX_REPLY_TOKENS, 10);
+  return Number.isFinite(v) && v > 0 ? v : 512;
+})();
 
 // Response-style rules (narration vs dialogue control). Addresses the common
 // failure where the model only narrates the scene instead of speaking as the
@@ -25,7 +32,7 @@ const OLLAMA_CHAT_URL = `${OLLAMA_HOST}/api/chat`;
 // per-character system message — which lands right before the turn — is what
 // actually makes the model break replies into spaced paragraphs.
 const FORMAT_RULE =
-  'Formatting (REQUIRED): write your reply as 2-4 SHORT paragraphs. Separate each paragraph with one empty line (press Enter twice). Do NOT write the words "blank line" or any label between paragraphs — just leave the empty line. Never answer in a single block. ALWAYS wrap every spoken line in straight double quotes, like "this", with no exceptions — even one-line replies must put the spoken words in quotes. Put spoken dialogue on its own paragraph, and put actions/narration in separate paragraphs around it. This applies to every reply, even short ones.';
+  'Formatting (REQUIRED): keep your reply SHORT — 2 to 4 short paragraphs, then STOP. Do not write a long multi-paragraph scene; leave room for the user to respond. Separate each paragraph with one empty line (press Enter twice). Do NOT write the words "blank line" or any label between paragraphs — just leave the empty line. Never answer in a single block. ALWAYS wrap every spoken line in straight double quotes, like "this", with no exceptions — even one-line replies must put the spoken words in quotes. Put spoken dialogue on its own paragraph, and put actions/narration in separate paragraphs around it. CRITICAL: write ONLY your own character. Never narrate, decide, or quote the user — do not describe the user\'s actions, words, body, gaze, thoughts, or feelings ("you take a sip", "you let out a breath", "a flicker of surprise on your face", "you say..."). End your reply at the moment it becomes the user\'s turn, then stop and wait.';
 
 const STYLE_RULES = {
   balanced: '',
@@ -264,15 +271,18 @@ app.post('/chat', async (req, res) => {
     if (!res.writableEnded) { clientAborted = true; abortController.abort(); }
   });
 
-  // Per-character sampling overrides (cleaned in characters.js).
-  const options = character && character.sampling ? { ...character.sampling } : undefined;
+  // Per-character sampling overrides (cleaned in characters.js). Apply a default
+  // num_predict ceiling so a reply can't run away into an essay even when the
+  // model ignores the "2-4 short paragraphs" rule; a character may still raise it
+  // via its own sampling.num_predict.
+  const options = { num_predict: DEFAULT_NUM_PREDICT, ...(character && character.sampling ? character.sampling : {}) };
 
   let ollamaRes;
   try {
     ollamaRes = await fetch(OLLAMA_CHAT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: OLLAMA_MODEL, messages: outboundMessages, stream: true, ...(options ? { options } : {}) }),
+      body: JSON.stringify({ model: OLLAMA_MODEL, messages: outboundMessages, stream: true, options }),
       signal: abortController.signal,
     });
   } catch (err) {

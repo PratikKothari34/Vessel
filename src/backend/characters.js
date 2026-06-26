@@ -36,6 +36,7 @@ const SAMPLING_BOUNDS = {
   min_p: [0, 1],
   repeat_penalty: [0, 4],
   num_ctx: [256, 131072],
+  num_predict: [16, 4096],
 };
 const SAMPLING_KEYS = Object.keys(SAMPLING_BOUNDS);
 function cleanSampling(s) {
