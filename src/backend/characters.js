@@ -26,14 +26,26 @@ function isValidId(id) {
 }
 
 // Sampling overrides are stored as a JSON string. Keep only known numeric keys
-// so a client can't smuggle arbitrary Ollama options through.
-const SAMPLING_KEYS = ['temperature', 'top_p', 'top_k', 'min_p', 'repeat_penalty', 'num_ctx'];
+// so a client can't smuggle arbitrary Ollama options through, and clamp each to
+// a sane range so a hostile/imported value can't request a runaway context
+// window (OOM / GPU exhaustion) or out-of-domain sampling params.
+const SAMPLING_BOUNDS = {
+  temperature: [0, 2],
+  top_p: [0, 1],
+  top_k: [0, 1000],
+  min_p: [0, 1],
+  repeat_penalty: [0, 4],
+  num_ctx: [256, 131072],
+};
+const SAMPLING_KEYS = Object.keys(SAMPLING_BOUNDS);
 function cleanSampling(s) {
   const out = {};
   if (s && typeof s === 'object') {
     for (const k of SAMPLING_KEYS) {
       const v = Number(s[k]);
-      if (Number.isFinite(v)) out[k] = v;
+      if (!Number.isFinite(v)) continue;
+      const [min, max] = SAMPLING_BOUNDS[k];
+      out[k] = Math.min(Math.max(v, min), max);
     }
   }
   return out;

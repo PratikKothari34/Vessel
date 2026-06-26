@@ -55,7 +55,7 @@ function splitLongBlock(block) {
   let inUnder = false;
   for (let i = 0; i < block.length; i++) {
     const ch = block[i];
-    if (ch === '"') inQuote = !inQuote;
+    if (ch === '"' || ch === '“' || ch === '”') inQuote = !inQuote;
     else if (ch === '*' && !inQuote) inStar = !inStar;
     else if (ch === '_' && !inQuote) inUnder = !inUnder;
     const open = inQuote || inStar || inUnder;
@@ -89,13 +89,16 @@ function renderBlock(block) {
   let k = 0;
   block.split('\n').forEach((line, li) => {
     if (li > 0) out.push(<br key={`br-${k++}`} />);
-    const re = /("[^"]*"|\*[^*]+\*|_[^_]+_)/g;
+    // Recognize both straight ("...") and curly (“...”) double quotes — the 8B
+    // model sometimes emits smart quotes, which would otherwise lose the accent.
+    const re = /("[^"]*"|“[^”]*”|\*[^*]+\*|_[^_]+_)/g;
     let last = 0;
     let m;
     while ((m = re.exec(line)) !== null) {
       if (m.index > last) out.push(<span key={k++}>{line.slice(last, m.index)}</span>);
       const tok = m[0];
-      if (tok.startsWith('"')) out.push(<span key={k++} className="rp-dialogue">{tok}</span>);
+      if (tok.startsWith('"') || tok.startsWith('“'))
+        out.push(<span key={k++} className="rp-dialogue">{tok}</span>);
       else out.push(<em key={k++} className="rp-action">{tok.slice(1, -1)}</em>);
       last = m.index + tok.length;
     }

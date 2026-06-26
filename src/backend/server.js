@@ -25,7 +25,7 @@ const OLLAMA_CHAT_URL = `${OLLAMA_HOST}/api/chat`;
 // per-character system message — which lands right before the turn — is what
 // actually makes the model break replies into spaced paragraphs.
 const FORMAT_RULE =
-  'Formatting (REQUIRED): write your reply as 2-4 SHORT paragraphs. Separate each paragraph with one empty line (press Enter twice). Do NOT write the words "blank line" or any label between paragraphs — just leave the empty line. Never answer in a single block. Put spoken dialogue ("in quotes") on its own paragraph, and put actions/narration in separate paragraphs around it. This applies to every reply, even short ones.';
+  'Formatting (REQUIRED): write your reply as 2-4 SHORT paragraphs. Separate each paragraph with one empty line (press Enter twice). Do NOT write the words "blank line" or any label between paragraphs — just leave the empty line. Never answer in a single block. ALWAYS wrap every spoken line in straight double quotes, like "this", with no exceptions — even one-line replies must put the spoken words in quotes. Put spoken dialogue on its own paragraph, and put actions/narration in separate paragraphs around it. This applies to every reply, even short ones.';
 
 const STYLE_RULES = {
   balanced: '',
