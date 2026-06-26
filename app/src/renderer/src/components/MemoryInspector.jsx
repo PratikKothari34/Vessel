@@ -35,8 +35,10 @@ export default function MemoryInspector({ conversationId, recalled, onClose }) {
                 {recalled && recalled.length ? (
                   recalled.map((r, i) => (
                     <div key={i} className="mem-snippet recalled">
-                      <span className="mem-score">{(r.score * 100).toFixed(0)}%</span>
-                      <span className="mem-snippet-text">{r.content.slice(0, 220)}</span>
+                      {Number.isFinite(r.score) && (
+                        <span className="mem-score">{(r.score * 100).toFixed(0)}%</span>
+                      )}
+                      <span className="mem-snippet-text">{String(r.content || '').slice(0, 220)}</span>
                     </div>
                   ))
                 ) : (

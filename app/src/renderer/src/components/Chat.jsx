@@ -189,9 +189,13 @@ export default function Chat({ character, conversationId, onBack, onConversation
 
   const deleteConv = async (e, id) => {
     e.stopPropagation();
-    await api.deleteConversation(id);
-    if (id === convId) newConversation();
-    refreshConversations();
+    try {
+      await api.deleteConversation(id);
+      if (id === convId) newConversation();
+      refreshConversations();
+    } catch (err) {
+      setError(`Could not delete scenario: ${err.message}`);
+    }
   };
 
   const onKey = (e) => {

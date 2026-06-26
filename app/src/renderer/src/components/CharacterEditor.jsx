@@ -63,7 +63,11 @@ export default function CharacterEditor({ character, onClose, onSave, onDelete }
 
             <label className="field-label" style={{ marginTop: 22 }}>Sampling</label>
             {SLIDERS.map((s) => {
-              const val = sampling[s.key] ?? s.def;
+              // Coerce defensively: a stored/imported/synced sampling value may
+              // be a non-number (e.g. a stringified JSON value); Number(...) +
+              // fallback keeps .toFixed and the range input from crashing render.
+              const raw = Number(sampling[s.key]);
+              const val = Number.isFinite(raw) ? raw : s.def;
               return (
                 <div key={s.key} className="slider-row">
                   <div className="slider-top">
