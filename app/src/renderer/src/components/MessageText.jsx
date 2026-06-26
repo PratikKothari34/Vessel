@@ -89,9 +89,12 @@ function renderBlock(block) {
   let k = 0;
   block.split('\n').forEach((line, li) => {
     if (li > 0) out.push(<br key={`br-${k++}`} />);
-    // Recognize both straight ("...") and curly (“...”) double quotes — the 8B
-    // model sometimes emits smart quotes, which would otherwise lose the accent.
-    const re = /("[^"]*"|“[^”]*”|\*[^*]+\*|_[^_]+_)/g;
+    // Recognize straight ("..."), curly (“...”), AND mixed ("...” or “...")
+    // double quotes. The 8B model frequently opens with a straight quote and
+    // closes with a curly one (or vice versa); a same-style-only regex would
+    // leave that dialogue uncolored, which is the exact bug from the original
+    // report. Match any opening quote char paired with any closing quote char.
+    const re = /(["“][^"“”]*["”]|\*[^*]+\*|_[^_]+_)/g;
     let last = 0;
     let m;
     while ((m = re.exec(line)) !== null) {
