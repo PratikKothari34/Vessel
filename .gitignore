@@ -7,18 +7,12 @@ app/node_modules/
 .env.local
 app/.env
 
-# Local libSQL database + embedded-replica artifacts
+# Local Turso database + sync engine sidecar files (scenario.db-info, -wal, etc)
 *.db
 *.db-*
 *.sqlite
 *.sqlite3
 data/
-local-replica*
-# Cleartext DB backup/temp from the encrypt-at-rest migration (never commit these)
-*.plaintext.bak
-*.plaintext.bak-*
-*.enc.tmp
-*.enc.tmp-*
 
 # Build output
 out/

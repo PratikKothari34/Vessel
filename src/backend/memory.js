@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * memory.js — long-term memory engine (Turso/libSQL backed).
+ * memory.js — long-term memory engine (Turso @tursodatabase/sync backed).
  *
  * Keeps the model's live window small (fast) while preserving unlimited history:
  *

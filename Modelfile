@@ -3,7 +3,7 @@ FROM Tohur/natsumura-storytelling-rp-llama-3.1:8b
 # --- Context window -------------------------------------------------------
 # 32K native window — the fast regime on an RTX 4060 8GB (a larger KV cache
 # forces weight offload off the GPU). Long-term memory lives OUTSIDE the model
-# (rolling summary + native vector retrieval), so the live window stays small.
+# (rolling summary + JS-cosine vector retrieval), so the live window stays small.
 PARAMETER num_ctx 32768
 
 # --- Sampling (creative, coherent roleplay) -------------------------------

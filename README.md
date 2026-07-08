@@ -9,7 +9,7 @@ Optional encrypted cloud backup + multi-device sync via [Turso](https://turso.te
   storytelling/roleplay model.
 - **Multi-character** — create personas (name, persona, greeting, avatar, sampling),
   switch between them like character.ai.
-- **Long-term memory** — small fast live window + rolling summary + native vector
+- **Long-term memory** — small fast live window + rolling summary + embedding-based
   retrieval, so long stories stay coherent without slowing down.
 - **Swipe variants** — regenerate a reply to get alternates; swipe `◀ 2/3 ▶`
   between them. All variants persist; the one you pick becomes canonical for memory.
@@ -18,7 +18,7 @@ Optional encrypted cloud backup + multi-device sync via [Turso](https://turso.te
   Director notes guide behavior but are never written into the story or memory.
 - **Response style** — per-character setting (balanced / dialogue-first /
   light-narration) to stop the model from only narrating instead of speaking.
-- **Local-first storage** — SQLite (libSQL) on disk; cloud sync is opt-in.
+- **Local-first storage** — SQLite (Turso) on disk; cloud sync is opt-in.
 
 ---
 
@@ -27,14 +27,14 @@ Optional encrypted cloud backup + multi-device sync via [Turso](https://turso.te
 ```
 Electron main ──spawns──> Node/Express backend (127.0.0.1) ──HTTP──> Ollama
      │                          │
-  React renderer           Turso libSQL  (local file; optional cloud sync)
+  React renderer           Turso (@tursodatabase/sync)  (local file; optional cloud sync)
   (Vite)                   characters / conversations / turns / archive(+embeddings)
 ```
 
 The model's live window is kept small (32K) for speed. Older turns are folded into
 a **rolling summary** (gemma3:4b) and **archived with embeddings** (nomic-embed-text);
-relevant ones are recalled per message via libSQL native vector search
-(`vector_top_k` + `vector_distance_cos`).
+relevant ones are recalled per message by cosine-ranking the stored embeddings in
+JS (the Turso sync engine has no native vector search).
 
 ---
 
@@ -137,7 +137,7 @@ Scenario_Chat/
 ├── .env.example
 ├── src/backend/
 │   ├── server.js           # Express + SSE /chat + REST
-│   ├── db.js               # Turso/libSQL client + schema + vector index
+│   ├── db.js               # Turso sync client + schema + embedding codec
 │   ├── memory.js           # summary + retrieval engine
 │   └── characters.js       # character CRUD
 └── app/                    # Electron + React (Vite)

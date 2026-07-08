@@ -54,6 +54,28 @@ function localAbsPath() {
   return abs;
 }
 
+// The sync engine writes sidecar files next to the DB (scenario.db-info,
+// scenario.db-wal*, etc). If the MAIN db file is gone but sidecars remain
+// (crash mid-write, manual deletion, partial restore), connect() throws
+// "main DB file doesn't exist, but metadata is" and the app can't boot at all.
+// Detect that orphaned state and clear the stale sidecars so a clean replica
+// bootstraps instead. Only fires when the main file is absent, so it never
+// touches a healthy DB.
+function clearOrphanedSyncMetadata(abs) {
+  if (fs.existsSync(abs)) return; // main file present → nothing to clean
+  const dir = path.dirname(abs);
+  const base = path.basename(abs);
+  let cleared = 0;
+  for (const f of fs.readdirSync(dir)) {
+    // sidecars are "<dbfile>-<suffix>"; never delete the main file (absent) or
+    // unrelated files.
+    if (f.startsWith(`${base}-`)) {
+      try { fs.rmSync(path.join(dir, f), { force: true }); cleared++; } catch { /* ignore */ }
+    }
+  }
+  if (cleared) console.warn(`[db] cleared ${cleared} orphaned sync metadata file(s) (main DB was missing).`);
+}
+
 // ---- Compatibility shim ---------------------------------------------------
 // The codebase was written against @libsql/client:
 //   db.execute('SELECT ...')                 -> { rows, rowsAffected }
@@ -185,7 +207,9 @@ async function getDb() {
     console.warn('[db] local database is NOT encrypted at rest (no keychain key and no DB_ENCRYPTION_KEY).');
   }
 
-  const opts = { path: localAbsPath(), clientName: 'scenario-chat' };
+  const dbPath = localAbsPath();
+  clearOrphanedSyncMetadata(dbPath);
+  const opts = { path: dbPath, clientName: 'scenario-chat' };
   if (SYNC_ENABLED) {
     opts.url = TURSO_DATABASE_URL;
     opts.authToken = authToken;
@@ -251,7 +275,14 @@ function decodeEmbedding(buf) {
     : Buffer.from(buf);
   // guard against a truncated/garbage blob
   if (b.byteLength % 4 !== 0) return null;
-  return new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4);
+  // COPY into a fresh, 4-byte-aligned Float32Array rather than viewing over the
+  // source buffer: a driver that returns a BLOB as a slice of a pooled
+  // ArrayBuffer could hand back a non-4-aligned byteOffset, which would make a
+  // Float32Array VIEW constructor throw. A freshly allocated ArrayBuffer is
+  // always aligned; copy the bytes into it (cheap for 768 floats).
+  const ab = new ArrayBuffer(b.byteLength);
+  new Uint8Array(ab).set(b);
+  return new Float32Array(ab);
 }
 
 module.exports = {
