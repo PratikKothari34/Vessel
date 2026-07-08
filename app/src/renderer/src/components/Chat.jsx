@@ -189,6 +189,11 @@ export default function Chat({ character, conversationId, onBack, onConversation
 
   const deleteConv = async (e, id) => {
     e.stopPropagation();
+    // Delete is irreversible — it drops the scenario and its whole memory
+    // (summary, verbatim, archive). Confirm before wiping.
+    const conv = conversations.find((c) => c.id === id);
+    const label = conv?.title || 'this scenario';
+    if (!window.confirm(`Delete "${label}"? This erases the scenario and its memory and cannot be undone.`)) return;
     try {
       await api.deleteConversation(id);
       if (id === convId) newConversation();

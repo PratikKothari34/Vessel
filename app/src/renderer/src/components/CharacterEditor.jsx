@@ -152,7 +152,18 @@ export default function CharacterEditor({ character, onClose, onSave, onDelete }
 
         <div className="overlay-foot">
           {editing && (
-            <button className="btn btn-danger" onClick={() => onDelete(character.id)}>Delete</button>
+            <button
+              className="btn btn-danger"
+              onClick={() => {
+                // Deleting a character removes it and every scenario/memory
+                // tied to it. Irreversible — confirm first.
+                if (window.confirm(`Delete "${name || 'this character'}"? This removes the character and all its scenarios and memory. This cannot be undone.`)) {
+                  onDelete(character.id);
+                }
+              }}
+            >
+              Delete
+            </button>
           )}
           {err && <span className="editor-err">{err}</span>}
           <div style={{ flex: 1 }} />
