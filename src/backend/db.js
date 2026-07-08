@@ -1,36 +1,41 @@
 'use strict';
 
 /**
- * db.js — Turso / libSQL data layer for Scenario_Chat.
+ * db.js — Turso data layer for Scenario_Chat (@tursodatabase/sync).
  *
- * Local-first: the source of truth is a local SQLite file (LOCAL_DB_PATH).
- * If TURSO_DATABASE_URL + TURSO_AUTH_TOKEN are set, the client becomes an
- * embedded replica with OFFLINE WRITES — writes hit the local file first and
- * sync to Turso cloud in the background (backup + multi-device). With no Turso
- * creds the app is 100% local and needs no account.
+ * Local-first: the source of truth is a local SQLite file (LOCAL_DB_PATH). If
+ * TURSO_DATABASE_URL + TURSO_AUTH_TOKEN are set, the client also syncs to Turso
+ * cloud via the push/pull protocol (backup + multi-device). With no Turso creds
+ * the app is 100% local and needs no account.
  *
- * Vector search is native (libSQL): archived turns store a 768-dim F32_BLOB
- * embedding indexed with libsql_vector_idx; retrieval uses vector_top_k +
- * vector_distance_cos. (Verified against @libsql/client 0.14.0.)
+ * NOTE (2026-07): migrated off @libsql/client. Turso retired the old embedded-
+ * replica sync protocol (syncUrl + offline:true) server-side, so this uses the
+ * new @tursodatabase/sync engine (explicit push()/pull()). That engine has NO
+ * native vector search (no libsql_vector_idx / vector_top_k), so retrieval moved
+ * to in-JS cosine over stored embeddings (see memory.js retrieve()). Embeddings
+ * are stored as raw little-endian Float32 blobs.
  *
- * Encryption at rest: the local SQLite file is opened with libSQL's native
- * `encryptionKey` (whole-file, transparent — vector search still works because
- * decryption happens in-process). The key comes from the OS keychain via
- * keystore.js; with no key available the DB opens unencrypted (local-only,
- * no-keychain fallback). The Turso cloud leg is already TLS (https/libsql://).
+ * The rest of the backend still calls db.execute({sql,args}) / .rows /
+ * .rowsAffected — a compatibility shim below preserves that contract over the
+ * new better-sqlite3-style API (prepare/all/get/run), so only db.js + the vector
+ * query in memory.js changed.
+ *
+ * Encryption at rest: the local SQLite file is encrypted with libSQL-style
+ * whole-file encryption (aes256gcm) via the new engine's `encryption` option.
+ * The key comes from the OS keychain via keystore.js; with no key available the
+ * DB opens unencrypted (local-only, no-keychain fallback). The Turso cloud leg
+ * is TLS (https/libsql://).
  */
 
 const path = require('path');
 const fs = require('fs');
-const { createClient } = require('@libsql/client');
+const { connect } = require('@tursodatabase/sync');
 const keystore = require('./keystore');
 
 const EMBED_DIM = 768; // nomic-embed-text output dimension
 
 const LOCAL_DB_PATH = process.env.LOCAL_DB_PATH || './data/scenario.db';
 const TURSO_DATABASE_URL = (process.env.TURSO_DATABASE_URL || '').trim();
-// Sync is *possible* if a URL is configured; the token is resolved at connect
-// time from the keychain (with .env fallback), so we confirm SYNC_ENABLED then.
 const TURSO_URL_SET = Boolean(TURSO_DATABASE_URL);
 let SYNC_ENABLED = false;
 let _encryptedAtRest = false;
@@ -39,46 +44,56 @@ const SYNC_INTERVAL = (() => {
   return Number.isFinite(v) && v >= 0 ? v : 60;
 })();
 
-let _db = null;
+let _db = null;      // the shim-wrapped client used by the rest of the app
+let _raw = null;     // the underlying @tursodatabase/sync Database (push/pull)
 let _syncTimer = null;
 
-function localFileUrl() {
-  // libSQL wants a file: URL; resolve to an absolute path so cwd doesn't matter.
+function localAbsPath() {
   const abs = path.resolve(LOCAL_DB_PATH);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
-  return `file:${abs}`;
+  return abs;
 }
 
-// Build the client. Embedded replica (offline writes) when synced, else a plain
-// local file. syncUrl + authToken turn the local file into a replica of the
-// remote primary; offline:true makes local writes authoritative until synced.
-// `encryptionKey` (when present) encrypts the LOCAL replica file at rest only —
-// it is independent of the remote Turso DB (which is managed/encrypted by Turso
-// and reached over TLS). The key is machine-local (keychain), so an encrypted
-// local file is NOT portable to another machine by copy; use sync for that.
-function makeClient({ authToken, encryptionKey }) {
-  const synced = Boolean(TURSO_URL_SET && authToken);
-  const enc = encryptionKey ? { encryptionKey } : {};
-  if (synced) {
-    return createClient({
-      url: localFileUrl(),
-      syncUrl: TURSO_DATABASE_URL,
-      authToken,
-      syncInterval: SYNC_INTERVAL > 0 ? SYNC_INTERVAL : undefined,
-      offline: true,
-      ...enc,
-    });
-  }
-  return createClient({ url: localFileUrl(), ...enc });
+// ---- Compatibility shim ---------------------------------------------------
+// The codebase was written against @libsql/client:
+//   db.execute('SELECT ...')                 -> { rows, rowsAffected }
+//   db.execute({ sql, args: [...] })         -> { rows, rowsAffected }
+// The new engine exposes db.all()/db.get()/db.run()/db.exec() instead. This
+// wrapper re-implements execute() so nothing else has to change.
+//
+// Reads (SELECT/PRAGMA/WITH... that returns rows) go through all(); writes go
+// through run() (which reports { changes, lastInsertRowid }). We detect reads by
+// the leading keyword — good enough for this app's fully-known query set.
+function isReadQuery(sql) {
+  const head = sql.replace(/^\s+/, '').slice(0, 12).toUpperCase();
+  return head.startsWith('SELECT') || head.startsWith('PRAGMA') || head.startsWith('WITH');
 }
 
-// Schema. Vector index is created on the archive embedding column so retrieval
-// can use vector_top_k. FKs cascade so deleting a character/conversation cleans
-// up its turns + archive.
+function wrap(raw) {
+  return {
+    async execute(q) {
+      const sql = typeof q === 'string' ? q : q.sql;
+      const args = typeof q === 'string' ? [] : (q.args || []);
+      if (isReadQuery(sql)) {
+        const rows = await raw.all(sql, ...args);
+        return { rows, rowsAffected: 0 };
+      }
+      const info = await raw.run(sql, ...args);
+      return { rows: [], rowsAffected: Number(info?.changes || 0), lastInsertRowid: info?.lastInsertRowid };
+    },
+    // multi-statement DDL (schema init) — no bind params
+    async exec(sql) { return raw.exec(sql); },
+    raw,
+  };
+}
+
+// ---- Schema ---------------------------------------------------------------
+// No vector index: the new engine has no libsql_vector_idx. `embedding` is a
+// plain blob column holding raw Float32 bytes; retrieval scans + cosines in JS.
 async function initSchema(db) {
-  await db.execute('PRAGMA foreign_keys = ON;');
+  await db.exec(`PRAGMA foreign_keys = ON;`);
 
-  await db.execute(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS characters (
       id         TEXT PRIMARY KEY,
       name       TEXT NOT NULL,
@@ -91,7 +106,7 @@ async function initSchema(db) {
     );
   `);
 
-  await db.execute(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       id           TEXT PRIMARY KEY,
       character_id TEXT REFERENCES characters(id) ON DELETE CASCADE,
@@ -103,7 +118,7 @@ async function initSchema(db) {
   `);
 
   // verbatim recent turns (kept in full in the live window)
-  await db.execute(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS turns (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -112,15 +127,11 @@ async function initSchema(db) {
       created_at      TEXT NOT NULL
     );
   `);
-  await db.execute(
-    `CREATE INDEX IF NOT EXISTS turns_conv_idx ON turns(conversation_id, id);`
-  );
+  await db.exec(`CREATE INDEX IF NOT EXISTS turns_conv_idx ON turns(conversation_id, id);`);
 
-  // Swipe variants: alternate generations for an assistant turn. The parent
-  // turns.content always mirrors the ACTIVE variant (so memory reads turns
-  // unchanged). Only the latest assistant turn is regenerated in practice, but
-  // variants persist so you can swipe between them after reopening the chat.
-  await db.execute(`
+  // Swipe variants: alternate generations for an assistant turn. turns.content
+  // mirrors the ACTIVE variant so memory reads turns unchanged.
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS variants (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       turn_id    INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
@@ -129,53 +140,41 @@ async function initSchema(db) {
       created_at TEXT NOT NULL
     );
   `);
-  await db.execute(
-    `CREATE INDEX IF NOT EXISTS variants_turn_idx ON variants(turn_id, id);`
-  );
+  await db.exec(`CREATE INDEX IF NOT EXISTS variants_turn_idx ON variants(turn_id, id);`);
 
-  // archive: frozen older turns + embedding for retrieval
-  await db.execute(`
+  // archive: frozen older turns + embedding (raw Float32 blob) for retrieval.
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS archive (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
       role            TEXT NOT NULL,
       content         TEXT NOT NULL,
-      embedding       F32_BLOB(${EMBED_DIM}),
+      embedding       BLOB,
       created_at      TEXT NOT NULL
     );
   `);
-  await db.execute(
-    `CREATE INDEX IF NOT EXISTS archive_conv_idx ON archive(conversation_id, id);`
-  );
-  // Native vector index for approximate nearest-neighbour retrieval.
-  await db.execute(
-    `CREATE INDEX IF NOT EXISTS archive_vec_idx ON archive(libsql_vector_idx(embedding));`
-  );
+  await db.exec(`CREATE INDEX IF NOT EXISTS archive_conv_idx ON archive(conversation_id, id);`);
 
   await runMigrations(db);
 }
 
-// Additive migrations for existing DBs. Each is guarded so re-running is safe.
+// Additive migrations for existing DBs. Each guarded so re-running is safe.
 async function runMigrations(db) {
-  const cols = await db.execute(`PRAGMA table_info(characters);`);
-  const has = (name) => cols.rows.some((r) => r.name === name);
-  const addCol = async (name, ddl) => { if (!has(name)) await db.execute(`ALTER TABLE characters ADD COLUMN ${ddl};`); };
+  const cols = await db.raw.all(`PRAGMA table_info(characters);`);
+  const has = (name) => cols.some((r) => r.name === name);
+  const addCol = async (name, ddl) => { if (!has(name)) await db.exec(`ALTER TABLE characters ADD COLUMN ${ddl};`); };
 
-  // narration vs dialogue control
   await addCol('response_style', `response_style TEXT DEFAULT 'balanced'`);
-  // c.ai-style profile fields
-  await addCol('tagline', `tagline TEXT DEFAULT ''`);        // short hook under the name
-  await addCol('about', `about TEXT DEFAULT ''`);            // longer public blurb
-  await addCol('chat_starters', `chat_starters TEXT DEFAULT '[]'`); // JSON array of opening prompts
-  await addCol('tags', `tags TEXT DEFAULT '[]'`);           // JSON array of category labels
+  await addCol('tagline', `tagline TEXT DEFAULT ''`);
+  await addCol('about', `about TEXT DEFAULT ''`);
+  await addCol('chat_starters', `chat_starters TEXT DEFAULT '[]'`);
+  await addCol('tags', `tags TEXT DEFAULT '[]'`);
 }
 
-// Initialise once. On a synced client, pull the remote state before creating
-// the schema so we don't fork from an existing cloud DB.
+// ---- Connect --------------------------------------------------------------
 async function getDb() {
   if (_db) return _db;
 
-  // Resolve secrets from the OS keychain (with env fallbacks) before connecting.
   const [encryptionKey, authToken] = await Promise.all([
     keystore.getDbEncryptionKey(),
     keystore.getTursoToken(),
@@ -186,44 +185,73 @@ async function getDb() {
     console.warn('[db] local database is NOT encrypted at rest (no keychain key and no DB_ENCRYPTION_KEY).');
   }
 
-  const db = makeClient({ authToken, encryptionKey });
+  const opts = { path: localAbsPath(), clientName: 'scenario-chat' };
   if (SYNC_ENABLED) {
-    try { await db.sync(); } catch (e) {
-      console.warn('[db] initial sync failed (continuing local-first):', e.message);
+    opts.url = TURSO_DATABASE_URL;
+    opts.authToken = authToken;
+  }
+  if (encryptionKey) {
+    // keystore returns a 64-char hex string (32 bytes); the engine wants hexkey.
+    opts.experimental = ['encryption'];
+    opts.encryption = { cipher: 'aes256gcm', hexkey: encryptionKey };
+  }
+
+  const raw = await connect(opts);
+  _raw = raw;
+  _db = wrap(raw);
+
+  // Pull remote state before creating schema so we don't fork an existing cloud DB.
+  if (SYNC_ENABLED) {
+    try { await raw.pull(); } catch (e) {
+      console.warn('[db] initial pull failed (continuing local-first):', e.message);
     }
   }
-  await initSchema(db);
-  _db = db;
 
-  // Background sync heartbeat (syncInterval already auto-syncs, but this also
-  // pushes local offline writes up on a steady cadence).
-  if (SYNC_ENABLED && SYNC_INTERVAL > 0) {
-    _syncTimer = setInterval(() => {
-      db.sync().catch((e) => console.warn('[db] periodic sync failed:', e.message));
-    }, SYNC_INTERVAL * 1000);
-    if (_syncTimer.unref) _syncTimer.unref();
+  await initSchema(_db);
+
+  // Push our schema/rows up once, then start a push+pull heartbeat.
+  if (SYNC_ENABLED) {
+    try { await raw.push(); } catch (e) {
+      console.warn('[db] initial push failed (continuing local-first):', e.message);
+    }
+    if (SYNC_INTERVAL > 0) {
+      _syncTimer = setInterval(async () => {
+        try { await raw.pull(); await raw.push(); }
+        catch (e) { console.warn('[db] periodic sync failed:', e.message); }
+      }, SYNC_INTERVAL * 1000);
+      if (_syncTimer.unref) _syncTimer.unref();
+    }
   }
   return _db;
 }
 
-// Force a sync now (call on shutdown / on demand). No-op when local-only.
+// Force a full sync now (call on shutdown / on demand). No-op when local-only.
 async function syncNow() {
-  if (!_db || !SYNC_ENABLED) return false;
-  await _db.sync();
+  if (!_raw || !SYNC_ENABLED) return false;
+  await _raw.pull();
+  await _raw.push();
   return true;
 }
 
-function isSyncEnabled() {
-  return SYNC_ENABLED;
-}
+function isSyncEnabled() { return SYNC_ENABLED; }
+function isEncryptedAtRest() { return _encryptedAtRest; }
 
-function isEncryptedAtRest() {
-  return _encryptedAtRest;
+// ---- Embedding blob codec -------------------------------------------------
+// Store embeddings as raw little-endian Float32 bytes (the vector32() SQL func
+// no longer exists). encode: number[] -> Buffer; decode: Buffer -> Float32Array.
+function encodeEmbedding(arr) {
+  const f = Float32Array.from(arr);
+  return Buffer.from(f.buffer, f.byteOffset, f.byteLength);
 }
-
-// Encode a JS number[] as the JSON string vector32() expects.
-function toVectorArg(arr) {
-  return `[${arr.join(',')}]`;
+function decodeEmbedding(buf) {
+  if (!buf) return null;
+  // rows may hand back Buffer, Uint8Array, or ArrayBuffer depending on the driver.
+  const b = Buffer.isBuffer(buf) ? buf
+    : buf instanceof Uint8Array ? Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength)
+    : Buffer.from(buf);
+  // guard against a truncated/garbage blob
+  if (b.byteLength % 4 !== 0) return null;
+  return new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4);
 }
 
 module.exports = {
@@ -231,10 +259,9 @@ module.exports = {
   syncNow,
   isSyncEnabled,
   isEncryptedAtRest,
-  toVectorArg,
+  encodeEmbedding,
+  decodeEmbedding,
   EMBED_DIM,
-  // Live snapshot — sync/encryption are resolved at getDb() time, so read these
-  // via getters rather than capturing module-load values.
   get _config() {
     return {
       LOCAL_DB_PATH,

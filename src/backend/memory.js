@@ -10,16 +10,16 @@
  *               + [last N verbatim turns] + [newest user message]
  *
  * - Rolling summary : SUMMARIZER_MODEL (gemma3:4b) condenses old turns.
- * - Retrieval       : EMBED_MODEL (nomic-embed-text) embeds turns; native libSQL
- *                     vector_top_k finds relevant archived turns by cosine.
+ * - Retrieval       : EMBED_MODEL (nomic-embed-text) embeds turns; archived
+ *                     embeddings are cosine-ranked in JS (see retrieve()).
  * - Persistence     : Turso tables (see db.js). No JSON files.
  *
  * Adapted from the reference Natsumura memory.js (JSON + in-JS cosine) — same
- * algorithm, swapped storage to SQL and cosine to native vector search.
+ * algorithm, swapped storage to SQL.
  */
 
 const crypto = require('crypto');
-const { getDb, toVectorArg, EMBED_DIM } = require('./db');
+const { getDb, encodeEmbedding, decodeEmbedding, EMBED_DIM } = require('./db');
 
 // ---- Config --------------------------------------------------------------
 const OLLAMA_HOST = (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');
@@ -177,12 +177,28 @@ async function acquireLock(id) {
 
 // ---- Retrieval -----------------------------------------------------------
 
+// Cosine similarity of two equal-length vectors (Float32Array or number[]).
+// Embeddings from nomic-embed-text are not pre-normalized, so divide by norms.
+function cosine(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a[i], y = b[i];
+    dot += x * y; na += x * x; nb += y * y;
+  }
+  if (na === 0 || nb === 0) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
 /**
  * Up to k archived turns from THIS conversation most relevant to queryText,
  * above the score threshold, in chronological order.
  *
- * libSQL vector_top_k searches the whole index (can't pre-filter by
- * conversation), so we over-fetch then filter by conversation_id + score.
+ * The @tursodatabase/sync engine has no native vector search, so we load this
+ * conversation's embedded archive rows and cosine-rank them in JS (same
+ * algorithm as the original Natsumura reference). At this app's scale
+ * (hundreds–low-thousands of rows per conversation) this is sub-millisecond.
+ * The WHERE conversation_id already scopes the scan to one story.
  */
 async function retrieve(conversationId, queryText, k = RETRIEVE_K) {
   if (k <= 0 || typeof queryText !== 'string' || !queryText.trim()) return [];
@@ -190,32 +206,29 @@ async function retrieve(conversationId, queryText, k = RETRIEVE_K) {
 
   const db = await getDb();
   const q = await embed(queryText);
-  const qArg = toVectorArg(q);
-  // Over-fetch: the global vector index may interleave other conversations'
-  // turns, so pull extra then filter by conversation_id below.
-  // NOTE: vector_top_k's k MUST be a literal integer — a bound `?` param is
-  // rejected ("third parameter (k) must be a non-negative integer"). fetchK is
-  // never user input; we still coerce to a bounded integer so the inlined value
-  // can only ever be a safe number (defense in depth against SQL injection).
-  const fetchK = Math.trunc(Math.max(Math.min(Number(k) || RETRIEVE_K, 1000) * 8, 32));
 
   const res = await db.execute({
-    sql: `
-      SELECT a.id, a.role, a.content,
-             1 - vector_distance_cos(a.embedding, vector32(?)) AS score
-      FROM vector_top_k('archive_vec_idx', vector32(?), ${fetchK}) AS vt
-      JOIN archive a ON a.id = vt.id
-      WHERE a.conversation_id = ?
-      ORDER BY score DESC`,
-    args: [qArg, qArg, conversationId],
+    sql: `SELECT id, role, content, embedding FROM archive
+          WHERE conversation_id = ? AND embedding IS NOT NULL
+          ORDER BY id ASC`,
+    args: [conversationId],
   });
 
-  const hits = res.rows
-    .filter((r) => Number(r.score) >= RETRIEVE_MIN_SCORE)
-    .slice(0, k)
-    .sort((a, b) => Number(a.id) - Number(b.id)); // chronological
+  const scored = [];
+  for (const r of res.rows) {
+    const vec = decodeEmbedding(r.embedding);
+    if (!vec || vec.length !== EMBED_DIM) continue;
+    const score = cosine(q, vec);
+    if (score >= RETRIEVE_MIN_SCORE) {
+      scored.push({ id: Number(r.id), role: r.role, content: r.content, score });
+    }
+  }
 
-  return hits.map((r) => ({ role: r.role, content: r.content, score: Number(r.score) }));
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, k)
+    .sort((a, b) => a.id - b.id) // chronological
+    .map((r) => ({ role: r.role, content: r.content, score: r.score }));
 }
 
 // ---- Summarization -------------------------------------------------------
@@ -434,25 +447,17 @@ async function recordTurn(conversationId, userMessage, assistantReply, assistant
   // Move folded turns from verbatim -> archive (with embeddings).
   let archived = 0;
   for (const turn of oldest) {
-    let embeddingArg = null;
+    let embeddingBlob = null;
     try {
       const vec = await embed(`${turn.role}: ${turn.content}`);
-      embeddingArg = toVectorArg(vec);
+      embeddingBlob = encodeEmbedding(vec);
     } catch { /* keep content, drop vector (not retrievable) */ }
 
-    if (embeddingArg) {
-      await db.execute({
-        sql: `INSERT INTO archive (conversation_id, role, content, embedding, created_at)
-              VALUES (?, ?, ?, vector32(?), ?)`,
-        args: [conversationId, turn.role, turn.content, embeddingArg, nowIso()],
-      });
-    } else {
-      await db.execute({
-        sql: `INSERT INTO archive (conversation_id, role, content, embedding, created_at)
-              VALUES (?, ?, ?, NULL, ?)`,
-        args: [conversationId, turn.role, turn.content, nowIso()],
-      });
-    }
+    await db.execute({
+      sql: `INSERT INTO archive (conversation_id, role, content, embedding, created_at)
+            VALUES (?, ?, ?, ?, ?)`,
+      args: [conversationId, turn.role, turn.content, embeddingBlob, nowIso()],
+    });
     await db.execute({ sql: 'DELETE FROM turns WHERE id = ?', args: [turn.id] });
     archived++;
   }
