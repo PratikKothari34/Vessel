@@ -1,7 +1,7 @@
 {
-  "name": "scenario-chat-app",
+  "name": "vessel-app",
   "version": "1.0.0",
-  "description": "Scenario_Chat — local uncensored character roleplay desktop app.",
+  "description": "Vessel — local uncensored character roleplay desktop app.",
   "main": "out/main/index.js",
   "author": "Pratik",
   "scripts": {
@@ -19,22 +19,29 @@
     "electron": "^31.3.0",
     "electron-builder": "^24.13.3",
     "electron-vite": "^2.3.0",
+    "sharp": "^0.35.3",
     "vite": "^5.4.0"
   },
   "build": {
-    "appId": "com.scenariochat.app",
-    "productName": "Scenario Chat",
-    "files": ["out/**/*"],
+    "appId": "com.vessel.app",
+    "productName": "Vessel",
+    "files": [
+      "out/**/*"
+    ],
     "extraResources": [
       {
         "from": "../src",
         "to": "backend/src",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "../node_modules",
         "to": "backend/node_modules",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "../package.json",
@@ -46,7 +53,13 @@
       }
     ],
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "shortcutName": "Vessel"
     }
   }
 }

@@ -20,6 +20,10 @@
 
 const crypto = require('crypto');
 
+// Keychain service name. Intentionally kept as 'scenario-chat' (the app's former
+// name) even though the product is now "Vessel": the DB encryption key + Turso
+// token are already stored under this service. Renaming it would orphan them and
+// make the existing encrypted local DB unreadable. Do NOT change without a migration.
 const SERVICE = 'scenario-chat';
 const DB_KEY_ACCOUNT = 'db-encryption-key';
 const TURSO_ACCOUNT = 'turso-auth-token';

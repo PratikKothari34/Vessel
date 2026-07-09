@@ -1,4 +1,4 @@
-// API client for the local Scenario_Chat backend.
+// API client for the local Vessel backend.
 // EventSource can't POST, so /chat streaming is parsed manually from fetch().
 
 const BASE =

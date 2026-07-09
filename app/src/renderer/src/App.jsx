@@ -66,7 +66,7 @@ export default function App() {
       <header className="app-topbar">
         <div className="brand" onClick={() => setView('gallery')}>
           <span className="brand-mark" />
-          <span className="brand-name">Scenario<em>Chat</em></span>
+          <span className="brand-name">Ves<em>sel</em></span>
         </div>
         <div className="topbar-spacer" />
         <div className={`health-pill ${health?.status === 'ok' ? 'ok' : 'down'}`}>

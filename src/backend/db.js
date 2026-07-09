@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * db.js — Turso data layer for Scenario_Chat (@tursodatabase/sync).
+ * db.js — Turso data layer for Vessel (@tursodatabase/sync).
  *
  * Local-first: the source of truth is a local SQLite file (LOCAL_DB_PATH). If
  * TURSO_DATABASE_URL + TURSO_AUTH_TOKEN are set, the client also syncs to Turso
@@ -29,8 +29,20 @@
 
 const path = require('path');
 const fs = require('fs');
-const { connect } = require('@tursodatabase/sync');
 const keystore = require('./keystore');
+
+// @tursodatabase/sync is ESM-only ("type":"module"). This backend is CommonJS,
+// and in the packaged app it runs under Electron's bundled Node 20, where a
+// static require() of an ES module throws ERR_REQUIRE_ESM. Load it via a
+// memoized dynamic import() instead — the only form that works across Node 20
+// (packaged) and Node 22+ (dev).
+let _connect = null;
+async function getConnect() {
+  if (!_connect) {
+    ({ connect: _connect } = await import('@tursodatabase/sync'));
+  }
+  return _connect;
+}
 
 const EMBED_DIM = 768; // nomic-embed-text output dimension
 
@@ -209,7 +221,7 @@ async function getDb() {
 
   const dbPath = localAbsPath();
   clearOrphanedSyncMetadata(dbPath);
-  const opts = { path: dbPath, clientName: 'scenario-chat' };
+  const opts = { path: dbPath, clientName: 'vessel' };
   if (SYNC_ENABLED) {
     opts.url = TURSO_DATABASE_URL;
     opts.authToken = authToken;
@@ -220,6 +232,7 @@ async function getDb() {
     opts.encryption = { cipher: 'aes256gcm', hexkey: encryptionKey };
   }
 
+  const connect = await getConnect();
   const raw = await connect(opts);
   _raw = raw;
   _db = wrap(raw);

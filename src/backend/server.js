@@ -13,7 +13,7 @@ const app = express();
 // ---- Config --------------------------------------------------------------
 const PORT = process.env.PORT || 3001;
 const OLLAMA_HOST = (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'scenario-chat';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'vessel';
 const OLLAMA_CHAT_URL = `${OLLAMA_HOST}/api/chat`;
 // Default reply-length ceiling (tokens). Bounds runaway "essay" replies even
 // when the model ignores the short-paragraph rule; a character can raise it via
@@ -436,7 +436,7 @@ const MAX_BIND_ATTEMPTS = 4;
 
 function listen(attempt = 0) {
   const server = app.listen(PORT, '127.0.0.1', () => {
-    console.log(`Scenario_Chat backend on http://localhost:${PORT}`);
+    console.log(`Vessel backend on http://localhost:${PORT}`);
     console.log(`  -> ollama: ${OLLAMA_CHAT_URL} | model: ${OLLAMA_MODEL}`);
     console.log(`  -> sync: ${db.isSyncEnabled() ? 'enabled' : 'local-only'}`);
     console.log(`  -> memory: summarizer=${memory._config.SUMMARIZER_MODEL}, embedder=${memory._config.EMBED_MODEL}`);

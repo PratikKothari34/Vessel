@@ -1,4 +1,4 @@
-# Scenario Chat
+# Vessel
 
 A local, private, **uncensored** character.ai-style roleplay desktop app for Windows.
 Multiple characters, each with its own persona; long-term memory that survives the
@@ -49,7 +49,7 @@ JS (the Turso sync engine has no native vector search).
    ```
 3. **The custom chat model** (built from the included `Modelfile`):
    ```bash
-   ollama create scenario-chat -f Modelfile
+   ollama create vessel -f Modelfile
    ```
 
 ---
@@ -86,7 +86,7 @@ full list. Key ones:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OLLAMA_MODEL` | `scenario-chat` | Chat model |
+| `OLLAMA_MODEL` | `vessel` | Chat model |
 | `SUMMARIZER_MODEL` | `gemma3:4b` | Rolling-summary model |
 | `EMBED_MODEL` | `nomic-embed-text` | Embedding model (768-dim) |
 | `LOCAL_DB_PATH` | `./data/scenario.db` | Local SQLite file |
@@ -101,11 +101,11 @@ full list. Key ones:
 Local-first with offline writes — the app always works offline; the cloud is a
 backup/mirror you can restore from or read on another machine.
 
-1. Create a Turso DB: `turso db create scenario-chat`
+1. Create a Turso DB: `turso db create vessel`
 2. Get the URL + token:
    ```bash
-   turso db show scenario-chat --url
-   turso db tokens create scenario-chat
+   turso db show vessel --url
+   turso db tokens create vessel
    ```
 3. Put them in `.env` as `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`, restart.
 
@@ -132,8 +132,8 @@ machine.
 ## Project layout
 
 ```
-Scenario_Chat/
-├── Modelfile               # ollama create scenario-chat -f Modelfile
+Vessel/
+├── Modelfile               # ollama create vessel -f Modelfile
 ├── .env.example
 ├── src/backend/
 │   ├── server.js           # Express + SSE /chat + REST

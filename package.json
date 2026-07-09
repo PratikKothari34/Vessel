@@ -1,5 +1,5 @@
 {
-  "name": "scenario-chat-backend",
+  "name": "vessel-backend",
   "version": "1.0.0",
   "description": "Local uncensored character.ai-style roleplay backend (Ollama + Turso sync).",
   "main": "src/backend/server.js",

@@ -20,6 +20,12 @@ dist/
 app/out/
 app/dist/
 
+# Generated icon artifacts. icon.ico IS tracked (electron-builder needs it at
+# build time); the 4K icon.png is regenerable from icon-source.png via
+# app/build/make-icon.mjs, so it stays out of history.
+app/build/icon.png
+app/build/_preview.png
+
 # Logs / OS cruft
 *.log
 .DS_Store
