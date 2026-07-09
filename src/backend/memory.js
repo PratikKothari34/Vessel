@@ -265,10 +265,12 @@ const RETRIEVAL_HEADER =
   '[Relevant earlier moments recalled from this story — use them for continuity:]';
 const SUMMARY_HEADER = '[Story so far — summary of earlier events:]';
 
+// Content must be non-empty: an empty/whitespace user message would otherwise
+// be recorded as a junk turn (the UI blocks empty sends, but the API is open).
 function isValidMsg(m) {
   return m && typeof m === 'object' &&
     (m.role === 'system' || m.role === 'user' || m.role === 'assistant') &&
-    typeof m.content === 'string';
+    typeof m.content === 'string' && m.content.trim().length > 0;
 }
 
 /**
@@ -465,6 +467,37 @@ async function recordTurn(conversationId, userMessage, assistantReply, assistant
   return { archived, summarized: true };
 }
 
+// Record ONLY a user turn (no assistant reply). Used when a stream is stopped
+// before any reply text arrives, so the user's message still survives a reload.
+async function recordUserTurn(conversationId, userMessage) {
+  if (!userMessage || typeof userMessage.content !== 'string' || !userMessage.content.trim()) return false;
+  const db = await getDb();
+  const verbatim = await getVerbatim(conversationId);
+  if (alreadyLast(verbatim, userMessage)) return false;
+  await db.execute({
+    sql: 'INSERT INTO turns (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)',
+    args: [conversationId, 'user', userMessage.content, nowIso()],
+  });
+  await touchConversation(conversationId);
+  return true;
+}
+
+// Delete a conversation row only if it is truly empty (no turns, no archive,
+// no title/summary). Cleans up the row /chat pre-creates when the request then
+// fails (e.g. Ollama down) — safe to call on any conversation.
+async function deleteConversationIfEmpty(id) {
+  if (!isValidId(id)) return false;
+  const db = await getDb();
+  const res = await db.execute({
+    sql: `DELETE FROM conversations WHERE id = ?
+          AND title = '' AND summary = ''
+          AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.conversation_id = conversations.id)
+          AND NOT EXISTS (SELECT 1 FROM archive a WHERE a.conversation_id = conversations.id)`,
+    args: [id],
+  });
+  return res.rowsAffected > 0;
+}
+
 // Record a regenerated reply: append it as a new variant of the LAST assistant
 // turn (no new turn, no re-archiving). Returns the turn + variant ids, or null
 // if there's no assistant turn to regenerate.
@@ -571,7 +604,9 @@ module.exports = {
   ensureConversation,
   buildContext,
   recordTurn,
+  recordUserTurn,
   recordRegeneration,
+  deleteConversationIfEmpty,
   acquireLock,
   getLastAssistantTurn,
   setActiveVariant,

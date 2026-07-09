@@ -109,7 +109,8 @@ backup/mirror you can restore from or read on another machine.
    ```
 3. Put them in `.env` as `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`, restart.
 
-The schema (including the vector index) is created on both local and remote.
+The schema is created on both local and remote (retrieval is in-JS cosine — the
+sync engine has no native vector index).
 
 > **Storage tip:** keep `LOCAL_DB_PATH` **outside** a OneDrive/Dropbox-synced
 > folder — file-syncers can lock the SQLite file mid-write.

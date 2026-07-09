@@ -74,6 +74,19 @@ function buildDirectorMessage(director) {
 }
 
 // ---- Middleware ----------------------------------------------------------
+app.disable('x-powered-by');
+
+// DNS-rebinding guard: a malicious website can point its own DNS at 127.0.0.1
+// and then read this API same-origin from the victim's browser. Such requests
+// carry the attacker's hostname in Host; only loopback names are legitimate
+// (the app itself always calls localhost/127.0.0.1).
+app.use((req, res, next) => {
+  const host = String(req.headers.host || '').toLowerCase();
+  const name = host.replace(/:\d+$/, '');
+  if (name === 'localhost' || name === '127.0.0.1' || name === '[::1]') return next();
+  return res.status(403).json({ error: 'Forbidden host.' });
+});
+
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173')
   .split(',').map((o) => o.trim()).filter(Boolean);
 app.use(cors({
@@ -187,13 +200,14 @@ app.delete('/conversations/:id', async (req, res) => {
  *   - Post-stream: records the turn off the response path (summarize/embed).
  */
 app.post('/chat', async (req, res) => {
-  const { messages, conversationId, characterId, regenerate, director } = req.body || {};
+  const { messages: rawMessages, conversationId, characterId, regenerate, director } = req.body || {};
   const isRegenerate = Boolean(regenerate);
   const hasDirector = typeof director === 'string' && director.trim().length > 0;
 
-  // messages may be empty for a regenerate (re-roll) or a director-only note
-  // (steer + continue without a new user turn). Otherwise require a real message.
-  if (!Array.isArray(messages) || (messages.length === 0 && !isRegenerate && !hasDirector)) {
+  // messages may be absent/empty for a regenerate (re-roll) or a director-only
+  // note (steer + continue without a new user turn). Otherwise require a real message.
+  const messages = Array.isArray(rawMessages) ? rawMessages : [];
+  if (messages.length === 0 && !isRegenerate && !hasDirector) {
     return res.status(400).json({ error: 'Invalid input: "messages" must be a non-empty array.' });
   }
   // A director-only request has no story user turn to record.
@@ -229,6 +243,7 @@ app.post('/chat', async (req, res) => {
     if (isRegenerate) {
       const lastAssistant = await memory.getLastAssistantTurn(convId);
       if (!lastAssistant) {
+        await memory.deleteConversationIfEmpty(convId);
         if (releaseLock) releaseLock();
         return res.status(400).json({ error: 'Nothing to regenerate: this conversation has no previous reply.' });
       }
@@ -251,6 +266,7 @@ app.post('/chat', async (req, res) => {
     retrieved = built.retrieved || [];
 
     if (!outboundMessages.some((m) => m.role !== 'system')) {
+      await memory.deleteConversationIfEmpty(convId);
       if (releaseLock) releaseLock();
       return res.status(400).json({
         error: isRegenerate
@@ -259,6 +275,7 @@ app.post('/chat', async (req, res) => {
       });
     }
   } catch (err) {
+    if (convId) { try { await memory.deleteConversationIfEmpty(convId); } catch { /* best effort */ } }
     if (releaseLock) releaseLock();
     return res.status(500).json({ error: 'Memory subsystem failed to assemble context.', detail: err.message });
   }
@@ -286,14 +303,27 @@ app.post('/chat', async (req, res) => {
       signal: abortController.signal,
     });
   } catch (err) {
+    if (err.name === 'AbortError') {
+      // User stopped before Ollama even sent headers (e.g. model still
+      // loading). Keep their message so it survives a reload.
+      try {
+        if (latestUser) await memory.recordUserTurn(convId, latestUser);
+        else await memory.deleteConversationIfEmpty(convId);
+      } catch { /* best effort */ }
+      if (releaseLock) releaseLock();
+      return;
+    }
+    // Request failed — nothing generated or recorded. Don't leave behind the
+    // empty conversation row ensureConversation pre-created for a new chat.
+    try { await memory.deleteConversationIfEmpty(convId); } catch { /* best effort */ }
     if (releaseLock) releaseLock();
-    if (err.name === 'AbortError') return;
     return res.status(503).json({ error: 'Cannot reach Ollama. Is it running?', detail: err.message, ollama: OLLAMA_HOST });
   }
 
   if (!ollamaRes.ok) {
     let detail;
     try { detail = await ollamaRes.json(); } catch { detail = await ollamaRes.text().catch(() => ''); }
+    try { await memory.deleteConversationIfEmpty(convId); } catch { /* best effort */ }
     if (releaseLock) releaseLock();
     return res.status(ollamaRes.status === 404 ? 404 : 502).json({ error: `Ollama returned ${ollamaRes.status}.`, detail });
   }
@@ -351,17 +381,27 @@ app.post('/chat', async (req, res) => {
     try { res.end(); } catch { /* closed */ }
   }
 
-  // Post-stream bookkeeping — off the response path. Skip on error/disconnect.
+  // Post-stream bookkeeping — off the response path.
   // A director-only message (no user turn, no regenerate) steers behavior but is
   // never recorded; it still produces a reply we DO record as a normal turn.
+  // A stream the user stopped (clientAborted) is still recorded: the partial
+  // reply if any tokens arrived, else just the user's message — so nothing on
+  // screen silently vanishes on reload. Only an Ollama error skips recording.
   try {
-    if (!ollamaError && !clientAborted && replyText.trim()) {
+    const partial = replyText.trim();
+    if (!ollamaError && partial) {
       const assistantName = character ? character.name : 'Character';
       if (isRegenerate) {
-        await memory.recordRegeneration(convId, replyText.trim());
+        await memory.recordRegeneration(convId, partial);
       } else {
-        await memory.recordTurn(convId, latestUser, replyText.trim(), assistantName);
+        await memory.recordTurn(convId, latestUser, partial, assistantName);
       }
+    } else if (!ollamaError && latestUser) {
+      await memory.recordUserTurn(convId, latestUser);
+    } else {
+      // Nothing recorded (Ollama error, or aborted director/regenerate with no
+      // text) — drop the conversation row if this request created it empty.
+      await memory.deleteConversationIfEmpty(convId);
     }
   } catch (err) {
     console.error(`[memory] record failed for ${convId}:`, err.message);
@@ -384,6 +424,23 @@ app.put('/conversations/:id/active-variant', async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: 'Failed to set active variant.', detail: err.message });
   }
+});
+
+// ---- Shutdown (called by the Electron shell) -------------------------------
+// On Windows, Electron's before-quit child.kill() is TerminateProcess — the
+// SIGTERM flush below never runs. The shell instead POSTs here so the final
+// cloud sync happens before the process exits. Loopback-only, same local trust
+// model as the rest of the API; a no-op flush when sync is disabled.
+app.post('/shutdown', async (req, res) => {
+  // Custom header forces a CORS preflight, so a drive-by webpage's "simple"
+  // cross-site POST can't kill the backend; the Electron shell sets it freely.
+  if (req.get('x-vessel-shutdown') !== '1') {
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+  try { await db.syncNow(); } catch { /* best effort */ }
+  res.json({ ok: true });
+  const t = setTimeout(() => process.exit(0), 100);
+  if (t.unref) t.unref();
 });
 
 // ---- Startup -------------------------------------------------------------

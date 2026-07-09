@@ -21,7 +21,6 @@ export const api = {
 
   // Characters
   listCharacters: () => json('GET', '/characters').then((d) => d.characters),
-  getCharacter: (id) => json('GET', `/characters/${id}`),
   createCharacter: (c) => json('POST', '/characters', c),
   updateCharacter: (id, c) => json('PUT', `/characters/${id}`, c),
   deleteCharacter: (id) => json('DELETE', `/characters/${id}`),
@@ -32,7 +31,6 @@ export const api = {
       (d) => d.conversations
     ),
   getConversation: (id) => json('GET', `/conversations/${id}`),
-  renameConversation: (id, title) => json('PATCH', `/conversations/${id}`, { title }),
   deleteConversation: (id) => json('DELETE', `/conversations/${id}`),
   setActiveVariant: (id, turnId, variantId) =>
     json('PUT', `/conversations/${id}/active-variant`, { turnId, variantId }),

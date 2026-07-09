@@ -4,7 +4,16 @@
    surfaces. Premium, calm, modern. (Palette adopted from the Stitch design.)
    ============================================================================ */
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+/* Inter bundled locally (variable, latin, 400-700). A Google Fonts @import
+   here would be blocked by the CSP (style-src 'self') and would break the
+   app's no-external-calls guarantee. */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('./assets/inter-latin-400-700.woff2') format('woff2');
+}
 
 :root {
   /* ── Ink / surfaces (near-black, layered) ── */

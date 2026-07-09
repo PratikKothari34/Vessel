@@ -179,7 +179,6 @@ async function deleteCharacter(id) {
 }
 
 module.exports = {
-  newId,
   isValidId,
   listCharacters,
   getCharacter,

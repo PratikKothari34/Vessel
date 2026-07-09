@@ -74,6 +74,10 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
 
+  // The app never needs camera/mic/geolocation/etc. Electron grants permission
+  // requests by default — deny them all so a compromised renderer can't ask.
+  mainWindow.webContents.session.setPermissionRequestHandler((_wc, _permission, cb) => cb(false));
+
   // Open external links in the system browser — but ONLY safe web schemes, so a
   // compromised renderer can't trigger file://, javascript:, or app-launch URLs.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -120,9 +124,25 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-// Kill the backend child on quit so it doesn't linger.
-app.on('before-quit', () => {
-  if (backendProc && !backendProc.killed) {
-    try { backendProc.kill(); } catch { /* best effort */ }
-  }
+// Flush + kill the backend child on quit so it doesn't linger. On Windows,
+// child.kill() is TerminateProcess — the backend's SIGTERM handler (final cloud
+// sync) never runs — so ask it to flush over HTTP first, then kill.
+let quitting = false;
+app.on('before-quit', (e) => {
+  if (quitting) return;
+  quitting = true;
+  if (!backendProc || backendProc.killed) return;
+  e.preventDefault();
+
+  const finish = () => {
+    try { if (backendProc && !backendProc.killed) backendProc.kill(); } catch { /* best effort */ }
+    app.exit(0);
+  };
+  const req = http.request(
+    { host: '127.0.0.1', port: BACKEND_PORT, path: '/shutdown', method: 'POST', headers: { 'x-vessel-shutdown': '1' }, timeout: 3000 },
+    (res) => { res.resume(); res.on('end', finish); },
+  );
+  req.on('error', finish);
+  req.on('timeout', () => { req.destroy(); finish(); });
+  req.end();
 });
