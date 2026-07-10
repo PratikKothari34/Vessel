@@ -2,6 +2,7 @@
   "name": "vessel-app",
   "version": "1.0.0",
   "description": "Vessel — local uncensored character roleplay desktop app.",
+  "license": "GPL-3.0-only",
   "main": "out/main/index.js",
   "author": "Pratik",
   "scripts": {

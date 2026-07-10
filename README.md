@@ -121,7 +121,14 @@ sync engine has no native vector index).
 
 ---
 
-## Build a Windows installer
+## Install (Windows)
+
+Grab the latest `Vessel Setup *.exe` from the
+[Releases](../../releases) page and run it (one-click, per-user install).
+You still need **Ollama + the three models** (see Prerequisites) on the machine.
+Your data lives in `%APPDATA%/Vessel/data/` and survives updates.
+
+### Or build the installer yourself
 
 ```bash
 cd app
@@ -159,3 +166,10 @@ Vessel/
 Everything is local by default: the LLM, the database, the conversations. No
 telemetry, no external calls except to your own Ollama instance. Cloud sync is
 strictly opt-in and only activates when you provide Turso credentials.
+
+---
+
+## License
+
+[GPL-3.0](LICENSE) — free to use, modify, and redistribute; derivatives must
+stay under the same license.

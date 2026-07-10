@@ -2,6 +2,7 @@
   "name": "vessel-backend",
   "version": "1.0.0",
   "description": "Local uncensored character.ai-style roleplay backend (Ollama + Turso sync).",
+  "license": "GPL-3.0-only",
   "main": "src/backend/server.js",
   "type": "commonjs",
   "engines": {
