@@ -581,14 +581,16 @@ async function getConversation(id) {
   };
 }
 
+// Returns the new title, or null when the conversation doesn't exist.
 async function setTitle(id, title) {
   if (!isValidId(id)) throw new Error('setTitle: invalid id');
+  const clean = typeof title === 'string' ? title.slice(0, 200) : '';
   const db = await getDb();
-  await db.execute({
+  const res = await db.execute({
     sql: 'UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?',
-    args: [typeof title === 'string' ? title.slice(0, 200) : '', nowIso(), id],
+    args: [clean, nowIso(), id],
   });
-  return { title: typeof title === 'string' ? title.slice(0, 200) : '' };
+  return res.rowsAffected > 0 ? { title: clean } : null;
 }
 
 async function deleteConversation(id) {

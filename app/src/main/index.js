@@ -2,6 +2,7 @@
 
 const { app, BrowserWindow, shell, ipcMain } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const { spawn } = require('child_process');
 const http = require('http');
 
@@ -23,11 +24,37 @@ function backendPaths() {
   return { script: path.join(base, 'src', 'backend', 'server.js'), cwd: base };
 }
 
+// Packaged: user data must NOT live under resources/ (the backend cwd) — an
+// NSIS update reinstalls into a wiped install dir, deleting the DB, its sync
+// sidecars, and settings.json. Point the backend at Electron's per-user data
+// dir instead, migrating anything an older build left in resources/backend/data
+// (one-time copy; the filename scenario.db must not change — see keystore.js).
+// Dev keeps the repo-relative default; an explicit LOCAL_DB_PATH always wins.
+function packagedDataEnv(cwd) {
+  if (isDev || process.env.LOCAL_DB_PATH) return {};
+  const dataDir = path.join(app.getPath('userData'), 'data');
+  const newDb = path.join(dataDir, 'scenario.db');
+  const oldDir = path.join(cwd, 'data');
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    if (!fs.existsSync(newDb) && fs.existsSync(oldDir)) {
+      for (const f of fs.readdirSync(oldDir)) {
+        const dst = path.join(dataDir, f);
+        if (!fs.existsSync(dst)) fs.copyFileSync(path.join(oldDir, f), dst);
+      }
+      console.log(`[main] migrated legacy data dir ${oldDir} -> ${dataDir}`);
+    }
+  } catch (e) {
+    console.error('[main] data dir migration failed:', e.message);
+  }
+  return { LOCAL_DB_PATH: newDb };
+}
+
 function startBackend() {
   const { script, cwd } = backendPaths();
   backendProc = spawn(process.execPath, [script], {
     cwd,
-    env: { ...process.env, PORT: String(BACKEND_PORT), ELECTRON_RUN_AS_NODE: '1' },
+    env: { ...process.env, ...packagedDataEnv(cwd), PORT: String(BACKEND_PORT), ELECTRON_RUN_AS_NODE: '1' },
     stdio: 'pipe',
   });
   backendProc.stdout.on('data', (d) => process.stdout.write(`[backend] ${d}`));

@@ -29,6 +29,9 @@ export default function Chat({ character, conversationId, onBack, onConversation
   const abortRef = useRef(null);
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
+  // Mirrors convId for use inside timeouts (stop-reload) without stale closures.
+  const convIdRef = useRef(convId);
+  useEffect(() => { convIdRef.current = convId; }, [convId]);
 
   const refreshConversations = useCallback(async () => {
     try { setConversations(await api.listConversations(character.id)); } catch { /* ignore */ }
@@ -161,6 +164,22 @@ export default function Chat({ character, conversationId, onBack, onConversation
   };
 
   const stop = () => { if (abortRef.current) abortRef.current(); setStreaming(false); };
+
+  // Explicit ■ Stop: the backend records the partial reply (or just the user
+  // turn) after the abort, so reload shortly after to show what was kept —
+  // otherwise the bubble vanishes until the next conversation switch. Guarded
+  // by convIdRef so a reload never clobbers a conversation switched to since.
+  const stopAndReload = () => {
+    const id = convId;
+    stop();
+    setStreamText('');
+    setTimeout(() => {
+      if (convIdRef.current === id) {
+        if (id) loadConversation(id);
+        refreshConversations();
+      }
+    }, 600);
+  };
 
   const swipeVariant = async (msgIndex, dir) => {
     const msg = messages[msgIndex];
@@ -328,7 +347,7 @@ export default function Chat({ character, conversationId, onBack, onConversation
               rows={1}
             />
             {streaming ? (
-              <button className="send-btn stop" onClick={stop}>■</button>
+              <button className="send-btn stop" onClick={stopAndReload}>■</button>
             ) : (
               <button className="send-btn" onClick={() => send()} disabled={!input.trim()}>↑</button>
             )}

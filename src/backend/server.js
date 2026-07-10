@@ -226,8 +226,11 @@ app.get('/conversations/:id', async (req, res) => {
 
 app.patch('/conversations/:id', async (req, res) => {
   if (!memory.isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid conversation id.' });
-  try { res.json(await memory.setTitle(req.params.id, (req.body || {}).title)); }
-  catch (err) { res.status(500).json({ error: 'Failed to rename conversation.', detail: err.message }); }
+  try {
+    const result = await memory.setTitle(req.params.id, (req.body || {}).title);
+    if (!result) return res.status(404).json({ error: 'Conversation not found.' });
+    res.json(result);
+  } catch (err) { res.status(500).json({ error: 'Failed to rename conversation.', detail: err.message }); }
 });
 
 app.delete('/conversations/:id', async (req, res) => {
@@ -330,9 +333,8 @@ app.post('/chat', async (req, res) => {
   // Abort upstream if the client disconnects. Listen on res (real disconnect),
   // not req (fires immediately after body parse).
   const abortController = new AbortController();
-  let clientAborted = false;
   res.on('close', () => {
-    if (!res.writableEnded) { clientAborted = true; abortController.abort(); }
+    if (!res.writableEnded) abortController.abort();
   });
 
   // Per-character sampling overrides (cleaned in characters.js). Apply a default
