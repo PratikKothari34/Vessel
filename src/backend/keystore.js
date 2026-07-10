@@ -102,4 +102,27 @@ async function getTursoToken() {
   }
 }
 
-module.exports = { getDbEncryptionKey, getTursoToken };
+/**
+ * Store (or clear, when empty) the user's Turso auth token in the keychain.
+ * Returns false when no keychain is available — the caller must surface that
+ * instead of silently dropping the secret (we never write it to disk).
+ */
+async function setTursoToken(token) {
+  const kt = keytar();
+  if (!kt) return false;
+  const t = String(token || '').trim();
+  try {
+    if (t) await kt.setPassword(SERVICE, TURSO_ACCOUNT, t);
+    else await kt.deletePassword(SERVICE, TURSO_ACCOUNT);
+    return true;
+  } catch (e) {
+    console.warn('[keystore] could not write Turso token to keychain:', e.message);
+    return false;
+  }
+}
+
+function keychainAvailable() {
+  return Boolean(keytar());
+}
+
+module.exports = { getDbEncryptionKey, getTursoToken, setTursoToken, keychainAvailable };

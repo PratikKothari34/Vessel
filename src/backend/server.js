@@ -7,6 +7,8 @@ const cors = require('cors');
 const db = require('./db');
 const memory = require('./memory');
 const characters = require('./characters');
+const keystore = require('./keystore');
+const settings = require('./settings');
 
 const app = express();
 
@@ -123,6 +125,51 @@ app.get('/health', (_req, res) => {
       summarizeThreshold: memory._config.SUMMARIZE_THRESHOLD,
     },
   });
+});
+
+// ---- Settings (cloud sync credentials) -------------------------------------
+// End users configure their OWN Turso database from the in-app Settings panel
+// (a packaged install ships no .env and no baked-in creds). URL is persisted
+// to data/settings.json; the token goes to the OS keychain only — it is never
+// written to disk and never echoed back. Changes apply on next app start:
+// swapping the live DB handle would race in-flight bookkeeping chains.
+app.get('/settings', async (_req, res) => {
+  try {
+    const token = await keystore.getTursoToken();
+    res.json({
+      tursoUrl: db.resolveSyncUrl(),
+      tokenSet: Boolean(token),
+      keychain: keystore.keychainAvailable(),
+      syncActive: db.isSyncEnabled(), // what the current boot connected with
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not read settings.', detail: e.message });
+  }
+});
+
+app.put('/settings', async (req, res) => {
+  const body = req.body || {};
+  try {
+    if (body.tursoUrl !== undefined) {
+      const url = String(body.tursoUrl).trim().slice(0, 2048);
+      if (url && !/^(libsql|https?):\/\/\S+$/i.test(url)) {
+        return res.status(400).json({ error: 'Database URL must start with libsql:// or https://.' });
+      }
+      settings.save({ tursoUrl: url });
+    }
+    if (body.tursoToken !== undefined) {
+      const token = String(body.tursoToken).trim().slice(0, 8192);
+      const ok = await keystore.setTursoToken(token);
+      if (!ok) {
+        return res.status(500).json({
+          error: 'OS keychain unavailable — the token cannot be stored securely. Sync stays off.',
+        });
+      }
+    }
+    res.json({ ok: true, restartRequired: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not save settings.', detail: e.message });
+  }
 });
 
 // ---- Characters ----------------------------------------------------------

@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, shell, ipcMain } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const http = require('http');
@@ -105,6 +105,14 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
   }
 }
+
+// Renderer asks for a relaunch after saving sync settings (they apply at
+// backend boot). Goes through the normal quit path, so before-quit still
+// flushes + kills the backend first.
+ipcMain.handle('app:relaunch', () => {
+  app.relaunch();
+  app.quit();
+});
 
 app.whenReady().then(async () => {
   startBackend();

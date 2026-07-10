@@ -25,6 +25,10 @@ export const api = {
   updateCharacter: (id, c) => json('PUT', `/characters/${id}`, c),
   deleteCharacter: (id) => json('DELETE', `/characters/${id}`),
 
+  // Settings (cloud sync credentials — applied on next app start)
+  getSettings: () => json('GET', '/settings'),
+  saveSettings: (patch) => json('PUT', '/settings', patch),
+
   // Conversations
   listConversations: (characterId) =>
     json('GET', `/conversations${characterId ? `?characterId=${characterId}` : ''}`).then(

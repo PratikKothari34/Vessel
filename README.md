@@ -99,7 +99,8 @@ full list. Key ones:
 ### Cloud sync (optional)
 
 Local-first with offline writes — the app always works offline; the cloud is a
-backup/mirror you can restore from or read on another machine.
+backup/mirror you can restore from or read on another machine. Every user brings
+their **own** Turso database; no credentials ship with the app.
 
 1. Create a Turso DB: `turso db create vessel`
 2. Get the URL + token:
@@ -107,7 +108,10 @@ backup/mirror you can restore from or read on another machine.
    turso db show vessel --url
    turso db tokens create vessel
    ```
-3. Put them in `.env` as `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`, restart.
+3. In the app: **Settings → Cloud sync**, paste the URL + token, save, restart.
+   The URL is persisted to `data/settings.json`; the token goes to the OS
+   keychain (never written to disk). Dev alternative: `TURSO_DATABASE_URL` /
+   `TURSO_AUTH_TOKEN` in `.env` — in-app values override `.env`.
 
 The schema is created on both local and remote (retrieval is in-JS cosine — the
 sync engine has no native vector index).

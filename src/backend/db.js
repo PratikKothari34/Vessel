@@ -4,9 +4,14 @@
  * db.js — Turso data layer for Vessel (@tursodatabase/sync).
  *
  * Local-first: the source of truth is a local SQLite file (LOCAL_DB_PATH). If
- * TURSO_DATABASE_URL + TURSO_AUTH_TOKEN are set, the client also syncs to Turso
- * cloud via the push/pull protocol (backup + multi-device). With no Turso creds
- * the app is 100% local and needs no account.
+ * a Turso database URL + auth token are configured, the client also syncs to
+ * Turso cloud via the push/pull protocol (backup + multi-device). With no
+ * Turso creds the app is 100% local and needs no account.
+ *
+ * Credentials come from the user, not the build: the URL from data/settings.json
+ * (set in-app via PUT /settings; falls back to TURSO_DATABASE_URL in dev) and
+ * the token from the OS keychain (falls back to TURSO_AUTH_TOKEN). Nothing is
+ * baked into the installer.
  *
  * NOTE (2026-07): migrated off @libsql/client. Turso retired the old embedded-
  * replica sync protocol (syncUrl + offline:true) server-side, so this uses the
@@ -30,6 +35,7 @@
 const path = require('path');
 const fs = require('fs');
 const keystore = require('./keystore');
+const settings = require('./settings');
 
 // @tursodatabase/sync is ESM-only ("type":"module"). This backend is CommonJS,
 // and in the packaged app it runs under Electron's bundled Node 20, where a
@@ -47,8 +53,16 @@ async function getConnect() {
 const EMBED_DIM = 768; // nomic-embed-text output dimension
 
 const LOCAL_DB_PATH = process.env.LOCAL_DB_PATH || './data/scenario.db';
-const TURSO_DATABASE_URL = (process.env.TURSO_DATABASE_URL || '').trim();
-const TURSO_URL_SET = Boolean(TURSO_DATABASE_URL);
+
+// Sync URL: settings.json wins when its key is present (the in-app Settings
+// panel wrote it; '' there means the user explicitly disabled sync). An absent
+// key falls back to the env var so dev .env setups keep working.
+function resolveSyncUrl() {
+  const s = settings.load();
+  if (typeof s.tursoUrl === 'string') return s.tursoUrl.trim();
+  return (process.env.TURSO_DATABASE_URL || '').trim();
+}
+let _syncUrlInUse = ''; // what this boot actually connected with
 let SYNC_ENABLED = false;
 let _encryptedAtRest = false;
 const SYNC_INTERVAL = (() => {
@@ -86,6 +100,28 @@ function clearOrphanedSyncMetadata(abs) {
     }
   }
   if (cleared) console.warn(`[db] cleared ${cleared} orphaned sync metadata file(s) (main DB was missing).`);
+}
+
+// The "<dbfile>-info" sidecar ties the local file's sync state to ONE remote
+// database. If the configured remote changed since the last connect (user
+// pointed the app at their own Turso DB), that stale metadata would make the
+// engine pull/push against the wrong generation. Removing just the -info file
+// turns a remote switch into the supported "existing local DB starts syncing
+// now" bootstrap; the local data and WAL are untouched.
+function clearSyncMetadataIfRemoteChanged(abs, syncUrl) {
+  if (!syncUrl) return;
+  const last = String(settings.load().lastSyncUrl || '');
+  if (syncUrl === last) return;
+  if (!last) return; // never synced before → nothing stale to clear
+  const info = `${abs}-info`;
+  try {
+    if (fs.existsSync(info)) {
+      fs.rmSync(info, { force: true });
+      console.warn('[db] sync remote changed — cleared stale sync metadata; re-bootstrapping against the new remote.');
+    }
+  } catch (e) {
+    console.warn('[db] could not clear stale sync metadata:', e.message);
+  }
 }
 
 // ---- Compatibility shim ---------------------------------------------------
@@ -214,16 +250,19 @@ async function getDb() {
     keystore.getTursoToken(),
   ]);
   _encryptedAtRest = Boolean(encryptionKey);
-  SYNC_ENABLED = Boolean(TURSO_URL_SET && authToken);
+  const syncUrl = resolveSyncUrl();
+  _syncUrlInUse = syncUrl;
+  SYNC_ENABLED = Boolean(syncUrl && authToken);
   if (!_encryptedAtRest) {
     console.warn('[db] local database is NOT encrypted at rest (no keychain key and no DB_ENCRYPTION_KEY).');
   }
 
   const dbPath = localAbsPath();
   clearOrphanedSyncMetadata(dbPath);
+  if (SYNC_ENABLED) clearSyncMetadataIfRemoteChanged(dbPath, syncUrl);
   const opts = { path: dbPath, clientName: 'vessel' };
   if (SYNC_ENABLED) {
-    opts.url = TURSO_DATABASE_URL;
+    opts.url = syncUrl;
     opts.authToken = authToken;
   }
   if (encryptionKey) {
@@ -233,7 +272,22 @@ async function getDb() {
   }
 
   const connect = await getConnect();
-  const raw = await connect(opts);
+  let raw;
+  try {
+    raw = await connect(opts);
+  } catch (e) {
+    if (!SYNC_ENABLED) throw e;
+    // A bad URL / revoked token / offline remote must NOT brick the app: the
+    // engine contacts the remote during connect() and throws (e.g. "Host not
+    // found"), which would stop the backend from ever listening — leaving the
+    // user no way to reopen Settings and fix the credentials. Fall back to a
+    // local-only connect instead.
+    console.warn('[db] cloud connect failed — starting LOCAL-ONLY (fix sync settings in-app):', e.message);
+    SYNC_ENABLED = false;
+    delete opts.url;
+    delete opts.authToken;
+    raw = await connect(opts);
+  }
   _raw = raw;
   _db = wrap(raw);
 
@@ -242,6 +296,9 @@ async function getDb() {
     try { await raw.pull(); } catch (e) {
       console.warn('[db] initial pull failed (continuing local-first):', e.message);
     }
+    // Remember which remote this file's sync metadata now belongs to, so a
+    // future URL change can detect it and clear the stale metadata.
+    try { settings.save({ lastSyncUrl: syncUrl }); } catch { /* non-fatal */ }
   }
 
   await initSchema(_db);
@@ -300,6 +357,7 @@ function decodeEmbedding(buf) {
 
 module.exports = {
   getDb,
+  resolveSyncUrl,
   syncNow,
   isSyncEnabled,
   isEncryptedAtRest,
@@ -312,7 +370,7 @@ module.exports = {
       SYNC_ENABLED,
       SYNC_INTERVAL,
       ENCRYPTED_AT_REST: _encryptedAtRest,
-      TURSO_DATABASE_URL: TURSO_URL_SET ? '(set)' : '',
+      TURSO_DATABASE_URL: _syncUrlInUse ? '(set)' : '',
     };
   },
 };
