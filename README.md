@@ -167,6 +167,19 @@ Everything is local by default: the LLM, the database, the conversations. No
 telemetry, no external calls except to your own Ollama instance. Cloud sync is
 strictly opt-in and only activates when you provide Turso credentials.
 
+> **Encryption at rest is currently NOT active.** The bundled sync engine
+> (`@tursodatabase/sync` 0.6.1) accepts an encryption key but still writes
+> cleartext pages — the database opens with a wrong key or no key at all. Rather
+> than claim protection it doesn't provide, the backend verifies this at startup,
+> logs a warning, and reports `encryptedAtRest: false` from `/health`.
+>
+> **What this means for you:** treat `data/scenario.db` (and its `-wal` sidecar)
+> as sensitive plaintext — anyone with read access to those files can read your
+> conversations. Use full-disk encryption (BitLocker / FileVault) if that matters
+> to you, and be careful where you copy or back the files up. The key is still
+> generated and kept in the OS keychain, so encryption switches on automatically
+> if a future engine version implements it.
+
 ---
 
 ## License

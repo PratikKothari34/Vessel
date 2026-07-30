@@ -25,15 +25,18 @@
  * new better-sqlite3-style API (prepare/all/get/run), so only db.js + the vector
  * query in memory.js changed.
  *
- * Encryption at rest: the local SQLite file is encrypted with libSQL-style
- * whole-file encryption (aes256gcm) via the new engine's `encryption` option.
- * The key comes from the OS keychain via keystore.js; with no key available the
- * DB opens unencrypted (local-only, no-keychain fallback). The Turso cloud leg
- * is TLS (https/libsql://).
+ * Encryption at rest: ATTEMPTED via the engine's `encryption` option (aes256gcm),
+ * with the key from the OS keychain (keystore.js). It is verified at boot rather
+ * than assumed — as of @tursodatabase/sync 0.6.1 that option is a silent no-op
+ * (cleartext pages; the file opens with a wrong key or none), so we probe it and
+ * only report/enable encryption when it demonstrably works. See
+ * encryptionActuallyWorks() below. The Turso cloud leg is TLS (https/libsql://).
  */
 
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const crypto = require('crypto');
 const keystore = require('./keystore');
 const settings = require('./settings');
 
@@ -241,6 +244,49 @@ async function runMigrations(db) {
   await addCol('tags', `tags TEXT DEFAULT '[]'`);
 }
 
+// Verify that the engine's `encryption` option ACTUALLY encrypts, instead of
+// trusting that passing it worked. As of @tursodatabase/sync 0.6.1 the local
+// encryption option is a silent no-op: pages are written in cleartext, and the
+// resulting file opens fine with a wrong key or no key at all. Claiming
+// "encrypted at rest" when it isn't is worse than admitting it's off, because
+// users make real privacy decisions (where to keep the file, whether to back it
+// up) based on that flag.
+//
+// The probe writes a known marker into a throwaway DB using the same options,
+// checkpoints it to force pages to disk, and greps the bytes. If the marker is
+// readable, encryption is not in effect. Cheap (a few KB, once per boot) and it
+// self-heals: when a future engine version implements this, the probe passes and
+// the app reports encryption without any code change here.
+async function encryptionActuallyWorks(connect, encryption) {
+  const marker = `vessel-probe-${crypto.randomBytes(8).toString('hex')}`;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vessel-enc-'));
+  const probePath = path.join(dir, 'probe.db');
+  try {
+    const probe = await connect({
+      path: probePath, clientName: 'vessel-probe',
+      experimental: ['encryption'], encryption,
+    });
+    await probe.exec('CREATE TABLE probe (v TEXT)');
+    await probe.run('INSERT INTO probe VALUES (?)', marker);
+    // Force WAL pages into the main file; unwritten data would look "encrypted"
+    // simply by not being there yet.
+    try { await probe.all('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best effort */ }
+    await probe.close();
+
+    const needle = Buffer.from(marker);
+    for (const f of fs.readdirSync(dir)) {
+      if (fs.readFileSync(path.join(dir, f)).includes(needle)) return false;
+    }
+    return true;
+  } catch (e) {
+    // Probe failed to run — don't claim encryption we couldn't demonstrate.
+    console.warn('[db] encryption self-check could not run:', e.message);
+    return false;
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 // ---- Connect --------------------------------------------------------------
 async function getDb() {
   if (_db) return _db;
@@ -249,13 +295,9 @@ async function getDb() {
     keystore.getDbEncryptionKey(),
     keystore.getTursoToken(),
   ]);
-  _encryptedAtRest = Boolean(encryptionKey);
   const syncUrl = resolveSyncUrl();
   _syncUrlInUse = syncUrl;
   SYNC_ENABLED = Boolean(syncUrl && authToken);
-  if (!_encryptedAtRest) {
-    console.warn('[db] local database is NOT encrypted at rest (no keychain key and no DB_ENCRYPTION_KEY).');
-  }
 
   const dbPath = localAbsPath();
   clearOrphanedSyncMetadata(dbPath);
@@ -265,13 +307,27 @@ async function getDb() {
     opts.url = syncUrl;
     opts.authToken = authToken;
   }
+  const connect = await getConnect();
+
   if (encryptionKey) {
     // keystore returns a 64-char hex string (32 bytes); the engine wants hexkey.
-    opts.experimental = ['encryption'];
-    opts.encryption = { cipher: 'aes256gcm', hexkey: encryptionKey };
+    const encryption = { cipher: 'aes256gcm', hexkey: encryptionKey };
+    // Only enable it if it demonstrably works (see encryptionActuallyWorks).
+    _encryptedAtRest = await encryptionActuallyWorks(connect, encryption);
+    if (_encryptedAtRest) {
+      opts.experimental = ['encryption'];
+      opts.encryption = encryption;
+    } else {
+      console.warn(
+        '[db] encryption-at-rest is NOT active: this @tursodatabase/sync build accepts the\n' +
+        '     encryption option but still writes cleartext pages (the file opens without a key).\n' +
+        '     Opening unencrypted so the DB stays readable by future versions. Treat the local\n' +
+        `     database as sensitive plaintext: ${localAbsPath()}`,
+      );
+    }
+  } else {
+    console.warn('[db] local database is NOT encrypted at rest (no keychain key and no DB_ENCRYPTION_KEY).');
   }
-
-  const connect = await getConnect();
   let raw;
   try {
     raw = await connect(opts);

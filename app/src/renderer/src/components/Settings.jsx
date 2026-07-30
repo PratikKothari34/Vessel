@@ -16,6 +16,7 @@ export default function Settings({ health, onClose }) {
         ['Verbatim turns', health.memory?.verbatimTurns],
         ['Summarize threshold', health.memory?.summarizeThreshold],
         ['Cloud sync', health.sync?.enabled ? `enabled (${health.sync.interval}s)` : 'local-only'],
+        ['Encrypted at rest', health.encryptedAtRest ? 'yes' : 'no — stored as plaintext'],
       ]
     : [];
 
