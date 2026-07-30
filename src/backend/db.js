@@ -25,32 +25,53 @@
  * new better-sqlite3-style API (prepare/all/get/run), so only db.js + the vector
  * query in memory.js changed.
  *
- * Encryption at rest: ATTEMPTED via the engine's `encryption` option (aes256gcm),
- * with the key from the OS keychain (keystore.js). It is verified at boot rather
- * than assumed — as of @tursodatabase/sync 0.6.1 that option is a silent no-op
- * (cleartext pages; the file opens with a wrong key or none), so we probe it and
- * only report/enable encryption when it demonstrably works. See
- * encryptionActuallyWorks() below. The Turso cloud leg is TLS (https/libsql://).
+ * Encryption at rest: REAL, via @tursodatabase/database's aes256gcm whole-file
+ * encryption, with the key from the OS keychain (keystore.js). Verified: no
+ * plaintext on disk, and the file will not open with a wrong key or no key.
+ *
+ * The catch — and why there are two drivers below — is that @tursodatabase/sync
+ * has NO local encryption: its connect() never maps a cipher and silently drops
+ * the `encryption` option (only `remoteEncryption` request headers exist, which
+ * cover the cloud leg, not the local file). So the driver is chosen at RUNTIME
+ * from the live config:
+ *   local-only      -> @tursodatabase/database + aes256gcm  (ENCRYPTED)
+ *   cloud sync on   -> @tursodatabase/sync                  (plaintext, warned)
+ * Existing plaintext databases are migrated in place on first encrypted boot
+ * (see migratePlaintextToEncrypted) because the encrypted driver cannot open a
+ * plaintext file. The Turso cloud leg is TLS (https/libsql://).
  */
 
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
-const crypto = require('crypto');
 const keystore = require('./keystore');
 const settings = require('./settings');
 
-// @tursodatabase/sync is ESM-only ("type":"module"). This backend is CommonJS,
+// Both Turso packages are ESM-only ("type":"module"). This backend is CommonJS,
 // and in the packaged app it runs under Electron's bundled Node 20, where a
-// static require() of an ES module throws ERR_REQUIRE_ESM. Load it via a
+// static require() of an ES module throws ERR_REQUIRE_ESM. Load them via a
 // memoized dynamic import() instead — the only form that works across Node 20
 // (packaged) and Node 22+ (dev).
-let _connect = null;
-async function getConnect() {
-  if (!_connect) {
-    ({ connect: _connect } = await import('@tursodatabase/sync'));
-  }
-  return _connect;
+//
+// TWO drivers, chosen at RUNTIME (see getDb): they have different call shapes
+// and, critically, different encryption support.
+//   @tursodatabase/sync     connect({ path, ... })  — push/pull cloud sync,
+//                           but it DROPS the local `encryption` option on the
+//                           floor (its connect() never maps a cipher; only
+//                           `remoteEncryption` request headers exist). Local
+//                           file is plaintext.
+//   @tursodatabase/database connect(path, opts)     — no cloud sync, but local
+//                           aes256gcm encryption genuinely works (verified:
+//                           no plaintext on disk, and the file will not open
+//                           with a wrong key or no key).
+let _syncConnect = null;
+async function getSyncConnect() {
+  if (!_syncConnect) ({ connect: _syncConnect } = await import('@tursodatabase/sync'));
+  return _syncConnect;
+}
+let _localConnect = null;
+async function getLocalConnect() {
+  if (!_localConnect) ({ connect: _localConnect } = await import('@tursodatabase/database'));
+  return _localConnect;
 }
 
 const EMBED_DIM = 768; // nomic-embed-text output dimension
@@ -244,46 +265,114 @@ async function runMigrations(db) {
   await addCol('tags', `tags TEXT DEFAULT '[]'`);
 }
 
-// Verify that the engine's `encryption` option ACTUALLY encrypts, instead of
-// trusting that passing it worked. As of @tursodatabase/sync 0.6.1 the local
-// encryption option is a silent no-op: pages are written in cleartext, and the
-// resulting file opens fine with a wrong key or no key at all. Claiming
-// "encrypted at rest" when it isn't is worse than admitting it's off, because
-// users make real privacy decisions (where to keep the file, whether to back it
-// up) based on that flag.
-//
-// The probe writes a known marker into a throwaway DB using the same options,
-// checkpoints it to force pages to disk, and greps the bytes. If the marker is
-// readable, encryption is not in effect. Cheap (a few KB, once per boot) and it
-// self-heals: when a future engine version implements this, the probe passes and
-// the app reports encryption without any code change here.
-async function encryptionActuallyWorks(connect, encryption) {
-  const marker = `vessel-probe-${crypto.randomBytes(8).toString('hex')}`;
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vessel-enc-'));
-  const probePath = path.join(dir, 'probe.db');
+// Is this file already encrypted? The encrypted driver refuses a plaintext file
+// ("Decryption failed for page=1") and the plain driver refuses an encrypted one,
+// so we probe cheaply: try to read the schema with no key. Succeeding means the
+// file is plaintext; failing means it's encrypted (or unreadable, which the real
+// open will report properly).
+async function isPlaintextDb(dbPath) {
+  if (!fs.existsSync(dbPath)) return false; // no file yet → nothing to migrate
+  const connect = await getLocalConnect();
+  let db = null;
   try {
-    const probe = await connect({
-      path: probePath, clientName: 'vessel-probe',
-      experimental: ['encryption'], encryption,
-    });
-    await probe.exec('CREATE TABLE probe (v TEXT)');
-    await probe.run('INSERT INTO probe VALUES (?)', marker);
-    // Force WAL pages into the main file; unwritten data would look "encrypted"
-    // simply by not being there yet.
-    try { await probe.all('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best effort */ }
-    await probe.close();
-
-    const needle = Buffer.from(marker);
-    for (const f of fs.readdirSync(dir)) {
-      if (fs.readFileSync(path.join(dir, f)).includes(needle)) return false;
-    }
+    db = await connect(dbPath);
+    await db.all("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1");
     return true;
-  } catch (e) {
-    // Probe failed to run — don't claim encryption we couldn't demonstrate.
-    console.warn('[db] encryption self-check could not run:', e.message);
+  } catch {
     return false;
   } finally {
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (db) { try { await db.close(); } catch { /* ignore */ } }
+  }
+}
+
+// One-time migration: copy an existing PLAINTEXT database into a new encrypted
+// one, then swap it into place. Needed because encryption is whole-file — the
+// encrypted driver cannot open a plaintext DB, so without this an existing
+// install would break the moment encryption switches on.
+//
+// Copies schema + every row (BLOB embeddings included, verified) into a sibling
+// file, then renames. The original is kept as a .plaintext-backup so a failure
+// can never lose someone's stories; we only ever rename after the new file is
+// fully written and closed.
+async function migratePlaintextToEncrypted(dbPath, encryption) {
+  const connect = await getLocalConnect();
+  const tmpPath = `${dbPath}.encrypting`;
+  const backupPath = `${dbPath}.plaintext-backup`;
+
+  // A previous interrupted attempt could leave this behind.
+  for (const f of [tmpPath, `${tmpPath}-wal`, `${tmpPath}-info`]) {
+    try { fs.rmSync(f, { force: true }); } catch { /* ignore */ }
+  }
+
+  console.log('[db] encrypting the existing local database (one-time migration)...');
+  const src = await connect(dbPath);
+  const dst = await connect(tmpPath, { encryption });
+  try {
+    // Fold the source WAL into its main file FIRST. Most of a live database's
+    // recent rows sit in the -wal sidecar, so without this the backup we keep
+    // below would be an empty shell and the sidecar cleanup would discard the
+    // only copy of that data.
+    try { await src.exec('PRAGMA wal_checkpoint(truncate)'); } catch { /* best effort */ }
+    // `__turso_internal_%` objects are engine-managed (autoincrement sequences)
+    // and are rejected if re-created by hand.
+    const tables = await src.all(
+      `SELECT name, sql FROM sqlite_master WHERE type='table'
+         AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'
+         AND sql IS NOT NULL`,
+    );
+    for (const t of tables) await dst.exec(t.sql);
+
+    let total = 0;
+    for (const t of tables) {
+      const rows = await src.all(`SELECT * FROM ${t.name}`);
+      for (const r of rows) {
+        const cols = Object.keys(r);
+        await dst.run(
+          `INSERT INTO ${t.name} (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`,
+          ...cols.map((c) => r[c]),
+        );
+      }
+      total += rows.length;
+    }
+
+    const indexes = await src.all(
+      `SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL
+         AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'`,
+    );
+    for (const i of indexes) { try { await dst.exec(i.sql); } catch { /* index recreated by initSchema */ } }
+
+    try { await dst.exec('PRAGMA wal_checkpoint(truncate)'); } catch { /* best effort */ }
+    await src.close();
+    await dst.close();
+
+    // Swap: keep the plaintext original as a backup rather than deleting it.
+    // (Its data is all in the main file now, thanks to the checkpoint above.)
+    fs.renameSync(dbPath, backupPath);
+    // Drop the OLD file's sidecars — they describe the plaintext DB and would
+    // corrupt reads of the encrypted one that takes its place.
+    for (const suffix of ['-wal', '-info', '-changes', '-wal-revert']) {
+      try { fs.rmSync(`${dbPath}${suffix}`, { force: true }); } catch { /* ignore */ }
+    }
+    fs.renameSync(tmpPath, dbPath);
+    // ...and carry over / clear the temp file's own sidecars.
+    for (const suffix of ['-wal', '-info', '-changes', '-wal-revert']) {
+      const from = `${tmpPath}${suffix}`;
+      try {
+        if (fs.existsSync(from)) fs.rmSync(from, { force: true });
+      } catch { /* ignore */ }
+    }
+    console.log(
+      `[db] migration complete: ${total} rows encrypted. The previous plaintext file is kept at\n` +
+      `     ${backupPath}\n` +
+      '     Delete it once you have confirmed the app works — it is NOT encrypted.',
+    );
+    return true;
+  } catch (e) {
+    try { await src.close(); } catch { /* ignore */ }
+    try { await dst.close(); } catch { /* ignore */ }
+    try { fs.rmSync(tmpPath, { force: true }); } catch { /* ignore */ }
+    console.error('[db] encryption migration FAILED — keeping the existing database as-is:', e.message);
+    return false;
   }
 }
 
@@ -302,47 +391,70 @@ async function getDb() {
   const dbPath = localAbsPath();
   clearOrphanedSyncMetadata(dbPath);
   if (SYNC_ENABLED) clearSyncMetadataIfRemoteChanged(dbPath, syncUrl);
-  const opts = { path: dbPath, clientName: 'vessel' };
-  if (SYNC_ENABLED) {
-    opts.url = syncUrl;
-    opts.authToken = authToken;
-  }
-  const connect = await getConnect();
 
-  if (encryptionKey) {
-    // keystore returns a 64-char hex string (32 bytes); the engine wants hexkey.
-    const encryption = { cipher: 'aes256gcm', hexkey: encryptionKey };
-    // Only enable it if it demonstrably works (see encryptionActuallyWorks).
-    _encryptedAtRest = await encryptionActuallyWorks(connect, encryption);
-    if (_encryptedAtRest) {
-      opts.experimental = ['encryption'];
-      opts.encryption = encryption;
-    } else {
-      console.warn(
-        '[db] encryption-at-rest is NOT active: this @tursodatabase/sync build accepts the\n' +
-        '     encryption option but still writes cleartext pages (the file opens without a key).\n' +
-        '     Opening unencrypted so the DB stays readable by future versions. Treat the local\n' +
-        `     database as sensitive plaintext: ${localAbsPath()}`,
-      );
+  // Driver choice is made HERE, at runtime, from the live config — never baked
+  // in at build/install time. Cloud sync and local encryption are mutually
+  // exclusive today (the sync package has no local encryption), so:
+  //   sync configured  -> sync driver, plaintext local file (user opted in)
+  //   local-only       -> database driver + aes256gcm, genuinely encrypted
+  // Flipping sync on/off in Settings therefore changes drivers on next start.
+  const encryption = encryptionKey ? { cipher: 'aes256gcm', hexkey: encryptionKey } : null;
+
+  // Open the local-only, encrypted path. Handles the one-time plaintext→encrypted
+  // migration and degrades to plaintext rather than failing to boot.
+  const openLocal = async () => {
+    const connect = await getLocalConnect();
+    if (!encryption) {
+      console.warn('[db] local database is NOT encrypted at rest (no keychain key and no DB_ENCRYPTION_KEY).');
+      _encryptedAtRest = false;
+      return connect(dbPath);
     }
-  } else {
-    console.warn('[db] local database is NOT encrypted at rest (no keychain key and no DB_ENCRYPTION_KEY).');
-  }
+    if (await isPlaintextDb(dbPath)) {
+      const ok = await migratePlaintextToEncrypted(dbPath, encryption);
+      if (!ok) { // migration failed — keep the user's data reachable
+        _encryptedAtRest = false;
+        return connect(dbPath);
+      }
+    }
+    try {
+      const db = await connect(dbPath, { encryption });
+      _encryptedAtRest = true;
+      return db;
+    } catch (e) {
+      console.warn('[db] could not open the encrypted database, falling back to plaintext:', e.message);
+      _encryptedAtRest = false;
+      return connect(dbPath);
+    }
+  };
+
   let raw;
-  try {
-    raw = await connect(opts);
-  } catch (e) {
-    if (!SYNC_ENABLED) throw e;
-    // A bad URL / revoked token / offline remote must NOT brick the app: the
-    // engine contacts the remote during connect() and throws (e.g. "Host not
-    // found"), which would stop the backend from ever listening — leaving the
-    // user no way to reopen Settings and fix the credentials. Fall back to a
-    // local-only connect instead.
-    console.warn('[db] cloud connect failed — starting LOCAL-ONLY (fix sync settings in-app):', e.message);
-    SYNC_ENABLED = false;
-    delete opts.url;
-    delete opts.authToken;
-    raw = await connect(opts);
+  if (!SYNC_ENABLED) {
+    raw = await openLocal();
+  } else {
+    // Cloud sync: the sync engine owns the file and cannot encrypt it locally.
+    _encryptedAtRest = false;
+    const connect = await getSyncConnect();
+    const opts = { path: dbPath, clientName: 'vessel', url: syncUrl, authToken };
+    try {
+      raw = await connect(opts);
+      // Only warn once we know sync actually came up; a failed connect falls
+      // back to the encrypted local path below and the warning would be wrong.
+      console.warn(
+        '[db] cloud sync is ON, so the local database is NOT encrypted at rest: the sync engine\n' +
+        '     has no local-file encryption (it only encrypts the cloud leg in transit/at the\n' +
+        `     remote). Treat this file as sensitive plaintext: ${dbPath}\n` +
+        '     Turn sync off in Settings to get an encrypted local database.',
+      );
+    } catch (e) {
+      // A bad URL / revoked token / offline remote must NOT brick the app: the
+      // engine contacts the remote during connect() and throws (e.g. "Host not
+      // found"), which would stop the backend from ever listening — leaving the
+      // user no way to reopen Settings and fix the credentials. Fall back to a
+      // local-only connect instead (which also re-enables encryption).
+      console.warn('[db] cloud connect failed — starting LOCAL-ONLY (fix sync settings in-app):', e.message);
+      SYNC_ENABLED = false;
+      raw = await openLocal();
+    }
   }
   _raw = raw;
   _db = wrap(raw);
