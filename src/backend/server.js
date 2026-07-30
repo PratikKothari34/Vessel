@@ -260,6 +260,21 @@ app.post('/chat', async (req, res) => {
   if (messages.length === 0 && !isRegenerate && !hasDirector) {
     return res.status(400).json({ error: 'Invalid input: "messages" must be a non-empty array.' });
   }
+  // ...and reject messages that carry no usable content (whitespace-only, wrong
+  // type, unknown role). Without this, such a request falls through to a normal
+  // generation on an EXISTING conversation: the junk message is dropped, but the
+  // stored history alone keeps the window non-empty, so the model replies to the
+  // previous turn and we append a SECOND assistant turn with no user turn between
+  // them. That breaks the user/assistant alternation the summarizer and the model
+  // depend on. (A fresh conversation already errored out; only existing ones leaked.)
+  if (messages.length > 0 && !isRegenerate && !hasDirector &&
+      !messages.some((m) => m && typeof m === 'object' &&
+        (m.role === 'user' || m.role === 'assistant') &&
+        typeof m.content === 'string' && m.content.trim())) {
+    return res.status(400).json({
+      error: 'No valid messages: each must have a known role and non-empty string content.',
+    });
+  }
   // A director-only request has no story user turn to record.
   const directorOnly = hasDirector && !isRegenerate &&
     !messages.some((m) => m && m.role === 'user' && typeof m.content === 'string' && m.content.trim());

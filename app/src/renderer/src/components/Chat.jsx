@@ -81,9 +81,11 @@ export default function Chat({ character, conversationId, onBack, onConversation
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, streamText]);
 
-  const send = (regenerate = false) => {
+  // overrideText sends that text instead of the input box (used by chat starters,
+  // which must not depend on a setInput state update having landed first).
+  const send = (regenerate = false, overrideText = null) => {
     if (streaming) return;
-    const raw = input.trim();
+    const raw = (overrideText != null ? overrideText : input).trim();
 
     // Director / OOC: either toggle is on, or the message uses a // or /ooc prefix.
     let director = null;
@@ -233,6 +235,15 @@ export default function Chat({ character, conversationId, onBack, onConversation
 
   const directorActive = directorMode || parseDirector(input) !== null;
 
+  // Starters are openers, so they only make sense before the user has said
+  // anything in this scenario (the display-only greeting doesn't count).
+  const sendStarter = (text) => { setInput(''); send(false, text); };
+  const showStarters =
+    !streaming &&
+    Array.isArray(character.chatStarters) &&
+    character.chatStarters.length > 0 &&
+    !messages.some((m) => m.role === 'user');
+
   return (
     <div className="chat-layout">
       <aside className="chat-rail">
@@ -304,6 +315,21 @@ export default function Chat({ character, conversationId, onBack, onConversation
                 </div>
               );
             })}
+
+            {/* Chat starters: suggested openers from the character dossier. Only
+                on an untouched scenario — once the story is moving they'd be noise. */}
+            {showStarters && (
+              <div className="starter-tray">
+                <p className="starter-head">Suggested openers</p>
+                <div className="starter-chips">
+                  {character.chatStarters.map((s, i) => (
+                    <button key={i} className="starter-chip" onClick={() => sendStarter(s)}>
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {streaming && (
               <div className="msg-row assistant">
