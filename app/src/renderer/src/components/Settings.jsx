@@ -2,6 +2,20 @@ import React, { useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import './settings.css';
 
+// Why the local database is not encrypted, in the user's terms. The backend
+// reports the cause (health.unencryptedReason) because "no" alone can't tell an
+// accepted tradeoff apart from a failure that left stories readable on disk.
+const UNENCRYPTED_LABEL = {
+  sync: 'no — cloud sync stores the local file as plaintext',
+  'no-key': 'NO — the OS keychain was unavailable, so no key could be stored',
+  migration: 'NO — encrypting your existing database failed',
+};
+
+function encryptionLabel(health) {
+  if (health.encryptedAtRest) return 'yes (aes256gcm)';
+  return UNENCRYPTED_LABEL[health.unencryptedReason] || 'no — stored as plaintext';
+}
+
 // Runtime config view + cloud-sync setup. Sync credentials are the user's own
 // Turso database: URL saved to the backend's settings.json, token to the OS
 // keychain (never echoed back — only "saved / not saved"). Changes apply on
@@ -16,16 +30,15 @@ export default function Settings({ health, onClose }) {
         ['Verbatim turns', health.memory?.verbatimTurns],
         ['Summarize threshold', health.memory?.summarizeThreshold],
         ['Cloud sync', health.sync?.enabled ? `enabled (${health.sync.interval}s)` : 'local-only'],
-        [
-          'Encrypted at rest',
-          health.encryptedAtRest
-            ? 'yes (aes256gcm)'
-            : health.sync?.enabled
-              ? 'no — cloud sync stores the local file as plaintext'
-              : 'no — stored as plaintext',
-        ],
+        ['Encrypted at rest', encryptionLabel(health)],
       ]
     : [];
+
+  // A silent downgrade to plaintext is the one failure the user must not miss:
+  // stories end up readable on disk. Sync is a tradeoff they chose, so it gets
+  // a plain note; the rest are failures worth a loud warning.
+  const degraded = health?.status === 'ok' && !health.encryptedAtRest &&
+    health.unencryptedReason && health.unencryptedReason !== 'sync';
 
   const [cfg, setCfg] = useState(null); // { tursoUrl, tokenSet, keychain, syncActive }
   const [url, setUrl] = useState('');
@@ -79,6 +92,18 @@ export default function Settings({ health, onClose }) {
             <span className="dot" />
             {health?.status === 'ok' ? 'Backend connected' : 'Backend offline — is Ollama running?'}
           </div>
+
+          {degraded && (
+            <div className="settings-alert">
+              <strong>Your conversations are being stored unencrypted.</strong>
+              <p>
+                Vessel could not encrypt the local database, so everything you write is
+                readable by anything with access to this machine&rsquo;s files. Restarting the
+                app often fixes it. If it persists, treat the files in your data folder as
+                sensitive and consider full-disk encryption.
+              </p>
+            </div>
+          )}
 
           {rows.length > 0 && (
             <div className="settings-table">

@@ -118,6 +118,9 @@ app.get('/health', (_req, res) => {
     ollama: OLLAMA_HOST,
     sync: { enabled: db.isSyncEnabled(), interval: db._config.SYNC_INTERVAL },
     encryptedAtRest: db.isEncryptedAtRest(),
+    // Why encryption is off, when it is — lets Settings distinguish an accepted
+    // tradeoff (cloud sync) from a silent failure the user should act on.
+    unencryptedReason: db.unencryptedReason(),
     memory: {
       summarizer: memory._config.SUMMARIZER_MODEL,
       embedder: memory._config.EMBED_MODEL,
@@ -291,7 +294,18 @@ app.post('/chat', async (req, res) => {
     releaseLock = await memory.acquireLock(convId);
 
     // Resolve character: explicit characterId, else the conversation's bound one.
+    // A well-formed id that no longer exists must be caught HERE: conversations
+    // .character_id is a FK, so binding a new conversation to a missing character
+    // makes the INSERT fail with a raw "FOREIGN KEY constraint failed" surfaced
+    // as an opaque 500. That is reachable in normal use — the character was
+    // deleted on another synced device, or from a second window, while this chat
+    // was still open. Report it as the 404 it is, so the UI can send the user
+    // back to the gallery instead of retrying a request that can never succeed.
     let charId = characters.isValidId(characterId) ? characterId : null;
+    if (charId && !(await characters.getCharacter(charId))) {
+      if (releaseLock) releaseLock();
+      return res.status(404).json({ error: 'Character not found.', characterId: charId });
+    }
     const convRow = await memory.ensureConversation(convId, charId);
     if (!charId && convRow.character_id) charId = convRow.character_id;
     if (charId) character = await characters.getCharacter(charId);

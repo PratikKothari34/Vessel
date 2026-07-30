@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * memory.js — long-term memory engine (Turso @tursodatabase/sync backed).
+ * memory.js — long-term memory engine (Turso backed; see db.js for the driver).
  *
  * Keeps the model's live window small (fast) while preserving unlimited history:
  *
@@ -55,15 +55,26 @@ function isValidId(id) { return typeof id === 'string' && /^[a-zA-Z0-9_-]{1,64}$
 
 // Ensure a conversation row exists; create it (optionally bound to a character)
 // if missing. Returns the conversation row.
+//
+// character_id is a FK, so a characterId that no longer exists would make the
+// INSERT fail with a raw "FOREIGN KEY constraint failed". Callers should reject
+// a missing character up front (see /chat), but drop the binding rather than
+// throwing if one slips through: an unbound conversation is recoverable, a
+// hard 500 mid-chat is not.
 async function ensureConversation(id, characterId = null) {
   const db = await getDb();
   const res = await db.execute({ sql: 'SELECT * FROM conversations WHERE id = ?', args: [id] });
   if (res.rows.length) return res.rows[0];
+  let boundId = characterId || null;
+  if (boundId) {
+    const c = await db.execute({ sql: 'SELECT 1 FROM characters WHERE id = ?', args: [boundId] });
+    if (!c.rows.length) boundId = null;
+  }
   const ts = nowIso();
   await db.execute({
     sql: `INSERT INTO conversations (id, character_id, title, summary, created_at, updated_at)
           VALUES (?, ?, '', '', ?, ?)`,
-    args: [id, characterId, ts, ts],
+    args: [id, boundId, ts, ts],
   });
   const again = await db.execute({ sql: 'SELECT * FROM conversations WHERE id = ?', args: [id] });
   return again.rows[0];

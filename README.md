@@ -192,6 +192,15 @@ state as `encryptedAtRest`, and Settings shows it too.
 > `scenario.db.plaintext-backup` — delete that file once you've confirmed things
 > work, since it is *not* encrypted.
 
+**If encryption can't be turned on, Vessel says so.** When a key exists but the
+encrypted database cannot be decrypted with it — a rotated or lost keychain
+entry, a restored backup from another machine, a damaged file — the backend
+refuses to start rather than silently reopening your stories in plaintext. Your
+existing data is left untouched and still encrypted, so recovering the original
+key recovers the stories. In the rarer case where no key can be stored at all
+(the OS keychain is unavailable), the app still runs, but `/health` reports *why*
+encryption is off and Settings shows a warning instead of a quiet "no".
+
 ---
 
 ## License

@@ -89,6 +89,17 @@ function resolveSyncUrl() {
 let _syncUrlInUse = ''; // what this boot actually connected with
 let SYNC_ENABLED = false;
 let _encryptedAtRest = false;
+// WHY encryption is off, when it is. A bare boolean can't distinguish "the user
+// turned on cloud sync and accepted the tradeoff" from "the keychain broke and
+// we silently wrote their stories in cleartext" — and those need very different
+// warnings in the UI. Surfaced via /health so Settings can say which happened.
+//   null         -> encrypted, nothing to explain
+//   'sync'       -> cloud sync owns the file; sync engine can't encrypt locally
+//   'no-key'     -> no keychain key and no DB_ENCRYPTION_KEY (degraded!)
+//   'migration'  -> plaintext->encrypted migration failed (degraded!)
+// A failed open of an EXISTING encrypted file has no reason code on purpose:
+// that path throws rather than continuing unencrypted (see openLocal below).
+let _unencryptedReason = null;
 const SYNC_INTERVAL = (() => {
   const v = parseInt(process.env.TURSO_SYNC_INTERVAL, 10);
   return Number.isFinite(v) && v >= 0 ? v : 60;
@@ -407,23 +418,37 @@ async function getDb() {
     if (!encryption) {
       console.warn('[db] local database is NOT encrypted at rest (no keychain key and no DB_ENCRYPTION_KEY).');
       _encryptedAtRest = false;
+      _unencryptedReason = 'no-key';
       return connect(dbPath);
     }
     if (await isPlaintextDb(dbPath)) {
       const ok = await migratePlaintextToEncrypted(dbPath, encryption);
       if (!ok) { // migration failed — keep the user's data reachable
         _encryptedAtRest = false;
+        _unencryptedReason = 'migration';
         return connect(dbPath);
       }
     }
     try {
       const db = await connect(dbPath, { encryption });
       _encryptedAtRest = true;
+      _unencryptedReason = null;
       return db;
     } catch (e) {
-      console.warn('[db] could not open the encrypted database, falling back to plaintext:', e.message);
-      _encryptedAtRest = false;
-      return connect(dbPath);
+      // We HAVE a key and the file is not plaintext, so the file exists and is
+      // encrypted with a DIFFERENT key (rotated/lost keychain entry, a DB
+      // restored from another machine) or is damaged. Falling back to the plain
+      // driver was the old behavior and is never right: it cannot open this
+      // file anyway, and when the file is merely missing it silently creates a
+      // NEW plaintext database that quietly records every future story in
+      // cleartext. Fail loudly instead — the user's encrypted data is left
+      // untouched, so recovering the original key recovers the stories.
+      console.error('[db] could not open the encrypted database:', e.message);
+      throw new Error(
+        `Could not open the encrypted database at ${dbPath}: ${e.message}. ` +
+        'Refusing to fall back to an unencrypted database — your existing data ' +
+        'is still encrypted and untouched.',
+      );
     }
   };
 
@@ -433,6 +458,7 @@ async function getDb() {
   } else {
     // Cloud sync: the sync engine owns the file and cannot encrypt it locally.
     _encryptedAtRest = false;
+    _unencryptedReason = 'sync';
     const connect = await getSyncConnect();
     const opts = { path: dbPath, clientName: 'vessel', url: syncUrl, authToken };
     try {
@@ -497,6 +523,8 @@ async function syncNow() {
 
 function isSyncEnabled() { return SYNC_ENABLED; }
 function isEncryptedAtRest() { return _encryptedAtRest; }
+// null when encrypted; otherwise why not (see _unencryptedReason above).
+function unencryptedReason() { return _encryptedAtRest ? null : _unencryptedReason; }
 
 // ---- Embedding blob codec -------------------------------------------------
 // Store embeddings as raw little-endian Float32 bytes (the vector32() SQL func
@@ -529,6 +557,7 @@ module.exports = {
   syncNow,
   isSyncEnabled,
   isEncryptedAtRest,
+  unencryptedReason,
   encodeEmbedding,
   decodeEmbedding,
   EMBED_DIM,
