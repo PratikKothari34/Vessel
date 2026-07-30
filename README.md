@@ -167,18 +167,30 @@ Everything is local by default: the LLM, the database, the conversations. No
 telemetry, no external calls except to your own Ollama instance. Cloud sync is
 strictly opt-in and only activates when you provide Turso credentials.
 
-> **Encryption at rest is currently NOT active.** The bundled sync engine
-> (`@tursodatabase/sync` 0.6.1) accepts an encryption key but still writes
-> cleartext pages — the database opens with a wrong key or no key at all. Rather
-> than claim protection it doesn't provide, the backend verifies this at startup,
-> logs a warning, and reports `encryptedAtRest: false` from `/health`.
+### Encryption at rest
+
+The local database is encrypted with **aes256gcm** using a 256-bit key generated
+on first run and stored in the OS keychain (Windows Credential Manager). The file
+cannot be opened with a wrong key or no key at all. `/health` reports the live
+state as `encryptedAtRest`, and Settings shows it too.
+
+> **Cloud sync and local encryption are mutually exclusive right now.** The Turso
+> sync engine has no local-file encryption — it only encrypts the cloud leg — so
+> Vessel picks the storage driver at startup based on your settings:
 >
-> **What this means for you:** treat `data/scenario.db` (and its `-wal` sidecar)
-> as sensitive plaintext — anyone with read access to those files can read your
-> conversations. Use full-disk encryption (BitLocker / FileVault) if that matters
-> to you, and be careful where you copy or back the files up. The key is still
-> generated and kept in the OS keychain, so encryption switches on automatically
-> if a future engine version implements it.
+> | Mode | Local file | Cloud backup |
+> |---|---|---|
+> | **Local-only** (default) | **encrypted** (aes256gcm) | — |
+> | **Cloud sync on** | plaintext (warned at startup) | yes, over TLS |
+>
+> Turning sync off in Settings gets you an encrypted local database on the next
+> start. If sync is configured but the remote is unreachable, Vessel falls back to
+> local-only — and encrypts.
+>
+> **Upgrading an existing install:** an older plaintext database is migrated to
+> encrypted automatically on first launch. The original is kept beside it as
+> `scenario.db.plaintext-backup` — delete that file once you've confirmed things
+> work, since it is *not* encrypted.
 
 ---
 
