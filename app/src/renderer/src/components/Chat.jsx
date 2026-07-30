@@ -161,6 +161,14 @@ export default function Chat({ character, conversationId, onBack, onConversation
         setStreaming(false);
         setStreamText('');
         setError(msg);
+        // The send failed, so nothing was recorded. Roll back the optimistic
+        // bubble and put the text back in the composer — otherwise the message
+        // is on screen as if it landed, and vanishes on the next reload with
+        // the user's words already cleared from the input.
+        if (!regenerate && (storyText || director)) {
+          setMessages(messages);
+          setInput((cur) => (cur ? cur : raw));
+        }
       },
     });
   };

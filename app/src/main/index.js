@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, shell, ipcMain } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
@@ -50,6 +50,11 @@ function packagedDataEnv(cwd) {
   return { LOCAL_DB_PATH: newDb };
 }
 
+// Last lines the backend wrote before dying. If it refuses to start (e.g. it
+// will not open the database unencrypted), the window would otherwise just say
+// "backend offline — is Ollama running?", which points at the wrong thing.
+let backendStderr = '';
+
 function startBackend() {
   const { script, cwd } = backendPaths();
   backendProc = spawn(process.execPath, [script], {
@@ -58,7 +63,10 @@ function startBackend() {
     stdio: 'pipe',
   });
   backendProc.stdout.on('data', (d) => process.stdout.write(`[backend] ${d}`));
-  backendProc.stderr.on('data', (d) => process.stderr.write(`[backend] ${d}`));
+  backendProc.stderr.on('data', (d) => {
+    process.stderr.write(`[backend] ${d}`);
+    backendStderr = (backendStderr + d).slice(-4000); // keep the tail only
+  });
   backendProc.on('exit', (code) => console.log(`[backend] exited (${code})`));
 }
 
@@ -96,6 +104,12 @@ function createWindow() {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Explicit rather than inherited: renderers are sandboxed by default on
+      // Electron 20+, but stating it here keeps a future webPreferences edit
+      // from silently dropping it. The preload only requires 'electron', which
+      // stays available under the sandbox.
+      sandbox: true,
+      webviewTag: false,
     },
   });
 
@@ -133,6 +147,10 @@ function createWindow() {
   }
 }
 
+// The preload asks for the backend URL synchronously at load, so the renderer
+// never has to guess the port from its own environment (see preload/index.js).
+ipcMain.on('app:backend-url', (e) => { e.returnValue = BACKEND_URL; });
+
 // Renderer asks for a relaunch after saving sync settings (they apply at
 // backend boot). Goes through the normal quit path, so before-quit still
 // flushes + kills the backend first.
@@ -147,6 +165,18 @@ app.whenReady().then(async () => {
     await waitForBackend();
   } catch (e) {
     console.error('Backend did not become ready:', e.message);
+    // The backend exited instead of listening. That is a hard startup failure
+    // with a real cause (most importantly: it refused to open the database
+    // unencrypted), and it is worth showing verbatim — the in-app status pill
+    // can only say "offline", which sends people to look at Ollama.
+    if (backendProc && backendProc.exitCode !== null) {
+      const detail = backendStderr.trim().split('\n').slice(-6).join('\n');
+      dialog.showErrorBox(
+        'Vessel could not start',
+        'The Vessel backend stopped during startup.\n\n' +
+        (detail || 'No error output was captured.'),
+      );
+    }
   }
   createWindow();
 

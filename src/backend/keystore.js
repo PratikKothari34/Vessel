@@ -6,8 +6,9 @@
  *
  * Holds two secrets:
  *   - db-key:     32-byte random key (hex) that encrypts the local SQLite file
- *                 at rest via the @tursodatabase/sync `encryption` option
- *                 (aes256gcm). Generated once on first run and reused after.
+ *                 at rest via @tursodatabase/database's aes256gcm whole-file
+ *                 encryption (see db.js — the sync package accepts the option
+ *                 but ignores it). Generated once on first run and reused after.
  *   - turso-token: optional Turso cloud auth token, migrated out of .env so it
  *                 isn't left in plaintext on disk.
  *
