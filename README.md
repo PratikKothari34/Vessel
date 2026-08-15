@@ -1,16 +1,20 @@
 # Vessel
 
-A local, private, **uncensored** character.ai-style roleplay desktop app for Windows.
-Multiple characters, each with its own persona; long-term memory that survives the
-model's context window; everything runs on your machine via [Ollama](https://ollama.com).
-Optional encrypted cloud backup + multi-device sync via [Turso](https://turso.tech).
+An **uncensored** roleplay desktop app for Windows that keeps a story coherent
+past the model's context window. Old turns are folded into a rolling summary and
+archived with embeddings, then recalled by relevance when they matter again — so
+the conversation keeps its history without the live window growing. Multiple
+characters, each with its own persona; the model runs on your machine via
+[Ollama](https://ollama.com) and the local database is encrypted at rest.
+Optional cloud backup + multi-device sync via [Turso](https://turso.tech) — which
+trades the encrypted local file for a synced one (see Privacy).
 
-- **Local LLM** — no external API, no content filtering. Built on the Natsumura
-  storytelling/roleplay model.
-- **Multi-character** — create personas (name, persona, greeting, avatar, sampling),
-  switch between them like character.ai.
 - **Long-term memory** — small fast live window + rolling summary + embedding-based
   retrieval, so long stories stay coherent without slowing down.
+- **Local LLM** — no external API, no content filtering. Built on the Natsumura
+  storytelling/roleplay model.
+- **Multi-character** — create personas (name, persona, greeting, avatar, sampling)
+  and switch between them.
 - **Swipe variants** — regenerate a reply to get alternates; swipe `◀ 2/3 ▶`
   between them. All variants persist; the one you pick becomes canonical for memory.
 - **Director / OOC mode** — steer the AI with out-of-character instructions
@@ -18,7 +22,8 @@ Optional encrypted cloud backup + multi-device sync via [Turso](https://turso.te
   Director notes guide behavior but are never written into the story or memory.
 - **Response style** — per-character setting (balanced / dialogue-first /
   light-narration) to stop the model from only narrating instead of speaking.
-- **Local-first storage** — SQLite (Turso) on disk; cloud sync is opt-in.
+- **Local-first storage** — SQLite (Turso) on disk, encrypted at rest with a key
+  in the OS keychain; cloud sync is opt-in.
 
 ---
 
@@ -92,9 +97,19 @@ full list. Key ones:
 | `LOCAL_DB_PATH` | `./data/scenario.db` | Local SQLite file |
 | `TURSO_DATABASE_URL` | *(blank)* | Set to enable cloud sync |
 | `TURSO_AUTH_TOKEN` | *(blank)* | Turso auth token |
+| `TURSO_SYNC_INTERVAL` | `60` | Background push/pull cadence (seconds); `0` = startup/shutdown only |
 | `VERBATIM_TURNS` | `8` | Recent turns kept verbatim |
-| `SUMMARIZE_THRESHOLD` | `12` | When to archive old turns |
+| `SUMMARIZE_THRESHOLD` | `12` | When to archive old turns — see the note below |
 | `RETRIEVE_K` | `4` | Max recalled turns per message |
+| `RETRIEVE_MIN_SCORE` | `0.45` | Min cosine similarity (0–1) for a recalled turn to count as relevant |
+| `MAX_SUMMARY_CHARS` | `6000` | Hard cap on rolling-summary length |
+| `SUMMARIZER_NUM_CTX` | `8192` | Summarizer context window |
+
+> `SUMMARIZE_THRESHOLD` must sit above `VERBATIM_TURNS` — archiving can't trigger
+> below the verbatim window. If you set it lower, the backend raises it to
+> `VERBATIM_TURNS + 4` when it starts; `SUMMARIZE_THRESHOLD=6` with
+> `VERBATIM_TURNS=8` runs as `12`, not `6`. Like all `.env` tuning, it's read from
+> your config each launch — nothing here is fixed when the app is built.
 
 ### Cloud sync (optional)
 
