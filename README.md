@@ -23,7 +23,8 @@ trades the encrypted local file for a synced one (see Privacy).
 - **Response style** — per-character setting (balanced / dialogue-first /
   light-narration) to stop the model from only narrating instead of speaking.
 - **Local-first storage** — SQLite (Turso) on disk, encrypted at rest with a key
-  in the OS keychain; cloud sync is opt-in.
+  in the OS keychain. Cloud sync is opt-in and trades that encryption for a
+  synced file (see Privacy).
 
 ---
 
