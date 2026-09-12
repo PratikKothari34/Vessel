@@ -57,7 +57,7 @@ Each stage ships and measures independently. Every stage survives the next.
 | 0 | Instrument | **done** — `metrics.js`, `GET /metrics`. |
 | 1 | KV quant test | **done, and it answered differently than expected.** The spill is real (9.52 GB resident, 3.27 GB on CPU), but `num_ctx` is the lever, not KV dtype: 32768 -> 12288 takes decode 13.69 -> 39.37 tok/s, while `q8_0` at 12288 is *slower* than f16. Adopted `OLLAMA_NUM_CTX=12288`, rejected `q8_0`. Numbers in `docs/MASTER.md`. |
 | 2 | Prompt reorder + retrieval fixes | **done** — prefill reuse p50 0.408 -> 0.717; stable prefix 8% -> 88%. |
-| 3 | Ollama -> llama-server | next. Still Node. Gains slot reuse and KV control; removes the three-model install wall. |
+| 3 | Ollama -> llama-server | **done, measured on the target GPU.** Adapter behind `INFERENCE_BACKEND`; both backends pass the same suite. Decode 39.4 -> 46.5 tok/s, prefill ~1,600 -> ~2,200 tok/s, 6.4 -> 6.03 GB resident, and the summariser's 19,365 ms reload becomes 0. KV reuse is now measured (`cache_n` p50 0.985), not estimated. Numbers in `docs/MASTER.md`. |
 | 4 | Rust + Tauri | In-process llama.cpp, persistent KV, single binary. Open risk below is now closed. |
 
 Stage 1 also surfaced the cost Stage 3 and Stage 4 are meant to delete. Ollama
@@ -66,8 +66,10 @@ model on every summary: the next user message waits **19.4 s** for a reload. Tha
 is not a tuning problem — it is the "summarisation reuses the already-loaded chat
 weights" argument above, priced.
 
-Stages 0-2 are free and carry forward verbatim. Stage 3 proves llama.cpp on the
-target GPU before committing to Rust. **Stage 4 must not start before 0-3** —
+Stages 0-2 are free and carry forward verbatim. Stage 3 proved llama.cpp on the
+target GPU before committing to Rust: it is faster on every axis measured, and
+the eviction cost above is gone rather than reduced. **Stage 4 must not start
+before 0-3** —
 building it first hardcodes guesses that measurement would have corrected.
 
 ## Open risk — CLOSED

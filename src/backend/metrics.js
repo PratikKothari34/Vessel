@@ -65,6 +65,11 @@ function record({ conversationId, characterId, model, backend, done, window, pro
   const d = done || {};
   const promptTokens = Number.isFinite(d.prompt_eval_count) ? d.prompt_eval_count : null;
   const evalTokens = Number.isFinite(d.eval_count) ? d.eval_count : null;
+  // llama-server only. `cached_tokens` is llama.cpp's `timings.cache_n` -- how
+  // many prompt tokens it genuinely served from the KV cache. prefillReuse
+  // below is a char-prefix ESTIMATE that works on any backend; this is the
+  // measurement, and the two should track each other closely.
+  const cachedTokens = Number.isFinite(d.cached_tokens) ? d.cached_tokens : null;
 
   const rec = {
     at: new Date().toISOString(),
@@ -89,6 +94,10 @@ function record({ conversationId, characterId, model, backend, done, window, pro
     prefillReuse: typeof promptText === 'string' && conversationId
       ? prefixReuse(conversationId, promptText)
       : null,
+    cachedTokens,
+    cacheReuse: cachedTokens != null && promptTokens
+      ? Math.round((cachedTokens / promptTokens) * 1000) / 1000
+      : null,
     window: window || null,
   };
 
@@ -109,6 +118,7 @@ function summarize(recs) {
   const decode = recs.map((r) => r.decodeTps).filter(Number.isFinite).sort((a, b) => a - b);
   const prefill = recs.map((r) => r.prefillTps).filter(Number.isFinite).sort((a, b) => a - b);
   const reuse = recs.map((r) => r.prefillReuse).filter(Number.isFinite).sort((a, b) => a - b);
+  const cacheReuse = recs.map((r) => r.cacheReuse).filter(Number.isFinite).sort((a, b) => a - b);
   const cpt = recs.map((r) => r.charsPerToken).filter(Number.isFinite).sort((a, b) => a - b);
   return {
     samples: recs.length,
@@ -118,6 +128,10 @@ function summarize(recs) {
     prefillTps: { p50: pct(prefill, 50), p95: pct(prefill, 95) },
     // Stage 2 target: this should climb toward 1.0 once retrieval moves to the tail.
     prefillReuse: { p50: pct(reuse, 50), p95: pct(reuse, 95) },
+    // Engine-reported, not estimated. Null on Ollama, which does not expose it.
+    cacheReuse: cacheReuse.length
+      ? { p50: pct(cacheReuse, 50), p95: pct(cacheReuse, 95), samples: cacheReuse.length }
+      : null,
     charsPerToken: { p50: pct(cpt, 50) },
     // Non-zero load time means the model was evicted between turns — the
     // signature of VRAM pressure, not of a cold start, when it recurs.

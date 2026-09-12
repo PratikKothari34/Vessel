@@ -20,9 +20,9 @@
 
 const crypto = require('crypto');
 const { getDb, encodeEmbedding, decodeEmbedding, EMBED_DIM } = require('./db');
+const inference = require('./inference');
 
 // ---- Config --------------------------------------------------------------
-const OLLAMA_HOST = (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');
 const CHAT_MODEL = process.env.OLLAMA_MODEL || 'vessel';
 const SUMMARIZER_MODEL = process.env.SUMMARIZER_MODEL || 'gemma3:4b';
 const EMBED_MODEL = process.env.EMBED_MODEL || 'nomic-embed-text';
@@ -41,7 +41,9 @@ function floatEnv(name, def, { min = -Infinity, max = Infinity } = {}) {
 }
 
 // Ollama keys a resident model instance on (model, num_ctx) -- not on the model
-// alone. A summariser that differs on EITHER evicts the chat model, and the next
+// alone. (On llama-server this whole problem is gone: one process, one window,
+// fixed at launch, nothing to evict. The backend warns and ignores the value.)
+// A summariser that differs on EITHER evicts the chat model, and the next
 // user message pays a full reload before its first token. Measured on an 8 GB
 // 4060: gemma3:4b costs 19.4 s, vessel at a mismatched num_ctx costs 18.6 s, and
 // vessel at the SAME num_ctx costs 3 ms. So when the summariser is the chat
@@ -120,55 +122,26 @@ async function getVerbatim(id) {
   return res.rows.map((r) => ({ role: r.role, content: r.content }));
 }
 
-// ---- Ollama helpers ------------------------------------------------------
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function fetchRetry(url, opts, tries = 3) {
-  let lastErr;
-  for (let i = 0; i < tries; i++) {
-    try {
-      const res = await fetch(url, opts);
-      if (res.ok) return res;
-      if (res.status < 500) throw new Error(`${res.status} ${await res.text().catch(() => '')}`);
-      lastErr = new Error(`${res.status} ${await res.text().catch(() => '')}`);
-    } catch (e) { lastErr = e; }
-    if (i < tries - 1) await sleep(400 * (i + 1));
-  }
-  throw lastErr;
-}
+// ---- Engine calls --------------------------------------------------------
+// Transport and per-backend quirks live in inference/; what stays here is the
+// part that is about memory, not about the engine: the dimension contract the
+// archive depends on, and the summarizer's window.
 
 async function embed(text) {
   const prompt = typeof text === 'string' ? text : String(text == null ? '' : text);
   if (!prompt.trim()) throw new Error('embed: empty text');
-  const body = { model: EMBED_MODEL, prompt };
-  if (EMBED_NUM_GPU >= 0) body.options = { num_gpu: EMBED_NUM_GPU };
-  const res = await fetchRetry(`${OLLAMA_HOST}/api/embeddings`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  if (!Array.isArray(data.embedding) || data.embedding.length === 0) {
-    throw new Error('embed: model returned no embedding');
+  const vec = await inference.embed(EMBED_MODEL, prompt, { numGpu: EMBED_NUM_GPU });
+  // Every archived row is stored at EMBED_DIM. A model that returns anything
+  // else would write vectors that can never be compared against the existing
+  // ones, so this fails the turn rather than corrupting the archive.
+  if (vec.length !== EMBED_DIM) {
+    throw new Error(`embed: expected ${EMBED_DIM} dims, got ${vec.length}`);
   }
-  if (data.embedding.length !== EMBED_DIM) {
-    throw new Error(`embed: expected ${EMBED_DIM} dims, got ${data.embedding.length}`);
-  }
-  return data.embedding;
+  return vec;
 }
 
-async function generate(model, prompt) {
-  const res = await fetchRetry(`${OLLAMA_HOST}/api/generate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model, prompt, stream: false,
-      options: { num_ctx: SUMMARIZER_NUM_CTX },
-    }),
-  });
-  const data = await res.json();
-  return (data.response || '').trim();
+function generate(model, prompt) {
+  return inference.generate(model, prompt, { numCtx: SUMMARIZER_NUM_CTX });
 }
 
 // ---- Per-conversation lock ----------------------------------------------

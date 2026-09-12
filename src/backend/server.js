@@ -10,14 +10,17 @@ const characters = require('./characters');
 const keystore = require('./keystore');
 const settings = require('./settings');
 const metrics = require('./metrics');
+const inference = require('./inference');
 
 const app = express();
 
 // ---- Config --------------------------------------------------------------
 const PORT = process.env.PORT || 3001;
-const OLLAMA_HOST = (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'vessel';
-const OLLAMA_CHAT_URL = `${OLLAMA_HOST}/api/chat`;
+// Which engine is generating tokens, and where it lives. Selected by
+// INFERENCE_BACKEND; see src/backend/inference/index.js.
+const BACKEND = inference.name;
+const OLLAMA_HOST = inference.host;
+const OLLAMA_MODEL = inference.model;
 // Default reply-length ceiling (tokens). Bounds runaway "essay" replies even
 // when the model ignores the short-paragraph rule; a character can raise it via
 // its own sampling.num_predict. ~512 tokens ≈ a few tight paragraphs.
@@ -32,17 +35,32 @@ const DEFAULT_NUM_PREDICT = (() => {
 // 13.7 tok/s. At 12288 the model is 100% GPU-resident and decodes at 39.4.
 // KV quantisation is deliberately NOT used: once the model fits, q8_0 measured
 // slightly slower than f16. See docs/MASTER.md.
+// On llama-server this is a LAUNCH flag (-c), not a request field, so the value
+// is not sent; it is still read here to check the running server agrees.
 const DEFAULT_NUM_CTX = (() => {
   const v = parseInt(process.env.OLLAMA_NUM_CTX, 10);
   return Number.isFinite(v) && v >= 256 ? v : 12288;
 })();
 
+// The model's own global behavior, read from the same Modelfile `ollama create`
+// was given. MEASURED, not assumed: when the client sends any system message of
+// its own, Ollama uses it AS the model's system prompt and the Modelfile SYSTEM
+// is not rendered at all. A bare /api/chat call prefixes 492 tokens; the same
+// call with a client system message prefixes 26. Since buildPersonaMessage
+// always produces a system message, that SYSTEM had never once reached the
+// model. Carrying it here is what actually applies it -- and it is also what
+// makes llama-server, which loads the raw GGUF and knows nothing of Modelfiles,
+// behave the same way. It sits at the head of the cacheable prefix, so it is
+// prefilled once per conversation and reused on every later turn.
+const MODELFILE = require('./inference/modelfile').load();
+const GLOBAL_BEHAVIOR = (MODELFILE.system || '').trim();
+
 // Response-style rules (narration vs dialogue control). Addresses the common
 // failure where the model only narrates the scene instead of speaking as the
 // character (seen in the character.ai reference).
-// FORMAT_RULE is appended to EVERY persona message (all styles). The Modelfile
-// SYSTEM also asks for paragraphs, but that instruction sits far from the point
-// of generation and the model dilutes it; restating it concretely in the
+// FORMAT_RULE is appended to EVERY persona message (all styles). GLOBAL_BEHAVIOR
+// asks for paragraphs too, but that instruction sits far from the point of
+// generation and the model dilutes it; restating it concretely at the end of the
 // per-character system message — which lands right before the turn — is what
 // actually makes the model break replies into spaced paragraphs.
 const FORMAT_RULE =
@@ -56,11 +74,12 @@ const STYLE_RULES = {
     'Response style: keep narration brief and focused. Prioritize the character speaking and reacting over describing the scene.',
 };
 
-// Build the character persona system message. The base model carries global
-// roleplay behavior; this injects the specific character per conversation.
+// Build the character persona system message: the model's global roleplay
+// behavior first, then the specific character for this conversation.
 function buildPersonaMessage(character) {
   if (!character) return null;
   const parts = [];
+  if (GLOBAL_BEHAVIOR) parts.push(GLOBAL_BEHAVIOR);
   parts.push(`You are roleplaying as the character "${character.name}". Stay fully in character as ${character.name}.`);
   if (character.persona && character.persona.trim()) {
     parts.push(`Character details:\n${character.persona.trim()}`);
@@ -127,7 +146,11 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     model: OLLAMA_MODEL,
+    // `ollama` is the host of whatever engine is serving chat. The key keeps its
+    // name because Settings.jsx and the packaged renderer read it; `inference`
+    // is the honest, backend-aware version.
     ollama: OLLAMA_HOST,
+    inference: inference.describe(),
     sync: { enabled: db.isSyncEnabled(), interval: db._config.SYNC_INTERVAL },
     encryptedAtRest: db.isEncryptedAtRest(),
     // Why encryption is off, when it is — lets Settings distinguish an accepted
@@ -428,23 +451,25 @@ app.post('/chat', async (req, res) => {
   // num_predict ceiling so a reply can't run away into an essay even when the
   // model ignores the "2-4 short paragraphs" rule; a character may still raise it
   // via its own sampling.num_predict.
+  // num_ctx goes first so a character's own sampling.num_ctx still wins, and is
+  // omitted entirely on a backend that fixes the window at launch -- sending it
+  // there would be a silently ignored field.
   const options = {
-    num_ctx: DEFAULT_NUM_CTX,
+    ...(inference.acceptsNumCtx ? { num_ctx: DEFAULT_NUM_CTX } : {}),
     num_predict: DEFAULT_NUM_PREDICT,
     ...(character && character.sampling ? character.sampling : {}),
   };
 
-  let ollamaRes;
+  let upstream;
   try {
-    ollamaRes = await fetch(OLLAMA_CHAT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: OLLAMA_MODEL, messages: outboundMessages, stream: true, options }),
+    upstream = await inference.chatStream({
+      messages: outboundMessages,
+      options,
       signal: abortController.signal,
     });
   } catch (err) {
     if (err.name === 'AbortError') {
-      // User stopped before Ollama even sent headers (e.g. model still
+      // User stopped before the engine even sent headers (e.g. model still
       // loading). Keep their message so it survives a reload.
       try {
         if (latestUser) await memory.recordUserTurn(convId, latestUser);
@@ -457,15 +482,19 @@ app.post('/chat', async (req, res) => {
     // empty conversation row ensureConversation pre-created for a new chat.
     try { await memory.deleteConversationIfEmpty(convId); } catch { /* best effort */ }
     if (releaseLock) releaseLock();
-    return res.status(503).json({ error: 'Cannot reach Ollama. Is it running?', detail: err.message, ollama: OLLAMA_HOST });
+    return res.status(503).json({
+      error: `Cannot reach ${BACKEND}. Is it running?`,
+      detail: err.message,
+      backend: BACKEND,
+      ollama: OLLAMA_HOST,
+    });
   }
 
-  if (!ollamaRes.ok) {
-    let detail;
-    try { detail = await ollamaRes.json(); } catch { detail = await ollamaRes.text().catch(() => ''); }
+  if (!upstream.ok) {
     try { await memory.deleteConversationIfEmpty(convId); } catch { /* best effort */ }
     if (releaseLock) releaseLock();
-    return res.status(ollamaRes.status === 404 ? 404 : 502).json({ error: `Ollama returned ${ollamaRes.status}.`, detail });
+    return res.status(upstream.status === 404 ? 404 : 502)
+      .json({ error: `${BACKEND} returned ${upstream.status}.`, detail: upstream.detail });
   }
 
   res.writeHead(200, {
@@ -487,38 +516,20 @@ app.post('/chat', async (req, res) => {
 
   let replyText = '';
   let ollamaError = null;
-  // The final Ollama chunk carries prompt_eval_count / eval_count / durations.
-  // Before metrics.js these were JSON.parsed on the line below and dropped.
+  // The final chunk carries prompt_eval_count / eval_count / durations. Ollama
+  // sends it; the llama-server backend synthesizes the same shape from
+  // llama.cpp's `timings`, and adds cached_tokens on top.
   let doneChunk = null;
 
   try {
-    const reader = ollamaRes.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    const handleLine = (line) => {
-      if (!line) return;
-      res.write(`data: ${line}\n\n`);
-      try {
-        const obj = JSON.parse(line);
-        if (obj.error) { ollamaError = String(obj.error); sendError(`Ollama error: ${ollamaError}`); return; }
-        if (obj.done === true) doneChunk = obj;
-        if (obj.message && typeof obj.message.content === 'string') replyText += obj.message.content;
-      } catch { /* non-JSON line */ }
-    };
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let nl;
-      while ((nl = buffer.indexOf('\n')) !== -1) {
-        const line = buffer.slice(0, nl).trim();
-        buffer = buffer.slice(nl + 1);
-        handleLine(line);
-      }
+    // The backend hands back Ollama-shaped lines whatever engine produced them,
+    // so the SSE body the renderer reads is the same on both.
+    for await (const evt of upstream.events) {
+      if (evt.error) { ollamaError = evt.error; sendError(`${BACKEND} error: ${ollamaError}`); continue; }
+      if (evt.raw) res.write(`data: ${evt.raw}\n\n`);
+      if (evt.delta) replyText += evt.delta;
+      if (evt.done) doneChunk = evt.done;
     }
-    handleLine(buffer.trim());
     res.end();
   } catch (err) {
     if (err.name !== 'AbortError') sendError(`Stream interrupted: ${err.message}`);
@@ -537,7 +548,7 @@ app.post('/chat', async (req, res) => {
       conversationId: convId,
       characterId: character ? character.id : null,
       model: OLLAMA_MODEL,
-      backend: 'ollama',
+      backend: BACKEND,
       done: doneChunk,
       window: windowStats,
       promptText: outboundMessages.map((m) => m.role + "\n" + m.content).join("\n"),
@@ -658,13 +669,34 @@ const MAX_BIND_ATTEMPTS = 4;
 function listen(attempt = 0) {
   const server = app.listen(PORT, '127.0.0.1', () => {
     console.log(`Vessel backend on http://localhost:${PORT}`);
-    console.log(`  -> ollama: ${OLLAMA_CHAT_URL} | model: ${OLLAMA_MODEL} | num_ctx: ${DEFAULT_NUM_CTX}`);
+    console.log(
+      `  -> inference: ${BACKEND} @ ${OLLAMA_HOST} | model: ${OLLAMA_MODEL}` +
+      ` | num_ctx: ${DEFAULT_NUM_CTX}${inference.acceptsNumCtx ? '' : ' (from -c at launch)'}`,
+    );
+    console.log(
+      `  -> model rules: ${GLOBAL_BEHAVIOR ? `${GLOBAL_BEHAVIOR.length} chars from Modelfile` : 'NONE'}` +
+      `${MODELFILE.found ? '' : ' (Modelfile not found)'}`,
+    );
+    // Without it the model falls back to its own alignment and starts refusing,
+    // moralizing, and writing the user's actions -- the exact behaviours the
+    // Modelfile SYSTEM exists to suppress. Silent degradation, so say it loudly.
+    if (!GLOBAL_BEHAVIOR) {
+      console.warn(
+        `  !! No SYSTEM found in ${MODELFILE.path}.\n` +
+        `     Replies will not carry the global roleplay rules on any backend.`,
+      );
+    }
     console.log(`  -> sync: ${db.isSyncEnabled() ? 'enabled' : 'local-only'}`);
-    console.log(`  -> memory: summarizer=${memory._config.SUMMARIZER_MODEL}, embedder=${memory._config.EMBED_MODEL}`);
+    console.log(
+      `  -> memory: summarizer=${memory._config.SUMMARIZER_MODEL},` +
+      ` embedder=${memory._config.EMBED_MODEL} (${inference._embedder.name})`,
+    );
     // Same model, different window = two resident instances, so every summary
     // evicts the chat model and the next message pays a full reload (~19 s
-    // measured). Only reachable by setting SUMMARIZER_NUM_CTX explicitly.
+    // measured). Only reachable by setting SUMMARIZER_NUM_CTX explicitly, and
+    // only meaningful on a backend that takes the window per request.
     if (
+      inference.acceptsNumCtx &&
       memory._config.SUMMARIZER_MODEL === OLLAMA_MODEL &&
       memory._config.SUMMARIZER_NUM_CTX !== DEFAULT_NUM_CTX
     ) {
@@ -674,6 +706,16 @@ function listen(attempt = 0) {
         `     reloads the model. Unset SUMMARIZER_NUM_CTX to keep one slot warm.`,
       );
     }
+    // On llama-server the window is whatever it was launched with. A silent
+    // mismatch shows up later as a truncated story, so ask the server.
+    inference.probeContext().then((n) => {
+      if (n && n !== DEFAULT_NUM_CTX) {
+        console.warn(
+          `  !! llama-server is running at n_ctx=${n}, but OLLAMA_NUM_CTX=${DEFAULT_NUM_CTX}.\n` +
+          `     The window the model actually has is ${n}. Relaunch it with -c ${DEFAULT_NUM_CTX}.`,
+        );
+      }
+    }).catch(() => { /* reporting only */ });
   });
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE' && attempt < MAX_BIND_ATTEMPTS - 1) {
