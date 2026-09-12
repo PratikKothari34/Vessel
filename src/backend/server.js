@@ -9,6 +9,7 @@ const memory = require('./memory');
 const characters = require('./characters');
 const keystore = require('./keystore');
 const settings = require('./settings');
+const metrics = require('./metrics');
 
 const app = express();
 
@@ -23,6 +24,17 @@ const OLLAMA_CHAT_URL = `${OLLAMA_HOST}/api/chat`;
 const DEFAULT_NUM_PREDICT = (() => {
   const v = parseInt(process.env.MAX_REPLY_TOKENS, 10);
   return Number.isFinite(v) && v > 0 ? v : 512;
+})();
+
+// Context window, sent per request so the installed Ollama model is never
+// rebuilt to change it. The Modelfile's own num_ctx 32768 measured 9.52 GB
+// resident against an 8 GB card -- 3.27 GB spilled to CPU and decode fell to
+// 13.7 tok/s. At 12288 the model is 100% GPU-resident and decodes at 39.4.
+// KV quantisation is deliberately NOT used: once the model fits, q8_0 measured
+// slightly slower than f16. See docs/MASTER.md.
+const DEFAULT_NUM_CTX = (() => {
+  const v = parseInt(process.env.OLLAMA_NUM_CTX, 10);
+  return Number.isFinite(v) && v >= 256 ? v : 12288;
 })();
 
 // Response-style rules (narration vs dialogue control). Addresses the common
@@ -130,6 +142,18 @@ app.get('/health', (_req, res) => {
   });
 });
 
+// ---- Metrics ---------------------------------------------------------------
+// Stage 0 of docs/decisions/0001: the measurement that turns num_ctx, KV dtype
+// and the live-window ceiling from arithmetic in docs/MASTER.md into numbers.
+// Local-only, no secrets, no message text — counts and durations only.
+app.get('/metrics', (req, res) => {
+  const limit = Math.min(200, Math.max(0, parseInt(req.query.limit, 10) || 50));
+  const conversationId = memory.isValidId(req.query.conversationId) ? req.query.conversationId : null;
+  res.json(metrics.snapshot({ limit, conversationId }));
+});
+
+app.delete('/metrics', (_req, res) => { metrics.reset(); res.json({ ok: true }); });
+
 // ---- Settings (cloud sync credentials) -------------------------------------
 // End users configure their OWN Turso database from the in-app Settings panel
 // (a packaged install ships no .env and no baked-in creds). URL is persisted
@@ -236,13 +260,33 @@ app.patch('/conversations/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Failed to rename conversation.', detail: err.message }); }
 });
 
+// In-flight /chat streams, keyed by conversation id. A delete aborts them before
+// taking the lock: without that it would sit behind a whole generation, and a
+// bounded wait that expires puts us back to a half-applied write.
+const _liveStreams = new Map();
+
+// The abort makes the holder finish in well under a second, so this only has to
+// cover the post-stream record (summarize + embed), not the generation itself.
+const DELETE_LOCK_WAIT_MS = 30000;
+
 app.delete('/conversations/:id', async (req, res) => {
   if (!memory.isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid conversation id.' });
+  // Stop any generation still writing into this conversation, then take the same
+  // per-conversation lock /chat holds. Recording a turn happens AFTER the stream
+  // closes, so without both the delete interleaves with that write and fails the
+  // turns -> conversations foreign key. Measured: 5 of 5 deletes issued mid-stream
+  // failed that way before, 0 of 5 after.
+  let releaseLock = null;
   try {
+    const live = _liveStreams.get(req.params.id);
+    if (live) for (const ac of live) ac.abort();
+    releaseLock = await memory.acquireLock(req.params.id, DELETE_LOCK_WAIT_MS);
     const removed = await memory.deleteConversation(req.params.id);
+    metrics.forgetConversation(req.params.id);
     if (!removed) return res.status(404).json({ error: 'Conversation not found.' });
     res.json({ deleted: true });
   } catch (err) { res.status(500).json({ error: 'Failed to delete conversation.', detail: err.message }); }
+  finally { if (releaseLock) releaseLock(); }
 });
 
 /**
@@ -288,6 +332,7 @@ app.post('/chat', async (req, res) => {
   let latestUser = null;
   let retrieved = [];
   let outboundMessages = messages;
+  let windowStats = null;
 
   try {
     convId = memory.isValidId(conversationId) ? conversationId : memory.newId();
@@ -312,7 +357,11 @@ app.post('/chat', async (req, res) => {
 
     const personaMsg = buildPersonaMessage(character);
     const directorMsg = buildDirectorMessage(director);
-    const leading = [personaMsg, directorMsg].filter(Boolean);
+    // Persona is stable for the whole conversation and belongs in the cacheable
+    // prefix. The director note changes per request, so it goes in the volatile
+    // tail with recall — see the ordering note in memory.buildContext.
+    const leading = [personaMsg].filter(Boolean);
+    const trailing = [directorMsg].filter(Boolean);
 
     // Regenerate: keep the assistant turn (we append a variant to it). Build
     // from the persisted verbatim window, then drop the trailing assistant so the
@@ -332,7 +381,7 @@ app.post('/chat', async (req, res) => {
     // Director-only: no new user turn — just steer + continue from current state.
     if (directorOnly) contextInput = [];
 
-    const built = await memory.buildContext(convId, contextInput, leading);
+    const built = await memory.buildContext(convId, contextInput, leading, trailing);
     // On regenerate, drop the last assistant turn from the outbound window so the
     // model doesn't see its own previous reply when re-rolling.
     if (isRegenerate) {
@@ -340,6 +389,7 @@ app.post('/chat', async (req, res) => {
       if (lastIdx !== -1) built.messages.splice(built.messages.length - 1 - lastIdx, 1);
     }
     outboundMessages = built.messages;
+    windowStats = built.stats || null;
     // directorOnly has no story user turn to record afterwards.
     latestUser = directorOnly ? null : built.latestUser;
     retrieved = built.retrieved || [];
@@ -362,15 +412,27 @@ app.post('/chat', async (req, res) => {
   // Abort upstream if the client disconnects. Listen on res (real disconnect),
   // not req (fires immediately after body parse).
   const abortController = new AbortController();
+  // Also registered by conversation so DELETE /conversations/:id can stop a
+  // generation that is still writing into the row it is about to remove.
+  // Set-valued because a regenerate can overlap the turn it re-rolls.
+  let live = _liveStreams.get(convId);
+  if (!live) { live = new Set(); _liveStreams.set(convId, live); }
+  live.add(abortController);
   res.on('close', () => {
     if (!res.writableEnded) abortController.abort();
+    live.delete(abortController);
+    if (live.size === 0 && _liveStreams.get(convId) === live) _liveStreams.delete(convId);
   });
 
   // Per-character sampling overrides (cleaned in characters.js). Apply a default
   // num_predict ceiling so a reply can't run away into an essay even when the
   // model ignores the "2-4 short paragraphs" rule; a character may still raise it
   // via its own sampling.num_predict.
-  const options = { num_predict: DEFAULT_NUM_PREDICT, ...(character && character.sampling ? character.sampling : {}) };
+  const options = {
+    num_ctx: DEFAULT_NUM_CTX,
+    num_predict: DEFAULT_NUM_PREDICT,
+    ...(character && character.sampling ? character.sampling : {}),
+  };
 
   let ollamaRes;
   try {
@@ -425,6 +487,9 @@ app.post('/chat', async (req, res) => {
 
   let replyText = '';
   let ollamaError = null;
+  // The final Ollama chunk carries prompt_eval_count / eval_count / durations.
+  // Before metrics.js these were JSON.parsed on the line below and dropped.
+  let doneChunk = null;
 
   try {
     const reader = ollamaRes.body.getReader();
@@ -437,6 +502,7 @@ app.post('/chat', async (req, res) => {
       try {
         const obj = JSON.parse(line);
         if (obj.error) { ollamaError = String(obj.error); sendError(`Ollama error: ${ollamaError}`); return; }
+        if (obj.done === true) doneChunk = obj;
         if (obj.message && typeof obj.message.content === 'string') replyText += obj.message.content;
       } catch { /* non-JSON line */ }
     };
@@ -458,6 +524,26 @@ app.post('/chat', async (req, res) => {
     if (err.name !== 'AbortError') sendError(`Stream interrupted: ${err.message}`);
     try { res.end(); } catch { /* closed */ }
   }
+
+  // Telemetry first: it is pure bookkeeping in memory and must not be skipped by
+  // an early return further down. A stopped stream still carries no done chunk,
+  // so an aborted generation records only that it happened.
+  try {
+    if (windowStats) {
+      windowStats.promptChars = outboundMessages.reduce((n, m) => n + m.content.length, 0);
+      windowStats.messageCount = outboundMessages.length;
+    }
+    metrics.record({
+      conversationId: convId,
+      characterId: character ? character.id : null,
+      model: OLLAMA_MODEL,
+      backend: 'ollama',
+      done: doneChunk,
+      window: windowStats,
+      promptText: outboundMessages.map((m) => m.role + "\n" + m.content).join("\n"),
+      aborted: !doneChunk && !ollamaError,
+    });
+  } catch { /* telemetry must never break a chat */ }
 
   // Post-stream bookkeeping — off the response path.
   // A director-only message (no user turn, no regenerate) steers behavior but is
@@ -572,9 +658,22 @@ const MAX_BIND_ATTEMPTS = 4;
 function listen(attempt = 0) {
   const server = app.listen(PORT, '127.0.0.1', () => {
     console.log(`Vessel backend on http://localhost:${PORT}`);
-    console.log(`  -> ollama: ${OLLAMA_CHAT_URL} | model: ${OLLAMA_MODEL}`);
+    console.log(`  -> ollama: ${OLLAMA_CHAT_URL} | model: ${OLLAMA_MODEL} | num_ctx: ${DEFAULT_NUM_CTX}`);
     console.log(`  -> sync: ${db.isSyncEnabled() ? 'enabled' : 'local-only'}`);
     console.log(`  -> memory: summarizer=${memory._config.SUMMARIZER_MODEL}, embedder=${memory._config.EMBED_MODEL}`);
+    // Same model, different window = two resident instances, so every summary
+    // evicts the chat model and the next message pays a full reload (~19 s
+    // measured). Only reachable by setting SUMMARIZER_NUM_CTX explicitly.
+    if (
+      memory._config.SUMMARIZER_MODEL === OLLAMA_MODEL &&
+      memory._config.SUMMARIZER_NUM_CTX !== DEFAULT_NUM_CTX
+    ) {
+      console.warn(
+        `  !! SUMMARIZER_NUM_CTX=${memory._config.SUMMARIZER_NUM_CTX} does not match num_ctx=${DEFAULT_NUM_CTX}.\n` +
+        `     The summariser shares the chat model but not its slot, so each summary\n` +
+        `     reloads the model. Unset SUMMARIZER_NUM_CTX to keep one slot warm.`,
+      );
+    }
   });
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE' && attempt < MAX_BIND_ATTEMPTS - 1) {

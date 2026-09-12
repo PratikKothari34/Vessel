@@ -52,24 +52,52 @@ from any HTTP-based design:
 
 Each stage ships and measures independently. Every stage survives the next.
 
-| # | Stage | Notes |
+| # | Stage | Status |
 |---|---|---|
-| 0 | Instrument | `prompt_eval_count` is already in the stream at `server.js:439` and discarded. ~3 lines. |
-| 1 | KV quant test | `OLLAMA_KV_CACHE_TYPE=q8_0` — confirms the VRAM spill hypothesis with no code change. |
-| 2 | Prompt reorder + retrieval fixes | Pure algorithm. Ports to any stack unchanged. |
-| 3 | Ollama -> llama-server | Still Node. Gains slot reuse and KV control; removes the three-model install wall. |
-| 4 | Rust + Tauri | In-process llama.cpp, persistent KV, single binary. |
+| 0 | Instrument | **done** — `metrics.js`, `GET /metrics`. |
+| 1 | KV quant test | **done, and it answered differently than expected.** The spill is real (9.52 GB resident, 3.27 GB on CPU), but `num_ctx` is the lever, not KV dtype: 32768 -> 12288 takes decode 13.69 -> 39.37 tok/s, while `q8_0` at 12288 is *slower* than f16. Adopted `OLLAMA_NUM_CTX=12288`, rejected `q8_0`. Numbers in `docs/MASTER.md`. |
+| 2 | Prompt reorder + retrieval fixes | **done** — prefill reuse p50 0.408 -> 0.717; stable prefix 8% -> 88%. |
+| 3 | Ollama -> llama-server | next. Still Node. Gains slot reuse and KV control; removes the three-model install wall. |
+| 4 | Rust + Tauri | In-process llama.cpp, persistent KV, single binary. Open risk below is now closed. |
+
+Stage 1 also surfaced the cost Stage 3 and Stage 4 are meant to delete. Ollama
+keys a resident model on **(model, num_ctx)**, so the summariser evicts the chat
+model on every summary: the next user message waits **19.4 s** for a reload. That
+is not a tuning problem — it is the "summarisation reuses the already-loaded chat
+weights" argument above, priced.
 
 Stages 0-2 are free and carry forward verbatim. Stage 3 proves llama.cpp on the
 target GPU before committing to Rust. **Stage 4 must not start before 0-3** —
 building it first hardcodes guesses that measurement would have corrected.
 
-## Open risk
+## Open risk — CLOSED
 
-Whether the Rust `turso`/`libsql` crate opens the **same aes256gcm whole-file
-format** that `@tursodatabase/database` writes.
+> Whether the Rust `turso`/`libsql` crate opens the **same aes256gcm whole-file
+> format** that `@tursodatabase/database` writes.
 
-If it does not, existing encrypted databases need an export path through the
-Node backend before cutover, and that backend must stay alive through the
-transition. This is the single unknown that can change the shape of Stage 4.
-**Answer it before writing Stage 4 code.**
+**It does.** Measured, not reasoned:
+
+1. `@tursodatabase/database` 0.7.2 — the version Vessel ships — wrote a throwaway
+   database with the exact options `db.js` passes
+   (`{ cipher: 'aes256gcm', hexkey }`) and inserted a canary row. The file starts
+   `54 75 72 73 6f 00 02` (`Turso\0\x02`), not `SQLite format 3` — the encrypted
+   container is Turso's own whole-file format, so this could not be assumed.
+2. A Rust binary against the `turso` crate at the matching 0.7.2, using
+   `Builder::new_local(path).experimental_encryption(true).with_encryption(
+   EncryptionOpts { cipher: "aes256gcm", hexkey })`, read the canary back:
+   `RESULT=OK note=Text("stage4-canary")`.
+3. Negative control, so that `OK` means something: the same binary with a wrong
+   key fails at the first page —
+   `RESULT=OPEN_FAILED error=Decryption failed for page=1`.
+
+`EncryptionOpts { cipher: String, hexkey: String }` is the same shape as the JS
+option object, and the Rust sync engine omits at-rest encryption for the same
+reason the JS one does — so the two-driver split in `db.js` carries over to Rust
+unchanged rather than being a Node-specific workaround.
+
+**Consequence:** Stage 4 needs **no export path** and no transitional Node
+backend. An existing encrypted database opens directly, with the key still read
+from the OS keychain under `SERVICE = 'scenario-chat'`.
+
+Re-verify if the pinned crate version moves: this was proven at 0.7.2 on both
+sides, and the container carries a format version byte (`\x02`).

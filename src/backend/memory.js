@@ -23,6 +23,7 @@ const { getDb, encodeEmbedding, decodeEmbedding, EMBED_DIM } = require('./db');
 
 // ---- Config --------------------------------------------------------------
 const OLLAMA_HOST = (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');
+const CHAT_MODEL = process.env.OLLAMA_MODEL || 'vessel';
 const SUMMARIZER_MODEL = process.env.SUMMARIZER_MODEL || 'gemma3:4b';
 const EMBED_MODEL = process.env.EMBED_MODEL || 'nomic-embed-text';
 const EMBED_NUM_GPU = (() => {
@@ -39,13 +40,31 @@ function floatEnv(name, def, { min = -Infinity, max = Infinity } = {}) {
   return Number.isFinite(v) && v >= min && v <= max ? v : def;
 }
 
-const SUMMARIZER_NUM_CTX = intEnv('SUMMARIZER_NUM_CTX', 8192, { min: 512 });
+// Ollama keys a resident model instance on (model, num_ctx) -- not on the model
+// alone. A summariser that differs on EITHER evicts the chat model, and the next
+// user message pays a full reload before its first token. Measured on an 8 GB
+// 4060: gemma3:4b costs 19.4 s, vessel at a mismatched num_ctx costs 18.6 s, and
+// vessel at the SAME num_ctx costs 3 ms. So when the summariser is the chat
+// model, default its window to the chat window and keep the one slot warm.
+const CHAT_NUM_CTX = intEnv('OLLAMA_NUM_CTX', 12288, { min: 256 });
+const SUMMARIZER_NUM_CTX = intEnv(
+  'SUMMARIZER_NUM_CTX',
+  SUMMARIZER_MODEL === CHAT_MODEL ? CHAT_NUM_CTX : 8192,
+  { min: 512 },
+);
 const VERBATIM_TURNS = intEnv('VERBATIM_TURNS', 8);
 let SUMMARIZE_THRESHOLD = intEnv('SUMMARIZE_THRESHOLD', 12);
 if (SUMMARIZE_THRESHOLD <= VERBATIM_TURNS) SUMMARIZE_THRESHOLD = VERBATIM_TURNS + 4;
 const RETRIEVE_K = intEnv('RETRIEVE_K', 4);
 const RETRIEVE_MIN_SCORE = floatEnv('RETRIEVE_MIN_SCORE', 0.45, { min: -1, max: 1 });
 const MAX_SUMMARY_CHARS = intEnv('MAX_SUMMARY_CHARS', 6000, { min: 500 });
+// How many conversations keep their archive vectors resident. 768 floats x 4 B
+// = 3 KB per archived turn, so a 1,000-turn story costs ~3 MB.
+const ARCHIVE_CACHE_CONVS = intEnv('ARCHIVE_CACHE_CONVS', 8);
+// Parallel embed calls when folding turns into the archive. Ollama serializes
+// work on one model, but overlapping the HTTP + tokenize legs still helps, and
+// this whole phase now runs underneath the summarizer call anyway.
+const EMBED_CONCURRENCY = intEnv('EMBED_CONCURRENCY', 4);
 
 function nowIso() { return new Date().toISOString(); }
 function newId() { return crypto.randomUUID(); }
@@ -99,14 +118,6 @@ async function getVerbatim(id) {
     args: [id],
   });
   return res.rows.map((r) => ({ role: r.role, content: r.content }));
-}
-
-async function hasArchive(id) {
-  const db = await getDb();
-  const res = await db.execute({
-    sql: 'SELECT 1 FROM archive WHERE conversation_id = ? LIMIT 1', args: [id],
-  });
-  return res.rows.length > 0;
 }
 
 // ---- Ollama helpers ------------------------------------------------------
@@ -166,14 +177,18 @@ async function generate(model, prompt) {
 const _locks = new Map();
 const LOCK_WAIT_MS = intEnv('LOCK_WAIT_MS', 120000, { min: 1000 });
 
-async function acquireLock(id) {
+// waitMs caps how long the caller queues behind the holder before giving up and
+// proceeding anyway. A turn is willing to wait out a whole generation; a delete
+// is not -- it should not leave a UI button spinning for two minutes because a
+// stream is stuck, and proceeding unlocked is exactly the old behaviour.
+async function acquireLock(id, waitMs = LOCK_WAIT_MS) {
   const prev = _locks.get(id) || Promise.resolve();
   let release;
   const next = new Promise((r) => { release = r; });
   _locks.set(id, prev.then(() => next));
 
   let timer;
-  const waited = new Promise((r) => { timer = setTimeout(r, LOCK_WAIT_MS); });
+  const waited = new Promise((r) => { timer = setTimeout(r, waitMs); });
   await Promise.race([prev.catch(() => {}), waited]);
   clearTimeout(timer);
 
@@ -188,58 +203,168 @@ async function acquireLock(id) {
 
 // ---- Retrieval -----------------------------------------------------------
 
-// Cosine similarity of two equal-length vectors (Float32Array or number[]).
-// Embeddings from nomic-embed-text are not pre-normalized, so divide by norms.
-function cosine(a, b) {
-  let dot = 0, na = 0, nb = 0;
+// Scale a vector to unit length IN PLACE. Every vector that enters the cache and
+// every query vector is normalized on the way in, which turns cosine similarity
+// into a plain dot product: the two sqrt() calls and the two norm accumulator
+// loops per candidate row disappear from the hot scan entirely.
+function normalizeInPlace(v) {
+  let n = 0;
+  for (let i = 0; i < v.length; i++) n += v[i] * v[i];
+  if (n === 0) return v;
+  const inv = 1 / Math.sqrt(n);
+  for (let i = 0; i < v.length; i++) v[i] *= inv;
+  return v;
+}
+
+// Cosine similarity of two ALREADY-NORMALIZED vectors.
+function dot(a, b) {
+  let d = 0;
   const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) {
-    const x = a[i], y = b[i];
-    dot += x * y; na += x * x; nb += y * y;
+  for (let i = 0; i < n; i++) d += a[i] * b[i];
+  return d;
+}
+
+// ---- Archive vector cache ------------------------------------------------
+// Retrieval used to re-read and re-decode every archived embedding on EVERY
+// turn: 3 KB per row off disk, a Float32 decode per row, then two sqrt loops per
+// row. None of that changes between turns -- the archive is append-only.
+//
+// So keep the decoded, normalized vectors resident per conversation and load
+// only rows newer than the high-water mark. Steady state is zero row reads and
+// zero decodes; a turn that archives adds a handful.
+//
+// Correctness against cloud sync: a pull can insert archive rows with ids BELOW
+// our high-water mark (another device's autoincrement), or a restore can shrink
+// the table. Neither is caught by a max(id) check alone, so we carry the row
+// count too and rebuild from scratch whenever it drops.
+//
+// LRU by insertion order: delete-then-set makes the first key the oldest.
+const _archiveCache = new Map(); // convId -> { ids:[], vecs:[], maxId, rowsSeen }
+
+function _touchCache(conversationId) {
+  let e = _archiveCache.get(conversationId);
+  if (e) _archiveCache.delete(conversationId);
+  else e = { ids: [], vecs: [], maxId: 0, rowsSeen: 0 };
+  _archiveCache.set(conversationId, e);
+  while (_archiveCache.size > ARCHIVE_CACHE_CONVS) {
+    _archiveCache.delete(_archiveCache.keys().next().value);
   }
-  if (na === 0 || nb === 0) return 0;
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+  return e;
+}
+
+function _resetCacheEntry(e) {
+  e.ids.length = 0; e.vecs.length = 0; e.maxId = 0; e.rowsSeen = 0;
+}
+
+// Drop a conversation's cached vectors (conversation deleted).
+function forgetArchive(conversationId) { _archiveCache.delete(conversationId); }
+
+// Rows newer than `sinceId`. NOT filtered on `embedding IS NOT NULL`: the count
+// returned has to be comparable with COUNT(*) below, so nulls are skipped here in
+// JS instead of in SQL.
+async function _fetchArchiveRows(db, conversationId, sinceId) {
+  return (await db.execute({
+    sql: `SELECT id, embedding FROM archive
+          WHERE conversation_id = ? AND id > ?
+          ORDER BY id ASC`,
+    args: [conversationId, sinceId],
+  })).rows;
+}
+
+function _absorbRows(e, rows) {
+  for (const r of rows) {
+    const vec = decodeEmbedding(r.embedding);
+    if (!vec || vec.length !== EMBED_DIM) continue; // no vector -> not retrievable
+    e.ids.push(Number(r.id));
+    e.vecs.push(normalizeInPlace(vec));
+  }
+}
+
+async function loadArchiveVectors(db, conversationId) {
+  const e = _touchCache(conversationId);
+
+  // One indexed aggregate replaces the old hasArchive() existence probe AND
+  // tells us whether anything changed since last turn.
+  const agg = (await db.execute({
+    sql: 'SELECT COUNT(*) AS n, MAX(id) AS m FROM archive WHERE conversation_id = ?',
+    args: [conversationId],
+  })).rows[0] || {};
+  const total = Number(agg.n || 0);
+  const maxId = Number(agg.m || 0);
+
+  if (total === 0) { _resetCacheEntry(e); return e; }
+  // Rows vanished, or the table was restored to an older state: the high-water
+  // mark means nothing now.
+  if (total < e.rowsSeen || maxId < e.maxId) _resetCacheEntry(e);
+
+  // maxId moving with the count unchanged means a row was replaced, not appended
+  // -- rare, but the fetch below then returns more rows than expected and forces
+  // the rebuild, which is exactly right.
+  const expectedNew = total - e.rowsSeen;
+  if (expectedNew > 0 || maxId > e.maxId) {
+    let rows = await _fetchArchiveRows(db, conversationId, e.maxId);
+    // A sync pull can land rows with ids BELOW our high-water mark -- another
+    // device's autoincrement is independent of ours. Those are invisible to the
+    // id > maxId fetch, and the only way to notice is that fewer rows came back
+    // than the count says appeared. Then, and only then, rebuild from scratch.
+    if (rows.length !== expectedNew) {
+      _resetCacheEntry(e);
+      rows = await _fetchArchiveRows(db, conversationId, 0);
+    }
+    _absorbRows(e, rows);
+    e.maxId = maxId;
+  }
+  e.rowsSeen = total;
+  return e;
 }
 
 /**
  * Up to k archived turns from THIS conversation most relevant to queryText,
  * above the score threshold, in chronological order.
  *
- * The @tursodatabase/sync engine has no native vector search, so we load this
- * conversation's embedded archive rows and cosine-rank them in JS (same
- * algorithm as the original Natsumura reference). At this app's scale
- * (hundreds–low-thousands of rows per conversation) this is sub-millisecond.
- * The WHERE conversation_id already scopes the scan to one story.
+ * The @tursodatabase/sync engine has no native vector search, so ranking happens
+ * in JS. Three things keep that cheap:
+ *   - vectors are cached decoded and normalized (see above), so the scan is one
+ *     multiply-add loop per row and nothing else;
+ *   - the scan reads NO prose -- only the k winners' text is fetched, so a
+ *     2,000-turn archive costs four row reads per turn instead of 2,000;
+ *   - the archive is checked BEFORE the embed, so a conversation that has not
+ *     archived anything yet never pays the 20-80 ms CPU embed at all.
  */
 async function retrieve(conversationId, queryText, k = RETRIEVE_K) {
   if (k <= 0 || typeof queryText !== 'string' || !queryText.trim()) return [];
-  if (!(await hasArchive(conversationId))) return [];
 
   const db = await getDb();
-  const q = await embed(queryText);
+  const cache = await loadArchiveVectors(db, conversationId);
+  if (!cache.ids.length) return [];
 
-  const res = await db.execute({
-    sql: `SELECT id, role, content, embedding FROM archive
-          WHERE conversation_id = ? AND embedding IS NOT NULL
-          ORDER BY id ASC`,
-    args: [conversationId],
-  });
+  const q = normalizeInPlace(Float32Array.from(await embed(queryText)));
 
   const scored = [];
-  for (const r of res.rows) {
-    const vec = decodeEmbedding(r.embedding);
-    if (!vec || vec.length !== EMBED_DIM) continue;
-    const score = cosine(q, vec);
-    if (score >= RETRIEVE_MIN_SCORE) {
-      scored.push({ id: Number(r.id), role: r.role, content: r.content, score });
-    }
+  for (let i = 0; i < cache.ids.length; i++) {
+    const score = dot(q, cache.vecs[i]);
+    if (score >= RETRIEVE_MIN_SCORE) scored.push({ id: cache.ids[i], score });
   }
+  if (!scored.length) return [];
 
-  return scored
+  const top = scored
     .sort((a, b) => b.score - a.score)
     .slice(0, k)
-    .sort((a, b) => a.id - b.id) // chronological
-    .map((r) => ({ role: r.role, content: r.content, score: r.score }));
+    .sort((a, b) => a.id - b.id); // chronological
+
+  const rows = (await db.execute({
+    sql: `SELECT id, role, content FROM archive
+          WHERE conversation_id = ? AND id IN (${top.map(() => '?').join(',')})`,
+    args: [conversationId, ...top.map((t) => t.id)],
+  })).rows;
+  const byId = new Map(rows.map((r) => [Number(r.id), r]));
+
+  return top
+    .map((t) => {
+      const r = byId.get(t.id);
+      return r ? { role: r.role, content: r.content, score: t.score } : null;
+    })
+    .filter(Boolean);
 }
 
 // ---- Summarization -------------------------------------------------------
@@ -272,8 +397,15 @@ async function summarize(priorSummary, turns, assistantName) {
 
 // ---- Context assembly ----------------------------------------------------
 
+// The recall block moved from the middle of the prompt to the tail (see
+// buildContext). Sitting after the verbatim window it is the last thing the model
+// reads before the new user turn, so it needs to say plainly that it is NOT the
+// current scene — otherwise the model continues from a retrieved fragment.
 const RETRIEVAL_HEADER =
-  '[Relevant earlier moments recalled from this story — use them for continuity:]';
+  '[Recall — excerpts from EARLIER in this same story, pulled up for continuity. ' +
+  'They already happened and are out of order. Do not treat them as the present ' +
+  'moment and do not continue from them:]';
+const RETRIEVAL_FOOTER = '[End of recall. The present moment is the conversation above.]';
 const SUMMARY_HEADER = '[Story so far — summary of earlier events:]';
 
 // Content must be non-empty: an empty/whitespace user message would otherwise
@@ -285,36 +417,87 @@ function isValidMsg(m) {
 }
 
 /**
- * Build the messages array the chat model receives. `leadingSystems` are
- * caller-supplied system messages (character persona + conversation rules)
- * placed first.
+ * Build the messages array the chat model receives.
+ *
+ * ORDER IS THE OPTIMIZATION. Ollama reuses its KV cache only up to the first
+ * token that differs from the previous request, so anything volatile poisons
+ * everything after it. The old order put the recall block in the middle:
+ *
+ *   persona | summary | RECALL | verbatim turns | new user
+ *                        ^ different every turn
+ *
+ * which re-prefilled the entire verbatim window (~2-4K tokens) on every single
+ * message. The volatile blocks now sit at the tail instead:
+ *
+ *   persona | summary | verbatim turns | RECALL | director | new user
+ *   ------------ append-only ---------/  ---- volatile ----/
+ *
+ * The prefix only ever grows, except when summarization fires and rewrites the
+ * summary — once every SUMMARIZE_THRESHOLD-VERBATIM_TURNS turns. metrics.js
+ * reports the shared-prefix fraction so this is measured, not assumed.
+ *
+ * Putting recall last also helps on quality: the model weights recent context
+ * more heavily, and recall is the part we most want it to actually use.
+ *
+ * `leadingSystems` are stable per-conversation system messages (character
+ * persona). `trailingSystems` are per-request ones (the director note) and
+ * belong in the volatile tail.
  */
-async function buildContext(conversationId, incoming, leadingSystems = []) {
+async function buildContext(conversationId, incoming, leadingSystems = [], trailingSystems = []) {
   const valid = Array.isArray(incoming) ? incoming.filter(isValidMsg) : [];
   const latestUser = [...valid].reverse().find((m) => m.role === 'user') || null;
   const queryText = latestUser ? latestUser.content : '';
 
+  // Independent reads; the retrieve() leg may include a CPU embed round trip.
+  const t0 = Date.now();
+  const [summary, verbatim, retrieved] = await Promise.all([
+    getSummary(conversationId),
+    getVerbatim(conversationId),
+    queryText
+      ? retrieve(conversationId, queryText).catch(() => [])
+      : Promise.resolve([]),
+  ]);
+  const retrieveMs = Date.now() - t0;
+
   const messages = [];
-  for (const s of leadingSystems) if (isValidMsg(s)) messages.push(s);
+  const stable = [];
+  for (const m of leadingSystems) if (isValidMsg(m)) stable.push(m);
+  if (summary) stable.push({ role: 'system', content: `${SUMMARY_HEADER}\n${summary}` });
+  for (const t of verbatim) stable.push({ role: t.role, content: t.content });
+  messages.push(...stable);
 
-  const summary = await getSummary(conversationId);
-  if (summary) messages.push({ role: 'system', content: `${SUMMARY_HEADER}\n${summary}` });
-
-  let retrieved = [];
-  if (queryText) {
-    try { retrieved = await retrieve(conversationId, queryText); } catch { retrieved = []; }
-  }
   if (retrieved.length) {
-    messages.push({ role: 'system', content: `${RETRIEVAL_HEADER}\n${renderTurns(retrieved)}` });
+    messages.push({
+      role: 'system',
+      content: `${RETRIEVAL_HEADER}\n${renderTurns(retrieved)}\n${RETRIEVAL_FOOTER}`,
+    });
   }
+  for (const m of trailingSystems) if (isValidMsg(m)) messages.push(m);
 
-  const verbatim = await getVerbatim(conversationId);
-  for (const t of verbatim) messages.push({ role: t.role, content: t.content });
   if (latestUser && !alreadyLast(verbatim, latestUser)) {
     messages.push({ role: 'user', content: latestUser.content });
   }
 
-  return { messages, retrieved, latestUser };
+  const chars = (arr) => arr.reduce((n, m) => n + m.content.length, 0);
+  const personaChars = chars(leadingSystems.filter(isValidMsg));
+  const stats = {
+    messageCount: messages.length,
+    promptChars: chars(messages),
+    // What the append-only prefix costs. Compare against prefillReuse in
+    // metrics.js: the two should track once the reorder is doing its job.
+    stablePrefixChars: chars(stable),
+    personaChars,
+    summaryChars: summary ? summary.length : 0,
+    verbatimCount: verbatim.length,
+    verbatimChars: chars(verbatim),
+    retrievedCount: retrieved.length,
+    retrievedChars: chars(retrieved),
+    directorChars: chars(trailingSystems.filter(isValidMsg)),
+    newUserChars: latestUser ? latestUser.content.length : 0,
+    retrieveMs,
+  };
+
+  return { messages, retrieved, latestUser, stats };
 }
 
 function alreadyLast(verbatim, msg) {
@@ -398,6 +581,36 @@ async function getVariants(turnId) {
 
 // ---- Post-turn bookkeeping ----------------------------------------------
 
+// Embed a batch of turns with bounded concurrency. Returns blobs positionally;
+// a failed embed yields null, which stores the turn WITHOUT a vector — the text
+// survives, it just cannot be retrieved.
+async function embedAll(turns) {
+  const out = new Array(turns.length).fill(null);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= turns.length) return;
+      try {
+        out[i] = encodeEmbedding(await embed(`${turns[i].role}: ${turns[i].content}`));
+      } catch { out[i] = null; }
+    }
+  };
+  const lanes = Math.max(1, Math.min(EMBED_CONCURRENCY, turns.length));
+  await Promise.all(Array.from({ length: lanes }, worker));
+  return out;
+}
+
+// SQLite caps bound parameters per statement (999 by default). Batched writes
+// below stay well under it by chunking.
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+const ARCHIVE_INSERT_CHUNK = 100; // x5 params = 500 bound values per statement
+const DELETE_ID_CHUNK = 400;
+
 /**
  * Record the user turn + assistant reply. When verbatim count exceeds the
  * threshold, fold the oldest turns into the rolling summary and archive them
@@ -444,38 +657,58 @@ async function recordTurn(conversationId, userMessage, assistantReply, assistant
   })).rows;
 
   const priorSummary = await getSummary(conversationId);
-  let updated;
-  try {
-    updated = await summarize(priorSummary, oldest, assistantName);
-    if (updated.length > MAX_SUMMARY_CHARS) updated = updated.slice(updated.length - MAX_SUMMARY_CHARS);
-  } catch (e) {
-    // Summarizer down: keep turns verbatim rather than lose them.
-    return { archived: 0, summarized: false, error: e.message };
+
+  // The summarizer call is by far the most expensive thing in this phase — a
+  // full generate on SUMMARIZER_MODEL — and the embeds do not depend on it.
+  // Running both legs at once hides the ENTIRE embedding phase underneath the
+  // summarize call. This runs while the per-conversation lock is held, so every
+  // millisecond saved here is a millisecond the user's next message is not
+  // blocked behind bookkeeping for the previous one.
+  const [summaryResult, embeddings] = await Promise.all([
+    summarize(priorSummary, oldest, assistantName).then(
+      (text) => ({ ok: true, text }),
+      (err) => ({ ok: false, error: err.message }),
+    ),
+    embedAll(oldest),
+  ]);
+
+  if (!summaryResult.ok) {
+    // Summarizer down: keep turns verbatim rather than lose them. The embeds we
+    // computed alongside are discarded; they will be recomputed next attempt.
+    return { archived: 0, summarized: false, error: summaryResult.error };
   }
+  let updated = summaryResult.text;
+  if (updated.length > MAX_SUMMARY_CHARS) updated = updated.slice(updated.length - MAX_SUMMARY_CHARS);
+
   await db.execute({
     sql: 'UPDATE conversations SET summary = ?, updated_at = ? WHERE id = ?',
     args: [updated, nowIso(), conversationId],
   });
 
-  // Move folded turns from verbatim -> archive (with embeddings).
-  let archived = 0;
-  for (const turn of oldest) {
-    let embeddingBlob = null;
-    try {
-      const vec = await embed(`${turn.role}: ${turn.content}`);
-      embeddingBlob = encodeEmbedding(vec);
-    } catch { /* keep content, drop vector (not retrievable) */ }
+  // Move folded turns from verbatim -> archive. Two batched statements instead
+  // of 2N single-row ones. A multi-row INSERT is one statement and therefore
+  // already atomic, which matters because the sync shim exposes no transaction
+  // API for us to wrap the old loop in.
+  const ts = nowIso();
+  const rows = oldest.map((turn, i) => ({ turn, blob: embeddings[i] }));
 
+  for (const part of chunk(rows, ARCHIVE_INSERT_CHUNK)) {
+    const args = [];
+    for (const { turn, blob } of part) args.push(conversationId, turn.role, turn.content, blob, ts);
     await db.execute({
       sql: `INSERT INTO archive (conversation_id, role, content, embedding, created_at)
-            VALUES (?, ?, ?, ?, ?)`,
-      args: [conversationId, turn.role, turn.content, embeddingBlob, nowIso()],
+            VALUES ${part.map(() => '(?, ?, ?, ?, ?)').join(', ')}`,
+      args,
     });
-    await db.execute({ sql: 'DELETE FROM turns WHERE id = ?', args: [turn.id] });
-    archived++;
+  }
+  for (const part of chunk(oldest.map((t) => t.id), DELETE_ID_CHUNK)) {
+    await db.execute({
+      sql: `DELETE FROM turns WHERE id IN (${part.map(() => '?').join(',')})`,
+      args: part,
+    });
   }
 
-  return { archived, summarized: true };
+  return { archived: oldest.length, summarized: true };
 }
 
 // Record ONLY a user turn (no assistant reply). Used when a stream is stopped
@@ -499,6 +732,7 @@ async function recordUserTurn(conversationId, userMessage) {
 async function deleteConversationIfEmpty(id) {
   if (!isValidId(id)) return false;
   const db = await getDb();
+  forgetArchive(id);
   const res = await db.execute({
     sql: `DELETE FROM conversations WHERE id = ?
           AND title = '' AND summary = ''
@@ -608,6 +842,7 @@ async function deleteConversation(id) {
   if (!isValidId(id)) throw new Error('deleteConversation: invalid id');
   const db = await getDb();
   const res = await db.execute({ sql: 'DELETE FROM conversations WHERE id = ?', args: [id] });
+  forgetArchive(id); // cached vectors would outlive the rows they describe
   return res.rowsAffected > 0;
 }
 
@@ -627,8 +862,11 @@ module.exports = {
   getConversation,
   setTitle,
   deleteConversation,
+  forgetArchive,
   _config: {
+    CHAT_MODEL, CHAT_NUM_CTX,
     SUMMARIZER_MODEL, SUMMARIZER_NUM_CTX, EMBED_MODEL, EMBED_NUM_GPU,
     VERBATIM_TURNS, SUMMARIZE_THRESHOLD, RETRIEVE_K, RETRIEVE_MIN_SCORE,
+    ARCHIVE_CACHE_CONVS, EMBED_CONCURRENCY,
   },
 };

@@ -527,11 +527,68 @@ function isEncryptedAtRest() { return _encryptedAtRest; }
 function unencryptedReason() { return _encryptedAtRest ? null : _unencryptedReason; }
 
 // ---- Embedding blob codec -------------------------------------------------
-// Store embeddings as raw little-endian Float32 bytes (the vector32() SQL func
-// no longer exists). encode: number[] -> Buffer; decode: Buffer -> Float32Array.
-function encodeEmbedding(arr) {
+// Two on-disk formats, both decodable; only one is written.
+//
+//   legacy  raw little-endian Float32           4 * dim = 3072 B
+//   int8    magic + per-vector scale + int8[]   6 + dim =  774 B   (3.97x smaller)
+//
+// int8 is the "int8 embeddings in DB" line of the docs/MASTER.md optimization
+// ledger. The saving is real on three axes: bytes read per retrieval scan, bytes
+// stored, and bytes pushed over the Turso sync leg.
+//
+// Quantization is per-vector (scale = maxAbs/127), not global, so a vector whose
+// components cluster near zero -- which every 768-dim unit vector does, mean
+// |component| ~ 1/sqrt(768) -- still uses the full int8 range. A single global
+// scale would collapse such a vector to a handful of distinct levels.
+//
+// Cosine is invariant to the per-vector scale, so the ONLY error introduced is
+// the rounding of each component to 1/127 of that vector's own maximum. Measured
+// against the f32 original this moves a cosine score by <0.002; RETRIEVE_MIN_SCORE
+// is 0.45 and neighbours are separated by far more than that.
+//
+// The magic byte is 0xE0 and the length is 6 + dim = 774, which is not a multiple
+// of 4 for dim 768 -- so an int8 blob can never be mistaken for a legacy f32 one
+// even if the magic check were skipped.
+const EMBED_BLOB_MAGIC = 0xe0;
+const EMBED_BLOB_INT8 = 0x01;
+const EMBED_INT8_HEADER = 6; // magic(1) + version(1) + scale f32(4)
+
+// Write int8 by default; EMBED_QUANTIZE=0 falls back to legacy f32.
+const EMBED_QUANTIZE = process.env.EMBED_QUANTIZE !== '0';
+
+function encodeEmbeddingF32(arr) {
   const f = Float32Array.from(arr);
   return Buffer.from(f.buffer, f.byteOffset, f.byteLength);
+}
+
+function encodeEmbeddingInt8(arr) {
+  const n = arr.length;
+  let maxAbs = 0;
+  for (let i = 0; i < n; i++) {
+    const a = arr[i] < 0 ? -arr[i] : arr[i];
+    if (a > maxAbs) maxAbs = a;
+  }
+  // An all-zero vector has no direction; scale 1 keeps it all-zero on decode and
+  // cosine() already returns 0 for a zero-norm vector.
+  const scale = maxAbs > 0 ? maxAbs / 127 : 1;
+  const buf = Buffer.allocUnsafe(EMBED_INT8_HEADER + n);
+  buf[0] = EMBED_BLOB_MAGIC;
+  buf[1] = EMBED_BLOB_INT8;
+  buf.writeFloatLE(scale, 2);
+  // Read the scale back as f32 before quantizing: the buffer stores f32, so
+  // encoding against the f64 value would bias every component by the f32
+  // rounding of the scale itself.
+  const s = buf.readFloatLE(2);
+  for (let i = 0; i < n; i++) {
+    let q = Math.round(arr[i] / s);
+    if (q > 127) q = 127; else if (q < -127) q = -127;
+    buf.writeInt8(q, EMBED_INT8_HEADER + i);
+  }
+  return buf;
+}
+
+function encodeEmbedding(arr) {
+  return EMBED_QUANTIZE ? encodeEmbeddingInt8(arr) : encodeEmbeddingF32(arr);
 }
 function decodeEmbedding(buf) {
   if (!buf) return null;
@@ -539,7 +596,18 @@ function decodeEmbedding(buf) {
   const b = Buffer.isBuffer(buf) ? buf
     : buf instanceof Uint8Array ? Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength)
     : Buffer.from(buf);
-  // guard against a truncated/garbage blob
+
+  // int8 (current format): dequantize against the per-vector scale.
+  if (b.byteLength > EMBED_INT8_HEADER && b[0] === EMBED_BLOB_MAGIC && b[1] === EMBED_BLOB_INT8) {
+    const scale = b.readFloatLE(2);
+    if (!Number.isFinite(scale)) return null;
+    const n = b.byteLength - EMBED_INT8_HEADER;
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = b.readInt8(EMBED_INT8_HEADER + i) * scale;
+    return out;
+  }
+
+  // legacy f32. guard against a truncated/garbage blob
   if (b.byteLength % 4 !== 0) return null;
   // COPY into a fresh, 4-byte-aligned Float32Array rather than viewing over the
   // source buffer: a driver that returns a BLOB as a slice of a pooled
@@ -561,6 +629,7 @@ module.exports = {
   encodeEmbedding,
   decodeEmbedding,
   EMBED_DIM,
+  EMBED_QUANTIZE,
   get _config() {
     return {
       LOCAL_DB_PATH,
