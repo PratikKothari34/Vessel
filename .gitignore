@@ -37,3 +37,6 @@ stitch_*/
 
 # Claude config (not version-controlled)
 .claude/
+
+# Path-keyed memory: local working copy, not published
+docs/memory/
