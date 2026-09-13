@@ -79,14 +79,20 @@ async function* iterate(res) {
 // Non-streaming completion, used by the summarizer. Ollama's /api/generate
 // applies the model's own TEMPLATE unless raw:true, so the prompt arrives
 // wrapped exactly as a chat turn would be.
-async function generate(model, prompt, { numCtx } = {}) {
+async function generate(model, prompt, { numCtx, numGpu } = {}) {
+  const options = {};
+  if (numCtx) options.num_ctx = numCtx;
+  // numGpu 0 pins the model to CPU. The summariser uses it for the same reason
+  // the embedder does: on an 8 GB card the chat model already owns 6.1 GB, so a
+  // second model on the GPU does not evict it (llama-server cannot be evicted)
+  // but does oversubscribe the card, and the driver pages the chat model's
+  // working set out to system RAM. See docs/MASTER.md, "Eviction is gone;
+  // contention replaced it".
+  if (Number.isFinite(numGpu) && numGpu >= 0) options.num_gpu = numGpu;
   const res = await fetchRetry(`${HOST}/api/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model, prompt, stream: false,
-      options: numCtx ? { num_ctx: numCtx } : {},
-    }),
+    body: JSON.stringify({ model, prompt, stream: false, options }),
   });
   const data = await res.json();
   return (data.response || '').trim();

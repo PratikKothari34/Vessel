@@ -94,10 +94,140 @@ model buys nothing on its own. Both axes have to match. `memory.js` therefore
 defaults `SUMMARIZER_NUM_CTX` to `OLLAMA_NUM_CTX` whenever the summariser *is*
 the chat model, and `server.js` warns at startup if an explicit value breaks it.
 
-This whole section is an **Ollama** problem. llama-server holds one model in one
-unified KV pool across four slots, so a second prompt cannot evict the first —
-see *Stage 3 result*. Under `INFERENCE_BACKEND=llama-server` the 19.4 s is 0 ms
-and `SUMMARIZER_MODEL=vessel` costs nothing at all.
+This whole section is an **Ollama** problem. llama-server holds its one model in
+an allocation it owns for the life of the process, so a second prompt cannot
+evict the first — see *Stage 3 result*. Under `INFERENCE_BACKEND=llama-server`
+the 19.4 s is 0 ms. (The KV pool is *not* unified and the extra slots are not
+free context — see *Launch it with `--parallel 1`*.)
+
+### Eviction is gone; contention replaced it
+
+Not being evictable is not the same as being free. llama-server holds 6,163 MiB
+of an 8,188 MiB card, so loading `gemma3:4b` (3.0 GB, confirmed `100% GPU` in
+`ollama ps`) puts the card at 7,874 MiB — 96% full — and the Windows driver
+pages the chat model's working set out to system RAM to make room:
+
+| | value | |
+|---|---|---|
+| llama-server resident, alone | 6,163 MiB | [M] |
+| both models resident | 7,874 MiB of 8,188 | [M] |
+| llama-server resident, **during** the summary | **3,867 MiB** — 2.3 GB paged out | [M] |
+| chat decode, summariser absent | 47.0 tok/s | [M] |
+| chat decode, summariser resident | **20.8 tok/s** (2.26x) | [M] |
+| chat decode, co-resident, separate run | 15.4 -> 38.0 tok/s (2.47x) | [M] |
+| gemma load into the remaining VRAM | **8,319 ms** warm, **32,163 ms** cold | [M] |
+
+The load figure is the one that kills `keep_alive: 0`. Unloading the summariser
+after every summary sounds like the fix the backend swap unlocks — it cannot be
+evicted, so the squeeze should last only as long as the call — but reloading a
+3 GB model into 2 GB of free VRAM costs 8–32 s **per summary**, against 3.9 s on
+an empty card. That is worse than the 19.4 s it was meant to avoid, and
+`memory.js` holds the per-conversation lock across `summarize()`, so the user's
+next message waits behind all of it.
+
+No llama-server configuration makes both fit. The 8B chat weights are ~4.6 GB
+and a 12,288-token unified KV pool is ~1.5 GB; dropping to `-c 8192` saves
+0.5 GB and q8_0 KV saves another 0.75 GB, which still leaves 5.4 + 3.0 GB against
+an 8.19 GB card. **The summariser cannot live on this GPU.** It runs on CPU —
+the same decision `EMBED_NUM_GPU=0` already makes for the embedder.
+
+### `SUMMARIZER_MODEL` was silently ignored
+
+`inference/index.js` routed `generate()` to the **chat** backend. llama-server
+accepts a `model` argument and ignores it — one server, one model — so in the
+shipped Stage 3 config every summary was written by `vessel`, not `gemma3:4b`,
+while `/health` reported gemma. The summariser now picks its own backend
+(`SUMMARIZER_BACKEND`, default `ollama`), and `/health` reports
+`summarize.honoursModel` so the failure cannot go quiet again.
+
+That matters because the substitution is not neutral. Scored on 13 facts the
+transcript actually contains, over a two-round rolling update [M]:
+
+| summariser | facts kept | invented entities | |
+|---|---|---|---|
+| `gemma3:4b` | **12–13 / 13** | **0** | [M] |
+| `vessel` (what was actually running) | 8 / 13 | names characters that do not exist | [M] |
+
+**Confabulation, not recall, is the metric that matters.** A rolling summary is
+read back as canon on every subsequent turn, so an invented character does not
+degrade gracefully — it becomes permanent story fact. `vessel` is tuned to write
+surprising prose; asked to condense, it keeps writing. `SUMMARIZER_MODEL=vessel`
+is rejected on quality, not on cost.
+
+### The summary had no length bound
+
+`memory.js` capped the stored summary at `MAX_SUMMARY_CHARS` (6,000) by
+**front-truncating**: `updated.slice(updated.length - 6000)`. Nothing told the
+model about the cap, so gemma answered with 5,792–12,422 chars and the overflow
+was cut off the **front** — amputating the oldest, most-condensed material, the
+part that can no longer be recovered from the verbatim window. The model was
+paying to generate tokens that were then thrown away, and throwing away the ones
+that mattered most.
+
+Sweeping an explicit bound in the prompt, gemma on CPU, round 2 scored /13 [M]:
+
+| bound | time | chars | facts | truncated |
+|---|---|---|---|---|
+| none | 238,937 ms | 12,422 | 13/13 | **−6,422 off the front** |
+| 2,500 | 95,270 ms | 5,160 | 12/13 | no |
+| 2,500 (repeat) | 136,255 ms | 5,125 | 12/13 | no |
+| 2,500 (repeat) | 172,312 ms | 8,709 | 12/13 | −2,709 |
+| 1,800 | 123,390 ms | 6,418 | **8/13** | −418 |
+
+The bound is a steer, not a limit — gemma overshoots it by 2–3.5x — but steering
+at 2,500 lands inside the 6,000 cap most of the time, costs 1 fact, and halves
+generation time. Steering at 1,800 makes the model drop material instead of
+compressing it: 8/13 is the same score `vessel` gets. `SUMMARY_TARGET_CHARS`
+defaults to `MAX_SUMMARY_CHARS * 0.4` (2,400) for exactly that reason, and the
+front-truncation stays as the backstop it was always meant to be.
+
+### Where the summariser runs: CPU
+
+Four placements were measured. Only one leaves the chat model alone:
+
+| placement | VRAM cost | chat decode | quality | verdict |
+|---|---|---|---|---|
+| GPU, co-resident | 3.0 GB | 47.0 → **20.8 tok/s** | 12–13/13 | rejected — 2.26x slowdown |
+| GPU, `keep_alive: 0` | transient | n/a | 12–13/13 | rejected — 8–32 s reload *per summary* |
+| `SUMMARIZER_MODEL=vessel` | 0 (shared) | unchanged | **8/13, confabulates** | rejected on quality |
+| **CPU (`SUMMARIZER_NUM_GPU=0`)** | **0 MiB** | **unchanged** | **12–13/13, 0 invented** | **chosen** [M] |
+
+CPU costs 95–239 s per summary against ~19 s on the GPU. That is the trade the
+app can actually afford: summarisation is a background maintenance job, not a
+read path, and VRAM was verified flat at 6,171–6,173 MiB across a full six-turn
+run with gemma showing `3.0 GB / 100% CPU` in `ollama ps` [M]. The same decision
+`EMBED_NUM_GPU=0` already makes for the embedder, for the same reason.
+
+### Folding moved off the turn lock
+
+CPU is only affordable if nobody waits for it, and the code made them wait.
+`server.js` holds `memory.acquireLock(convId)` across the whole `/chat` handler
+including `recordTurn`'s `summarize()`, so the summarising turn cost **31,839 ms
+and 35,619 ms** against 2.3–6.1 s for every other turn [M].
+
+`recordTurn` now does only the durable write — insert the turn, register the
+variant, touch the conversation — and hands the fold to `runMaintenance`, which
+summarises, embeds and archives in the background. Coalesced per conversation: a
+request arriving mid-fold sets a rerun flag rather than starting a second run.
+
+Verified with the summariser held 8,000 ms per call, `SUMMARIZE_THRESHOLD=6`,
+`VERBATIM_TURNS=4` [M]:
+
+| | result |
+|---|---|
+| slowest turn, against an 8,000 ms summariser | **44 ms** (every turn 16–44 ms) |
+| verbatim rows in the DB during the fold | 18 |
+| verbatim rows in the **prompt** during the fold | **8** (`VERBATIM_CEILING`) |
+| 6 schedule calls → folds actually run | **2**, 18 rows total, no duplicates |
+| settles at | `VERBATIM_TURNS` = 4, then stops |
+| delete mid-fold | stays deleted (404) |
+
+The cost is stale reads while a fold is in flight: the previous summary, and a
+verbatim window longer than the design. Both are safe — the summary is behind,
+not wrong, and the extra verbatim turns are exactly the material it is missing,
+so the model sees that content either way, in full rather than condensed.
+`VERBATIM_CEILING` (default `SUMMARIZE_THRESHOLD + 2`, the old synchronous
+design's own high-water mark) bounds how much of the backlog reaches the prompt.
 
 ## Live window ceiling
 
@@ -144,8 +274,12 @@ Ranked by bytes saved.
 |---|---|---|
 | `num_ctx` 32768 -> 12288 | 3.17 GB VRAM, **2.88x decode** [M] | **done** — `OLLAMA_NUM_CTX`, per request |
 | Ollama -> llama-server | 0.37 GB VRAM, **+18% decode**, +38% prefill, **19.4 s eviction -> 0** [M] | **done** — `INFERENCE_BACKEND`, both backends pass the same suite |
-| `SUMMARIZER_MODEL=vessel` (drop gemma3:4b) | 3.34 GB disk + **19.4 s per summary** [M] | test summary quality — the one open call. Free on llama-server: one model, no eviction [M] |
+| `SUMMARIZER_MODEL=vessel` (drop gemma3:4b) | 3.34 GB disk + **19.4 s per summary** [M] | **rejected on quality** — 8/13 facts and invents named characters; see *Summariser* [M] |
 | KV `q8_0` | 0.75 GiB VRAM, **-5% decode** [M] | rejected for now; see Stage 1 result |
+| summariser on CPU (`SUMMARIZER_NUM_GPU=0`) | **3.0 GB VRAM**, chat decode 20.8 -> **47.0 tok/s** [M] | **done** — costs 95–239 s per summary, which nothing waits on |
+| fold off the turn lock (background maintenance) | summarising turn **35.6 s -> 44 ms** [M] | **done** — readers see a stale summary until the fold lands; bounded by `VERBATIM_CEILING` |
+| llama-server `--parallel 1` | **`n_ctx_slot` 3,072 -> 12,288** at identical VRAM and decode [M] | **done** — none; the other three slots were never used |
+| summary length steer (`SUMMARY_TARGET_CHARS`) | up to **6,422 chars** no longer generated then front-truncated away [M] | **done** — 1 fact of 13, and gemma overshoots the steer 2–3.5x |
 | Q4_K_M -> IQ4_XS | ~0.47 GB disk + VRAM | negligible quality |
 | 384-dim embedder (bge-small / MiniLM) | ~0.18 GB disk, 2x faster cosine | slight recall loss |
 | int8 embeddings in DB | 3072 -> 774 B/turn (3.97x) [M] | **done** — max cosine error 1.2e-3, ranking identical |
@@ -155,9 +289,11 @@ Ranked by bytes saved.
 **Banked so far:** VRAM 9.52 GB spilling -> **6.03 GB fully resident** [M].
 Decode 13.69 -> **46.4 tok/s p50** end to end on the real GPU [M] — **3.39x**,
 from two levers: `num_ctx` 32768 -> 12288, then Ollama -> llama-server. Prefill
-1,145 -> ~2,200 tok/s. The summariser's 19.4 s eviction is 0. Disk is unchanged
-at 8.53 GB — every disk lever left is a model swap, and each one is a quality
-call.
+1,145 -> ~2,200 tok/s. The summariser's 19.4 s eviction is 0, its VRAM is 0, and
+the turn that triggers it no longer pays for it: **35.6 s -> 44 ms** [M].
+Usable context per conversation is 4x what shipped (`--parallel 1`). Disk is
+unchanged at 8.53 GB — every disk lever left is a model swap, and each one is a
+quality call.
 
 **Endpoint:** disk 8.5 GB -> ~4.6 GB. VRAM -> ~5.2 GB (resident, ~2.8 GB
 headroom for a speculative-decoding draft model).
@@ -214,8 +350,30 @@ the Stage 1 f16/12288 figure, re-confirmed live (`ollama ps`: `vessel:latest /
 | model load | 10,456 ms cold, 19,365 ms after eviction | **2,577 ms once, then never** | [M] |
 | KV reuse | estimated from char diffs | **measured, `cache_n`** | [M] |
 
-Server reports `n_slots 4`, `n_ctx_slot 12288`, `kv_unified true` — one KV pool,
-four slots, nothing to evict.
+### Launch it with `--parallel 1`
+
+An earlier draft of this doc claimed `n_slots 4`, `n_ctx_slot 12288`,
+`kv_unified true` — one shared KV pool with four free slots. That was wrong on
+two counts, and the live `/props` disagrees with it [M].
+
+`--parallel N` **divides** `-c`, it does not multiply it. `-c 12288 --parallel 4`
+gives `n_ctx_slot 3072`: each conversation gets a quarter of the window, not all
+of it. And `kv_unified` reported `'false'`, so the slots are four private pools,
+not one shared one — there is no borrowing between them.
+
+Vessel is a single-user desktop app that already serialises the summariser after
+the turn (see *Concurrency is a trap*, below). It never needs a second slot, and
+paying for three unused ones costs three quarters of the context window.
+
+| `--parallel` | `n_ctx_slot` | VRAM | decode | |
+|---|---|---|---|---|
+| 4 (was shipped) | 3,072 | 6,163 MiB | 46.2 tok/s | [M] |
+| **1 (required)** | **12,288** | 6,163 MiB | 46.2 tok/s | [M] |
+
+Same VRAM, same decode, 4x the usable window. `--parallel 1` is not a tuning
+preference; the shipped value was silently truncating long conversations to a
+quarter of the context they were configured for. `.env.example` documents the
+corrected launch line.
 
 ### The eviction cost is gone, not reduced
 

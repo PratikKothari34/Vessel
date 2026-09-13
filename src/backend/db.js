@@ -88,6 +88,10 @@ function resolveSyncUrl() {
 }
 let _syncUrlInUse = ''; // what this boot actually connected with
 let SYNC_ENABLED = false;
+// Presence-only, so `VESSEL_NO_SYNC=0` and a bare `VESSEL_NO_SYNC=` both disable
+// sync. A harness that mentions this variable at all means it, and the failure
+// mode of guessing wrong is pushing test data into someone's live database.
+const NO_SYNC = process.env.VESSEL_NO_SYNC !== undefined;
 let _encryptedAtRest = false;
 // WHY encryption is off, when it is. A bare boolean can't distinguish "the user
 // turned on cloud sync and accepted the tradeoff" from "the keychain broke and
@@ -397,7 +401,18 @@ async function getDb() {
   ]);
   const syncUrl = resolveSyncUrl();
   _syncUrlInUse = syncUrl;
-  SYNC_ENABLED = Boolean(syncUrl && authToken);
+  // An unambiguous kill switch for tests. Clearing TURSO_DATABASE_URL is the
+  // obvious way to isolate a test backend and it is not reliable: PowerShell's
+  // `$env:X = ''` DELETES the variable rather than emptying it, dotenv then
+  // supplies the real credentials from .env, and the "isolated" backend pushes
+  // scratch data into the user's live database. This flag cannot be defeated
+  // that way -- only its presence is checked, never its value.
+  if (NO_SYNC) {
+    SYNC_ENABLED = false;
+    console.warn('[db] VESSEL_NO_SYNC is set: cloud sync is OFF for this process.');
+  } else {
+    SYNC_ENABLED = Boolean(syncUrl && authToken);
+  }
 
   const dbPath = localAbsPath();
   clearOrphanedSyncMetadata(dbPath);

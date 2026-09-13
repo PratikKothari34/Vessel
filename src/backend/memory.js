@@ -30,6 +30,15 @@ const EMBED_NUM_GPU = (() => {
   const v = parseInt(process.env.EMBED_NUM_GPU, 10);
   return Number.isFinite(v) ? v : 0;
 })();
+// 0 = CPU, and CPU is the default for the same reason the embedder's is. The
+// chat model owns 6.1 GB of an 8 GB card; a 3 GB summariser alongside it does
+// not get evicted under llama-server, it oversubscribes the card and the driver
+// pages 2.3 GB of the chat model out to system RAM -- measured, chat decode
+// 47.0 -> 20.8 tok/s. On CPU the summariser costs the GPU nothing at all.
+const SUMMARIZER_NUM_GPU = (() => {
+  const v = parseInt(process.env.SUMMARIZER_NUM_GPU, 10);
+  return Number.isFinite(v) ? v : 0;
+})();
 
 function intEnv(name, def, { min = 1 } = {}) {
   const v = parseInt(process.env[name], 10);
@@ -57,9 +66,52 @@ const SUMMARIZER_NUM_CTX = intEnv(
 const VERBATIM_TURNS = intEnv('VERBATIM_TURNS', 8);
 let SUMMARIZE_THRESHOLD = intEnv('SUMMARIZE_THRESHOLD', 12);
 if (SUMMARIZE_THRESHOLD <= VERBATIM_TURNS) SUMMARIZE_THRESHOLD = VERBATIM_TURNS + 4;
+
+// Hard ceiling on how many verbatim rows the READ path will include.
+//
+// Folding is a background job now (see runMaintenance), so between the turn
+// that crosses the threshold and the fold finishing, `turns` legitimately holds
+// more rows than the design allows. A CPU summary takes 95-239 s -- long enough
+// for dozens of turns to pile up behind it -- and without a ceiling the prompt
+// would grow with that backlog and overflow the context window.
+//
+// SUMMARIZE_THRESHOLD + 2 is exactly the high-water mark the old synchronous
+// design already reached: the threshold, plus the user+assistant pair whose
+// arrival crossed it. So in the steady state this changes nothing.
+const VERBATIM_CEILING = intEnv(
+  'VERBATIM_CEILING', SUMMARIZE_THRESHOLD + 2, { min: VERBATIM_TURNS },
+);
+
+// Most turns one background fold will summarise at once.
+//
+// The synchronous design capped this implicitly: it folded on the turn that
+// crossed the threshold, so there were never more than a handful of rows to
+// fold. Background folding removes that guarantee -- a slow summariser plus a
+// fast typist can leave dozens of turns waiting -- and handing all of them to
+// one generate would blow SUMMARIZER_NUM_CTX and silently truncate the oldest,
+// which is the exact failure the summary exists to prevent.
+//
+// A fold that hits this cap asks for another pass instead of taking a bigger
+// bite. Successive passes fold the remainder, oldest first, each one seeing the
+// previous pass's summary as its prior.
+const MAX_FOLD_TURNS = intEnv('MAX_FOLD_TURNS', 24, { min: 2 });
 const RETRIEVE_K = intEnv('RETRIEVE_K', 4);
 const RETRIEVE_MIN_SCORE = floatEnv('RETRIEVE_MIN_SCORE', 0.45, { min: -1, max: 1 });
 const MAX_SUMMARY_CHARS = intEnv('MAX_SUMMARY_CHARS', 6000, { min: 500 });
+// The prompt never used to state a length, so the summarizer answered with
+// whatever it felt like -- measured at 5,792 to 12,422 chars against a 6,000
+// cap. The overflow is cut by the front-truncation below, which removes the
+// OLDEST text: the part already condensed several times over and no longer
+// present in the verbatim window, so it is the only part that cannot be
+// recovered. Asking for a bound fixes both ends -- gemma3:4b came back at 5,160
+// chars keeping 12 of 13 facts, versus 12,422 chars with 6,422 amputated.
+//
+// The target is deliberately well under the cap: models treat a character count
+// as a loose hint and overshoot roughly twofold. Truncation stays as the
+// backstop for when they ignore it entirely.
+const SUMMARY_TARGET_CHARS = intEnv(
+  'SUMMARY_TARGET_CHARS', Math.round(MAX_SUMMARY_CHARS * 0.4), { min: 200 },
+);
 // How many conversations keep their archive vectors resident. 768 floats x 4 B
 // = 3 KB per archived turn, so a 1,000-turn story costs ~3 MB.
 const ARCHIVE_CACHE_CONVS = intEnv('ARCHIVE_CACHE_CONVS', 8);
@@ -112,14 +164,18 @@ async function touchConversation(id) {
   await db.execute({ sql: 'UPDATE conversations SET updated_at = ? WHERE id = ?', args: [nowIso(), id] });
 }
 
-// Recent verbatim turns in chronological order.
-async function getVerbatim(id) {
+// Recent verbatim turns in chronological order, capped at VERBATIM_CEILING.
+//
+// Ordering DESC + reversing takes the NEWEST rows, which is the right end to
+// keep: anything past the ceiling is a backlog the background fold is already
+// working on, and the archive keeps every word of it either way.
+async function getVerbatim(id, limit = VERBATIM_CEILING) {
   const db = await getDb();
   const res = await db.execute({
-    sql: 'SELECT role, content FROM turns WHERE conversation_id = ? ORDER BY id ASC',
-    args: [id],
+    sql: 'SELECT role, content FROM turns WHERE conversation_id = ? ORDER BY id DESC LIMIT ?',
+    args: [id, limit],
   });
-  return res.rows.map((r) => ({ role: r.role, content: r.content }));
+  return [...res.rows].reverse().map((r) => ({ role: r.role, content: r.content }));
 }
 
 // ---- Engine calls --------------------------------------------------------
@@ -141,7 +197,10 @@ async function embed(text) {
 }
 
 function generate(model, prompt) {
-  return inference.generate(model, prompt, { numCtx: SUMMARIZER_NUM_CTX });
+  return inference.generate(model, prompt, {
+    numCtx: SUMMARIZER_NUM_CTX,
+    numGpu: SUMMARIZER_NUM_GPU,
+  });
 }
 
 // ---- Per-conversation lock ----------------------------------------------
@@ -356,6 +415,9 @@ async function summarize(priorSummary, turns, assistantName) {
     'locations, plot events, decisions, and unresolved threads. Be faithful and',
     'concise. Do not add disclaimers, opinions, or content not present in the',
     'text. Output ONLY the updated summary prose.',
+    `Keep the updated summary under ${SUMMARY_TARGET_CHARS} characters. If it `
+      + 'would run longer, compress the OLDEST material hardest and keep the '
+      + 'newest exchanges intact.',
     '',
     '=== CURRENT SUMMARY ===',
     priorSummary || '(none yet)',
@@ -622,8 +684,123 @@ async function recordTurn(conversationId, userMessage, assistantReply, assistant
     return { archived: 0, summarized: false };
   }
 
-  // Fold the oldest (count - VERBATIM_TURNS) turns into summary + archive.
-  const toArchiveCount = Number(count) - VERBATIM_TURNS;
+  // Everything above is the fast write phase, and it is done: the turn is
+  // durable and the reply is already on screen. What follows -- summarise,
+  // embed, archive -- is maintenance, and it is slow: the summariser runs on
+  // CPU (see docs/MASTER.md, "Where the summariser runs: CPU") at 95-239 s.
+  //
+  // The caller holds the per-conversation turn lock across this function, so
+  // doing that work here makes the user's NEXT message wait behind it. Measured
+  // at 31,839 ms and 35,619 ms for a summarising turn against 2.3-6.1 s for
+  // every other one. Hand it to the background instead; the read path is built
+  // to tolerate the stale state that creates (see VERBATIM_CEILING).
+  scheduleMaintenance(conversationId, assistantName);
+  return { archived: 0, summarized: false, maintenanceScheduled: true };
+}
+
+// ---- Background maintenance ---------------------------------------------
+// Folding old turns into the rolling summary is maintenance, not part of a
+// turn. It runs OFF the turn lock, so a summary never delays the next message.
+//
+// What that costs: for as long as a fold is in flight, readers see the previous
+// summary and a longer-than-designed verbatim window. Both are safe. The
+// summary is behind, not wrong; the extra verbatim turns are the very text the
+// summary is missing, so the model sees that material either way -- in full
+// rather than condensed. VERBATIM_CEILING bounds how much of it reaches the
+// prompt.
+//
+// One run per conversation at a time. A request arriving mid-run sets `rerun`
+// instead of starting a second one: the next pass re-reads the turn count and
+// picks up whatever arrived meanwhile, which is strictly better than two runs
+// racing over the same oldest rows.
+const _maintenance = new Map(); // conversationId -> { promise, rerun, cancelled }
+
+function scheduleMaintenance(conversationId, assistantName) {
+  const existing = _maintenance.get(conversationId);
+  if (existing) {
+    existing.rerun = true;
+    return existing.promise;
+  }
+
+  const state = { rerun: false, cancelled: false, draining: false, promise: null };
+  _maintenance.set(conversationId, state);
+  state.promise = (async () => {
+    try {
+      for (;;) {
+        state.rerun = false;
+        await runMaintenance(conversationId, assistantName, state);
+        // No await between the loop body returning and this check, so a
+        // scheduleMaintenance() call cannot slip in and set `rerun` on a state
+        // we are about to discard.
+        if (state.cancelled || !state.rerun) break;
+      }
+    } catch (err) {
+      // A failed fold is recoverable by construction: nothing was deleted, so
+      // the turns are still verbatim and the next turn schedules another try.
+      console.error(`[memory] maintenance failed for ${conversationId}:`, err.message);
+    } finally {
+      if (_maintenance.get(conversationId) === state) _maintenance.delete(conversationId);
+    }
+  })();
+  return state.promise;
+}
+
+// Resolve once no fold is in flight for this conversation. For shutdown and for
+// tests, which otherwise have no way to observe a background job.
+function awaitMaintenance(conversationId) {
+  const s = _maintenance.get(conversationId);
+  return s ? s.promise : Promise.resolve();
+}
+
+// Every in-flight fold, so shutdown can flush rather than drop them.
+function awaitAllMaintenance() {
+  return Promise.all([..._maintenance.values()].map((s) => s.promise.catch(() => {})));
+}
+
+// Stop a fold from WRITING. Not an abort -- the expensive legs (summarise +
+// embed) are already in flight and interrupting them saves nothing -- but it
+// guarantees no rows land for a conversation the user just deleted.
+function cancelMaintenance(conversationId) {
+  const s = _maintenance.get(conversationId);
+  if (s) {
+    s.cancelled = true;
+    s.rerun = false;
+    s.draining = false;
+  }
+}
+
+/**
+ * One fold: summarise + embed + archive the turns above the verbatim window.
+ * Re-reads its own state, so it is safe to call at any time and cheap when
+ * there is nothing to do.
+ */
+async function runMaintenance(conversationId, assistantName, state) {
+  const db = await getDb();
+  const count = (await db.execute({
+    sql: 'SELECT COUNT(*) AS n FROM turns WHERE conversation_id = ?', args: [conversationId],
+  })).rows[0].n;
+
+  // SUMMARIZE_THRESHOLD is the TRIGGER; VERBATIM_TURNS is the TARGET. Once a
+  // drain is under way the trigger has already fired, so later passes keep
+  // going down to the target -- otherwise a capped fold would stop at the
+  // threshold and leave the window permanently larger than the design.
+  const draining = Boolean(state && state.draining);
+  const floor = draining ? VERBATIM_TURNS : SUMMARIZE_THRESHOLD;
+  if (Number(count) <= floor) {
+    if (state) state.draining = false;
+    return { archived: 0, summarized: false };
+  }
+
+  // Fold the oldest (count - VERBATIM_TURNS) turns into summary + archive,
+  // at most MAX_FOLD_TURNS of them in one pass.
+  const pending = Number(count) - VERBATIM_TURNS;
+  const toArchiveCount = Math.min(pending, MAX_FOLD_TURNS);
+  // Ask for another pass rather than a bigger prompt. Set before the long
+  // awaits so a cancel during them still wins: cancelMaintenance clears both.
+  if (state) {
+    state.draining = pending > toArchiveCount;
+    if (state.draining) state.rerun = true;
+  }
   const oldest = (await db.execute({
     sql: 'SELECT id, role, content FROM turns WHERE conversation_id = ? ORDER BY id ASC LIMIT ?',
     args: [conversationId, toArchiveCount],
@@ -634,9 +811,8 @@ async function recordTurn(conversationId, userMessage, assistantReply, assistant
   // The summarizer call is by far the most expensive thing in this phase — a
   // full generate on SUMMARIZER_MODEL — and the embeds do not depend on it.
   // Running both legs at once hides the ENTIRE embedding phase underneath the
-  // summarize call. This runs while the per-conversation lock is held, so every
-  // millisecond saved here is a millisecond the user's next message is not
-  // blocked behind bookkeeping for the previous one.
+  // summarize call. Nothing waits on this any more, but the window of stale
+  // reads is still worth shortening, and the embedder is on CPU too.
   const [summaryResult, embeddings] = await Promise.all([
     summarize(priorSummary, oldest, assistantName).then(
       (text) => ({ ok: true, text }),
@@ -650,6 +826,17 @@ async function recordTurn(conversationId, userMessage, assistantReply, assistant
     // computed alongside are discarded; they will be recomputed next attempt.
     return { archived: 0, summarized: false, error: summaryResult.error };
   }
+
+  // Those two awaits are the long ones -- minutes, on CPU. The conversation can
+  // be deleted in that time, and writing archive rows for a row that no longer
+  // exists would resurrect a deleted story. Everything below this point is
+  // await-free apart from its own writes, so checking here is enough.
+  if (state && state.cancelled) return { archived: 0, summarized: false, cancelled: true };
+  const alive = await db.execute({
+    sql: 'SELECT 1 AS ok FROM conversations WHERE id = ?', args: [conversationId],
+  });
+  if (!alive.rows.length) return { archived: 0, summarized: false, cancelled: true };
+
   let updated = summaryResult.text;
   if (updated.length > MAX_SUMMARY_CHARS) updated = updated.slice(updated.length - MAX_SUMMARY_CHARS);
 
@@ -704,6 +891,7 @@ async function recordUserTurn(conversationId, userMessage) {
 // fails (e.g. Ollama down) — safe to call on any conversation.
 async function deleteConversationIfEmpty(id) {
   if (!isValidId(id)) return false;
+  cancelMaintenance(id);
   const db = await getDb();
   forgetArchive(id);
   const res = await db.execute({
@@ -813,6 +1001,10 @@ async function setTitle(id, title) {
 
 async function deleteConversation(id) {
   if (!isValidId(id)) throw new Error('deleteConversation: invalid id');
+  // A background fold may be mid-summary for this conversation. Tell it not to
+  // write; it checks the flag (and re-checks that this row still exists) right
+  // before its first write.
+  cancelMaintenance(id);
   const db = await getDb();
   const res = await db.execute({ sql: 'DELETE FROM conversations WHERE id = ?', args: [id] });
   forgetArchive(id); // cached vectors would outlive the rows they describe
@@ -825,6 +1017,10 @@ module.exports = {
   ensureConversation,
   buildContext,
   recordTurn,
+  scheduleMaintenance,
+  awaitMaintenance,
+  awaitAllMaintenance,
+  cancelMaintenance,
   recordUserTurn,
   recordRegeneration,
   deleteConversationIfEmpty,
@@ -838,8 +1034,9 @@ module.exports = {
   forgetArchive,
   _config: {
     CHAT_MODEL, CHAT_NUM_CTX,
-    SUMMARIZER_MODEL, SUMMARIZER_NUM_CTX, EMBED_MODEL, EMBED_NUM_GPU,
-    VERBATIM_TURNS, SUMMARIZE_THRESHOLD, RETRIEVE_K, RETRIEVE_MIN_SCORE,
+    SUMMARIZER_MODEL, SUMMARIZER_NUM_CTX, SUMMARIZER_NUM_GPU, EMBED_MODEL, EMBED_NUM_GPU,
+    MAX_SUMMARY_CHARS, SUMMARY_TARGET_CHARS,
+    VERBATIM_TURNS, VERBATIM_CEILING, MAX_FOLD_TURNS, SUMMARIZE_THRESHOLD, RETRIEVE_K, RETRIEVE_MIN_SCORE,
     ARCHIVE_CACHE_CONVS, EMBED_CONCURRENCY,
   },
 };

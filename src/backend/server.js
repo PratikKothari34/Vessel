@@ -735,7 +735,21 @@ async function start() {
 }
 
 // Flush to cloud on shutdown (no-op when local-only).
+//
+// Summarisation runs in the background now, so a fold can be in flight when the
+// window closes. Wait for it -- losing one means the next launch re-summarises
+// from scratch -- but cap the wait: a CPU summary takes up to 239 s and nobody
+// should watch a close button spin for four minutes. On timeout the turns are
+// still verbatim and untouched, so the next turn simply schedules another fold.
+const SHUTDOWN_MAINTENANCE_MS = 15000;
+
 async function shutdown() {
+  try {
+    await Promise.race([
+      memory.awaitAllMaintenance(),
+      new Promise((r) => setTimeout(r, SHUTDOWN_MAINTENANCE_MS)),
+    ]);
+  } catch { /* best effort */ }
   try { await db.syncNow(); } catch { /* best effort */ }
   process.exit(0);
 }
