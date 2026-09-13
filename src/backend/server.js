@@ -276,7 +276,14 @@ app.delete('/characters/:id', async (req, res) => {
       if (live) for (const ac of live) ac.abort();
       memory.cancelMaintenance(c.id);
     }
-    for (const c of owned) releases.push(await memory.acquireLock(c.id, DELETE_LOCK_WAIT_MS));
+    // Concurrently, not one after another: a character with 40 conversations
+    // would otherwise serialise 40 bounded waits, so the ceiling on the request
+    // would be 40 x DELETE_LOCK_WAIT_MS instead of one of them. acquireLock
+    // resolves either way -- it proceeds unlocked once the wait is spent -- so
+    // there is no partial-acquire case to unwind here.
+    releases.push(...await Promise.all(
+      owned.map((c) => memory.acquireLock(c.id, DELETE_LOCK_WAIT_MS)),
+    ));
 
     const removed = await characters.deleteCharacter(id);
     if (!removed) return res.status(404).json({ error: 'Character not found.' });

@@ -301,3 +301,22 @@ test('deleting a character mid-stream cascades without a foreign key failure', a
 test('an invalid character id is a 400 on delete, not a swallowed 500', async () => {
   assert.equal((await app.del('/characters/not a valid id')).status, 400);
 });
+
+test('deleting a character with many conversations cascades all of them at once', async () => {
+  // The lock waits are taken concurrently. Serialised, a character with this
+  // many conversations would bound the request at n x DELETE_LOCK_WAIT_MS.
+  const { json: c } = await create({ name: 'Prolific', persona: 'x' });
+  const ids = [];
+  for (let i = 0; i < 6; i++) {
+    const out = await app.sse({ characterId: c.id, messages: [{ role: 'user', content: `turn ${i}` }] });
+    ids.push(out.meta.conversationId);
+  }
+  assert.equal(new Set(ids).size, 6, 'six distinct conversations');
+
+  const started = Date.now();
+  assert.equal((await app.del(`/characters/${c.id}`)).status, 200);
+  assert.ok(Date.now() - started < 5000, 'the delete does not queue behind six separate waits');
+
+  for (const id of ids) assert.equal((await app.get(`/conversations/${id}`)).status, 404, id);
+  assert.ok(!/FOREIGN KEY constraint failed/.test(app.stdout()));
+});

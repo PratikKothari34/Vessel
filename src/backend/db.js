@@ -226,6 +226,12 @@ async function initSchema(db) {
     );
   `);
 
+  // The sidebar reads every conversation ordered by recency, filtered by
+  // character. Without this it is a full scan plus a sort on every refresh.
+  await db.exec(
+    `CREATE INDEX IF NOT EXISTS conversations_char_idx ON conversations(character_id, updated_at DESC);`,
+  );
+
   // verbatim recent turns (kept in full in the live window)
   await db.exec(`
     CREATE TABLE IF NOT EXISTS turns (

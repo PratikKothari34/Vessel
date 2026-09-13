@@ -974,15 +974,19 @@ async function recordRegeneration(conversationId, assistantReply) {
 
 async function listConversations(characterId = null) {
   const db = await getDb();
-  const sql = characterId
-    ? `SELECT c.*, (SELECT content FROM turns t WHERE t.conversation_id = c.id ORDER BY t.id DESC LIMIT 1) AS last_turn,
+  // Named columns, not c.*: the only thing the sidebar wants from `summary` is
+  // whether there is one, and a folded conversation's summary runs to a couple
+  // of thousand characters. Selecting it would serialise all of that across the
+  // driver for every row, on every refresh, to produce one boolean. Same reason
+  // the preview is truncated in SQL rather than in JS.
+  const sql = `SELECT c.id, c.character_id, c.title, c.created_at, c.updated_at,
+              LENGTH(COALESCE(c.summary, '')) > 0 AS has_summary,
+              (SELECT substr(t.content, 1, 120) FROM turns t
+                WHERE t.conversation_id = c.id ORDER BY t.id DESC LIMIT 1) AS last_turn,
               (SELECT COUNT(*) FROM turns t WHERE t.conversation_id = c.id) +
               (SELECT COUNT(*) FROM archive a WHERE a.conversation_id = c.id) AS turn_count
-       FROM conversations c WHERE c.character_id = ? ORDER BY c.updated_at DESC`
-    : `SELECT c.*, (SELECT content FROM turns t WHERE t.conversation_id = c.id ORDER BY t.id DESC LIMIT 1) AS last_turn,
-              (SELECT COUNT(*) FROM turns t WHERE t.conversation_id = c.id) +
-              (SELECT COUNT(*) FROM archive a WHERE a.conversation_id = c.id) AS turn_count
-       FROM conversations c ORDER BY c.updated_at DESC`;
+       FROM conversations c${characterId ? ' WHERE c.character_id = ?' : ''}
+       ORDER BY c.updated_at DESC`;
   const res = await db.execute(characterId ? { sql, args: [characterId] } : sql);
   return res.rows.map((r) => ({
     id: r.id,
@@ -990,9 +994,9 @@ async function listConversations(characterId = null) {
     title: r.title || '',
     createdAt: r.created_at,
     updatedAt: r.updated_at,
-    hasSummary: Boolean(r.summary && r.summary.length),
+    hasSummary: Boolean(Number(r.has_summary)),
     turnCount: Number(r.turn_count || 0),
-    preview: r.last_turn ? String(r.last_turn).slice(0, 120) : '',
+    preview: r.last_turn || '',
   }));
 }
 
