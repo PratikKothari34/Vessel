@@ -38,5 +38,9 @@ stitch_*/
 # Claude config (not version-controlled)
 .claude/
 
+# Project instruction file: authority #1, but local-only and never published.
+# Same rule as docs/memory/ below -- it does not survive a clone.
+CLAUDE.md
+
 # Path-keyed memory: local working copy, not published
 docs/memory/
