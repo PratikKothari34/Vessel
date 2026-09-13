@@ -21,15 +21,18 @@
  * report it as a fraction. Reorder working == this trends toward 1.0.
  */
 
-const RING = intEnv('METRICS_RING', 200, 20, 5000);
-const _ring = [];
-const _prevPrompt = new Map(); // conversationId -> last outbound prompt text
-const PREV_MAX = intEnv('METRICS_PREV_MAX', 32, 1, 512);
-
 function intEnv(name, def, min, max) {
   const v = parseInt(process.env[name], 10);
   return Number.isFinite(v) && v >= min && v <= max ? v : def;
 }
+
+const RING = intEnv('METRICS_RING', 200, 20, 5000);
+const _ring = [];
+// conversationId -> the previous turn's outbound messages, by reference. Not a
+// concatenated copy: the prefix walk below compares message by message, so the
+// whole prompt never has to be materialised as one string.
+const _prevPrompt = new Map();
+const PREV_MAX = intEnv('METRICS_PREV_MAX', 32, 1, 512);
 
 const ns = (v) => (Number.isFinite(v) && v > 0 ? v : 0);
 const msOf = (n) => Math.round(ns(n) / 1e5) / 10; // ns -> ms, 0.1ms resolution
@@ -41,17 +44,44 @@ const tps = (count, duration) => (ns(duration) ? Math.round((count / (duration /
  * closest proxy we have from outside the engine for how much of the KV cache
  * Ollama could reuse.
  */
-function prefixReuse(conversationId, promptText) {
+function promptChars(messages) {
+  let n = 0;
+  for (let i = 0; i < messages.length; i++) n += messages[i].content.length;
+  return n;
+}
+
+// Shared prefix between two message arrays, in characters. Whole messages are
+// compared by identity first -- buildContext reuses the same content strings
+// turn to turn, so an unchanged block costs one pointer compare instead of
+// thousands of charCodeAt calls -- and only the first message that actually
+// differs is walked character by character.
+function sharedPrefixChars(prev, cur) {
+  let shared = 0;
+  const n = Math.min(prev.length, cur.length);
+  for (let i = 0; i < n; i++) {
+    const a = prev[i];
+    const b = cur[i];
+    if (a.role !== b.role) break;
+    if (a.content === b.content) { shared += a.content.length; continue; }
+    const m = Math.min(a.content.length, b.content.length);
+    let j = 0;
+    while (j < m && a.content.charCodeAt(j) === b.content.charCodeAt(j)) j++;
+    shared += j;
+    break;
+  }
+  return shared;
+}
+
+function prefixReuse(conversationId, messages) {
   const prev = _prevPrompt.get(conversationId);
   // Bounded LRU: delete-then-set keeps insertion order == recency.
   _prevPrompt.delete(conversationId);
-  _prevPrompt.set(conversationId, promptText);
+  _prevPrompt.set(conversationId, messages);
   while (_prevPrompt.size > PREV_MAX) _prevPrompt.delete(_prevPrompt.keys().next().value);
-  if (typeof prev !== 'string' || !prev.length || !promptText.length) return null;
-  const n = Math.min(prev.length, promptText.length);
-  let i = 0;
-  while (i < n && prev.charCodeAt(i) === promptText.charCodeAt(i)) i++;
-  return Math.round((i / promptText.length) * 1000) / 1000;
+  if (!Array.isArray(prev) || !prev.length || !messages.length) return null;
+  const total = promptChars(messages);
+  if (!total) return null;
+  return Math.round((sharedPrefixChars(prev, messages) / total) * 1000) / 1000;
 }
 
 function forgetConversation(conversationId) { _prevPrompt.delete(conversationId); }
@@ -61,7 +91,7 @@ function forgetConversation(conversationId) { _prevPrompt.delete(conversationId)
  * composition breakdown from memory.buildContext(); `promptText` is the
  * concatenated outbound messages (used only for the reuse estimate).
  */
-function record({ conversationId, characterId, model, backend, done, window, promptText, aborted }) {
+function record({ conversationId, characterId, model, backend, done, window, promptMessages, aborted }) {
   const d = done || {};
   const promptTokens = Number.isFinite(d.prompt_eval_count) ? d.prompt_eval_count : null;
   const evalTokens = Number.isFinite(d.eval_count) ? d.eval_count : null;
@@ -91,8 +121,8 @@ function record({ conversationId, characterId, model, backend, done, window, pro
     charsPerToken: promptTokens && window && window.promptChars
       ? Math.round((window.promptChars / promptTokens) * 100) / 100
       : null,
-    prefillReuse: typeof promptText === 'string' && conversationId
-      ? prefixReuse(conversationId, promptText)
+    prefillReuse: Array.isArray(promptMessages) && conversationId
+      ? prefixReuse(conversationId, promptMessages)
       : null,
     cachedTokens,
     cacheReuse: cachedTokens != null && promptTokens
@@ -102,7 +132,10 @@ function record({ conversationId, characterId, model, backend, done, window, pro
   };
 
   _ring.push(rec);
-  while (_ring.length > RING) _ring.shift();
+  // shift() is O(n) per call; splice the overflow off in one move instead. In
+  // practice this is a single element, but a lowered METRICS_RING at runtime
+  // would otherwise re-index the array once per dropped record.
+  if (_ring.length > RING) _ring.splice(0, _ring.length - RING);
   return rec;
 }
 

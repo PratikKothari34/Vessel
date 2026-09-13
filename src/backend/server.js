@@ -222,6 +222,15 @@ app.put('/settings', async (req, res) => {
   }
 });
 
+// In-flight /chat streams, keyed by conversation id. A delete aborts them before
+// taking the lock: without that it would sit behind a whole generation, and a
+// bounded wait that expires puts us back to a half-applied write.
+const _liveStreams = new Map();
+
+// The abort makes the holder finish in well under a second, so this only has to
+// cover the post-stream record (summarize + embed), not the generation itself.
+const DELETE_LOCK_WAIT_MS = 30000;
+
 // ---- Characters ----------------------------------------------------------
 app.get('/characters', async (_req, res) => {
   try { res.json({ characters: await characters.listCharacters() }); }
@@ -250,18 +259,44 @@ app.put('/characters/:id', async (req, res) => {
 });
 
 app.delete('/characters/:id', async (req, res) => {
+  const id = req.params.id;
+  if (!characters.isValidId(id)) return res.status(400).json({ error: 'Invalid character id.' });
+  // The character's conversations go with it (ON DELETE CASCADE), so this has to
+  // do everything DELETE /conversations/:id does -- abort live streams, stop
+  // background folds, take each per-conversation lock -- or the cascade lands in
+  // the middle of a write and fails the turns -> conversations foreign key. Same
+  // race, one level up. Cached vectors and metrics are dropped after the delete
+  // commits, since a failed delete must leave them intact.
+  const releases = [];
+  let owned = [];
   try {
-    const removed = await characters.deleteCharacter(req.params.id);
+    owned = await memory.listConversations(id);
+    for (const c of owned) {
+      const live = _liveStreams.get(c.id);
+      if (live) for (const ac of live) ac.abort();
+      memory.cancelMaintenance(c.id);
+    }
+    for (const c of owned) releases.push(await memory.acquireLock(c.id, DELETE_LOCK_WAIT_MS));
+
+    const removed = await characters.deleteCharacter(id);
     if (!removed) return res.status(404).json({ error: 'Character not found.' });
+    for (const c of owned) { memory.forgetArchive(c.id); metrics.forgetConversation(c.id); }
     res.json({ deleted: true });
   } catch (err) { res.status(400).json({ error: 'Failed to delete character.', detail: err.message }); }
+  finally { for (const release of releases) release(); }
 });
 
 // ---- Conversations -------------------------------------------------------
 app.get('/conversations', async (req, res) => {
   try {
-    const characterId = req.query.characterId || null;
-    res.json({ conversations: await memory.listConversations(characterId) });
+    // Express's extended query parser turns ?characterId=a&characterId=b into an
+    // array and ?characterId[x]=1 into an object. Either one handed to a bound
+    // parameter is a driver-level failure, so validate rather than coerce.
+    const raw = req.query.characterId;
+    if (raw !== undefined && !characters.isValidId(raw)) {
+      return res.status(400).json({ error: 'Invalid character id.' });
+    }
+    res.json({ conversations: await memory.listConversations(raw || null) });
   } catch (err) { res.status(500).json({ error: 'Failed to list conversations.', detail: err.message }); }
 });
 
@@ -282,15 +317,6 @@ app.patch('/conversations/:id', async (req, res) => {
     res.json(result);
   } catch (err) { res.status(500).json({ error: 'Failed to rename conversation.', detail: err.message }); }
 });
-
-// In-flight /chat streams, keyed by conversation id. A delete aborts them before
-// taking the lock: without that it would sit behind a whole generation, and a
-// bounded wait that expires puts us back to a half-applied write.
-const _liveStreams = new Map();
-
-// The abort makes the holder finish in well under a second, so this only has to
-// cover the post-stream record (summarize + embed), not the generation itself.
-const DELETE_LOCK_WAIT_MS = 30000;
 
 app.delete('/conversations/:id', async (req, res) => {
   if (!memory.isValidId(req.params.id)) return res.status(400).json({ error: 'Invalid conversation id.' });
@@ -541,7 +567,9 @@ app.post('/chat', async (req, res) => {
   // so an aborted generation records only that it happened.
   try {
     if (windowStats) {
-      windowStats.promptChars = outboundMessages.reduce((n, m) => n + m.content.length, 0);
+      let n = 0;
+      for (let i = 0; i < outboundMessages.length; i++) n += outboundMessages[i].content.length;
+      windowStats.promptChars = n;
       windowStats.messageCount = outboundMessages.length;
     }
     metrics.record({
@@ -551,7 +579,9 @@ app.post('/chat', async (req, res) => {
       backend: BACKEND,
       done: doneChunk,
       window: windowStats,
-      promptText: outboundMessages.map((m) => m.role + "\n" + m.content).join("\n"),
+      // By reference. Concatenating the entire window into one string every
+      // turn -- tens of KB -- was pure telemetry cost on the response path.
+      promptMessages: outboundMessages,
       aborted: !doneChunk && !ollamaError,
     });
   } catch { /* telemetry must never break a chat */ }
@@ -616,6 +646,25 @@ app.post('/shutdown', async (req, res) => {
   res.json({ ok: true });
   const t = setTimeout(() => process.exit(0), 100);
   if (t.unref) t.unref();
+});
+
+// ---- Fallbacks -------------------------------------------------------------
+// Express's own defaults end both of these paths in HTML: "Cannot GET /x" for
+// an unknown route, and -- because NODE_ENV is not 'production' in a packaged
+// app either -- a full stack trace for a route that throws. Every client here
+// parses JSON, and a stack trace names absolute paths on the user's disk. So
+// terminate both ourselves. These must stay LAST: Express matches in order.
+app.use((_req, res) => {
+  res.status(404).json({ error: 'Not found.' });
+});
+
+// eslint-disable-next-line no-unused-vars -- Express selects this by arity
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled route error:', err && err.stack ? err.stack : err);
+  // Mid-stream (SSE) there is no status left to set; cutting the socket is the
+  // only honest signal, and the client already treats a truncated stream as one.
+  if (res.headersSent) return res.destroy();
+  res.status(500).json({ error: 'Internal error.' });
 });
 
 // ---- Startup -------------------------------------------------------------

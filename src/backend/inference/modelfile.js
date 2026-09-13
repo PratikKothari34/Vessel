@@ -69,12 +69,13 @@ function parse(text) {
     if (m) {
       const key = m[1].toLowerCase();
       const val = coerce(m[2]);
-      // `stop` is the one key Ollama allows more than once.
-      if (key in out.params) {
-        out.params[key] = [].concat(out.params[key], val);
-      } else {
-        out.params[key] = key === 'stop' ? [val] : val;
-      }
+      // `stop` is the one key Ollama allows more than once; it accumulates and
+      // is always a list, so consumers never have to branch on arity. Every
+      // other key is last-wins, as Ollama treats it. Accumulating those too
+      // turned a duplicated line into `temperature: [0.5, 0.9]`, which
+      // llama-server.js spreads straight into the llama.cpp request body.
+      if (key === 'stop') out.params[key] = [].concat(out.params[key] || [], val);
+      else out.params[key] = val;
       continue;
     }
   }

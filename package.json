@@ -10,7 +10,8 @@
   },
   "scripts": {
     "start": "node src/backend/server.js",
-    "dev": "node --watch src/backend/server.js"
+    "dev": "node --watch src/backend/server.js",
+    "test": "node --test --import ./test/guard.mjs test/unit/*.test.js test/integration/*.test.js"
   },
   "dependencies": {
     "@tursodatabase/database": "^0.7.2",
@@ -19,5 +20,8 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "keytar": "^7.9.0"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
   }
 }

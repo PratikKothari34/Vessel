@@ -43,7 +43,15 @@ function cleanSampling(s) {
   const out = {};
   if (s && typeof s === 'object') {
     for (const k of SAMPLING_KEYS) {
-      const v = Number(s[k]);
+      const raw = s[k];
+      // Number() is not a validator: it maps null, '', false and [] all to 0,
+      // which is IN RANGE for every bound here. A client sending
+      // { temperature: null } to mean "leave it alone" -- and JSON.stringify
+      // turns NaN and Infinity into null too -- would otherwise have pinned the
+      // character to greedy decoding forever. Absent means absent.
+      if (raw === null || raw === undefined || raw === '') continue;
+      if (typeof raw === 'boolean' || typeof raw === 'object') continue;
+      const v = Number(raw);
       if (!Number.isFinite(v)) continue;
       const [min, max] = SAMPLING_BOUNDS[k];
       out[k] = Math.min(Math.max(v, min), max);

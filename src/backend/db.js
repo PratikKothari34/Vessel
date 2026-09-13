@@ -392,7 +392,25 @@ async function migratePlaintextToEncrypted(dbPath, encryption) {
 }
 
 // ---- Connect --------------------------------------------------------------
-async function getDb() {
+// Memoized on the PROMISE, not on the resolved handle. `if (_db) return _db`
+// alone only closes the window after connect() finishes, and everything in
+// between is awaits: the first turn calls getDb() three times at once (see
+// buildContext's Promise.all), so two callers would each open the file, each run
+// initSchema, and -- the part that actually destroys data -- each start the
+// one-time plaintext->encrypted migration over the same file.
+let _dbPromise = null;
+function getDb() {
+  if (_db) return Promise.resolve(_db);
+  if (!_dbPromise) {
+    _dbPromise = connectDb().then(
+      (db) => { _dbPromise = null; return db; },
+      (err) => { _dbPromise = null; throw err; },
+    );
+  }
+  return _dbPromise;
+}
+
+async function connectDb() {
   if (_db) return _db;
 
   const [encryptionKey, authToken] = await Promise.all([
@@ -594,10 +612,15 @@ function encodeEmbeddingInt8(arr) {
   // encoding against the f64 value would bias every component by the f32
   // rounding of the scale itself.
   const s = buf.readFloatLE(2);
+  // Write through an Int8Array view rather than n x writeInt8: one bounds check
+  // for the view instead of one per component, and no per-call offset maths.
+  // Int8Array has 1-byte alignment, so a view is always constructible here.
+  const q8 = new Int8Array(buf.buffer, buf.byteOffset + EMBED_INT8_HEADER, n);
+  const inv = 1 / s;
   for (let i = 0; i < n; i++) {
-    let q = Math.round(arr[i] / s);
+    let q = Math.round(arr[i] * inv);
     if (q > 127) q = 127; else if (q < -127) q = -127;
-    buf.writeInt8(q, EMBED_INT8_HEADER + i);
+    q8[i] = q;
   }
   return buf;
 }
@@ -618,7 +641,11 @@ function decodeEmbedding(buf) {
     if (!Number.isFinite(scale)) return null;
     const n = b.byteLength - EMBED_INT8_HEADER;
     const out = new Float32Array(n);
-    for (let i = 0; i < n; i++) out[i] = b.readInt8(EMBED_INT8_HEADER + i) * scale;
+    // Same reason as the encode side: a typed view turns n bounds-checked
+    // readInt8 calls into one indexed read. This runs once per archived row on
+    // a cold cache fill, so a 2,000-turn story decodes 1.5M components.
+    const q8 = new Int8Array(b.buffer, b.byteOffset + EMBED_INT8_HEADER, n);
+    for (let i = 0; i < n; i++) out[i] = q8[i] * scale;
     return out;
   }
 

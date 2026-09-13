@@ -217,7 +217,12 @@ async function acquireLock(id, waitMs = LOCK_WAIT_MS) {
   const prev = _locks.get(id) || Promise.resolve();
   let release;
   const next = new Promise((r) => { release = r; });
-  _locks.set(id, prev.then(() => next));
+  // Keep a reference to the CHAIN we store, not to `next`. The tail-identity
+  // check below has to compare against what is actually in the map: comparing
+  // against `next` never matched, so no entry was ever removed and _locks grew
+  // by one dead promise per conversation for the life of the process.
+  const chain = prev.then(() => next);
+  _locks.set(id, chain);
 
   let timer;
   const waited = new Promise((r) => { timer = setTimeout(r, waitMs); });
@@ -229,7 +234,9 @@ async function acquireLock(id, waitMs = LOCK_WAIT_MS) {
     if (released) return;
     released = true;
     release();
-    if (_locks.get(id) === next) _locks.delete(id);
+    // Only the LAST waiter may drop the key; anyone queued behind us has
+    // already replaced the tail with their own chain.
+    if (_locks.get(id) === chain) _locks.delete(id);
   };
 }
 
@@ -372,16 +379,35 @@ async function retrieve(conversationId, queryText, k = RETRIEVE_K) {
 
   const q = normalizeInPlace(Float32Array.from(await embed(queryText)));
 
-  const scored = [];
-  for (let i = 0; i < cache.ids.length; i++) {
-    const score = dot(q, cache.vecs[i]);
-    if (score >= RETRIEVE_MIN_SCORE) scored.push({ id: cache.ids[i], score });
+  // Bounded selection, not a sort. The old path allocated one { id, score }
+  // object per row above the threshold and then sorted all of them to keep k --
+  // O(n log n) comparisons plus n allocations, on a list that grows with the
+  // story. Here each row costs one compare against the current k-th best, and
+  // only a winner pays an O(k) insert. k is 4, so that insert is free.
+  const topId = new Float64Array(k);
+  const topScore = new Float64Array(k);
+  let filled = 0;
+  let cutoff = RETRIEVE_MIN_SCORE;
+  const ids = cache.ids;
+  const vecs = cache.vecs;
+  for (let i = 0; i < ids.length; i++) {
+    const score = dot(q, vecs[i]);
+    if (score < cutoff) continue;
+    // Descending insert; drops the weakest once full.
+    let j = filled < k ? filled++ : k - 1;
+    while (j > 0 && topScore[j - 1] < score) {
+      topScore[j] = topScore[j - 1];
+      topId[j] = topId[j - 1];
+      j--;
+    }
+    topScore[j] = score;
+    topId[j] = ids[i];
+    // Once k winners are held, nothing weaker than the weakest can ever win.
+    if (filled === k) cutoff = topScore[k - 1];
   }
-  if (!scored.length) return [];
+  if (!filled) return [];
 
-  const top = scored
-    .sort((a, b) => b.score - a.score)
-    .slice(0, k)
+  const top = Array.from({ length: filled }, (_, i) => ({ id: topId[i], score: topScore[i] }))
     .sort((a, b) => a.id - b.id); // chronological
 
   const rows = (await db.execute({
@@ -479,8 +505,16 @@ function isValidMsg(m) {
  * belong in the volatile tail.
  */
 async function buildContext(conversationId, incoming, leadingSystems = [], trailingSystems = []) {
-  const valid = Array.isArray(incoming) ? incoming.filter(isValidMsg) : [];
-  const latestUser = [...valid].reverse().find((m) => m.role === 'user') || null;
+  // Walk backwards for the newest user message instead of filter + copy +
+  // reverse + find: three intermediate arrays over the whole incoming list, to
+  // locate one element that is almost always the last one.
+  let latestUser = null;
+  if (Array.isArray(incoming)) {
+    for (let i = incoming.length - 1; i >= 0; i--) {
+      const m = incoming[i];
+      if (m && m.role === 'user' && isValidMsg(m)) { latestUser = m; break; }
+    }
+  }
   const queryText = latestUser ? latestUser.content : '';
 
   // Independent reads; the retrieve() leg may include a CPU embed round trip.
@@ -496,10 +530,20 @@ async function buildContext(conversationId, incoming, leadingSystems = [], trail
 
   const messages = [];
   const stable = [];
-  for (const m of leadingSystems) if (isValidMsg(m)) stable.push(m);
+  // Counted while building instead of re-walked afterwards: leadingSystems was
+  // filtered twice (once here, once for the stats) and every block was measured
+  // by a separate reduce over an array we had just constructed.
+  let personaChars = 0;
+  for (const m of leadingSystems) {
+    if (!isValidMsg(m)) continue;
+    stable.push(m);
+    personaChars += m.content.length;
+  }
   if (summary) stable.push({ role: 'system', content: `${SUMMARY_HEADER}\n${summary}` });
   for (const t of verbatim) stable.push({ role: t.role, content: t.content });
-  messages.push(...stable);
+  // push(...stable) spreads the whole window onto the call stack; a long
+  // verbatim window plus a long summary is enough arguments to matter.
+  for (const m of stable) messages.push(m);
 
   if (retrieved.length) {
     messages.push({
@@ -507,14 +551,18 @@ async function buildContext(conversationId, incoming, leadingSystems = [], trail
       content: `${RETRIEVAL_HEADER}\n${renderTurns(retrieved)}\n${RETRIEVAL_FOOTER}`,
     });
   }
-  for (const m of trailingSystems) if (isValidMsg(m)) messages.push(m);
+  let directorChars = 0;
+  for (const m of trailingSystems) {
+    if (!isValidMsg(m)) continue;
+    messages.push(m);
+    directorChars += m.content.length;
+  }
 
   if (latestUser && !alreadyLast(verbatim, latestUser)) {
     messages.push({ role: 'user', content: latestUser.content });
   }
 
   const chars = (arr) => arr.reduce((n, m) => n + m.content.length, 0);
-  const personaChars = chars(leadingSystems.filter(isValidMsg));
   const stats = {
     messageCount: messages.length,
     promptChars: chars(messages),
@@ -527,7 +575,7 @@ async function buildContext(conversationId, incoming, leadingSystems = [], trail
     verbatimChars: chars(verbatim),
     retrievedCount: retrieved.length,
     retrievedChars: chars(retrieved),
-    directorChars: chars(trailingSystems.filter(isValidMsg)),
+    directorChars,
     newUserChars: latestUser ? latestUser.content.length : 0,
     retrieveMs,
   };
@@ -654,25 +702,39 @@ const DELETE_ID_CHUNK = 400;
 async function recordTurn(conversationId, userMessage, assistantReply, assistantName = 'Character') {
   const db = await getDb();
   const verbatim = await getVerbatim(conversationId);
+  // One timestamp for the whole exchange: the user turn, the reply and its base
+  // variant belong to the same moment, and three separate new Date() calls could
+  // otherwise straddle a second boundary and order the rows by clock skew.
+  const ts = nowIso();
 
   if (userMessage && !alreadyLast(verbatim, userMessage)) {
     await db.execute({
       sql: 'INSERT INTO turns (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)',
-      args: [conversationId, 'user', userMessage.content, nowIso()],
+      args: [conversationId, 'user', userMessage.content, ts],
     });
   }
-  await db.execute({
+  // The driver reports the inserted rowid, so the variant row is tied to the
+  // turn we just wrote rather than to whatever "newest assistant turn" happened
+  // to be by the time a follow-up SELECT ran. One round trip fewer, and no
+  // window for the two to disagree.
+  const inserted = await db.execute({
     sql: 'INSERT INTO turns (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)',
-    args: [conversationId, 'assistant', assistantReply, nowIso()],
+    args: [conversationId, 'assistant', assistantReply, ts],
   });
+  let turnId = Number(inserted.lastInsertRowid);
+  if (!Number.isInteger(turnId) || turnId <= 0) {
+    // Defensive: a driver that does not report lastInsertRowid falls back to the
+    // old lookup rather than writing an orphaned variant.
+    const newTurn = await db.execute({
+      sql: 'SELECT id FROM turns WHERE conversation_id = ? AND role = ? ORDER BY id DESC LIMIT 1',
+      args: [conversationId, 'assistant'],
+    });
+    turnId = Number(newTurn.rows[0].id);
+  }
   // Register this reply as the turn's first (active) variant so swiping works.
-  const newTurn = await db.execute({
-    sql: 'SELECT id FROM turns WHERE conversation_id = ? AND role = ? ORDER BY id DESC LIMIT 1',
-    args: [conversationId, 'assistant'],
-  });
   await db.execute({
     sql: 'INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 1, ?)',
-    args: [Number(newTurn.rows[0].id), assistantReply, nowIso()],
+    args: [turnId, assistantReply, ts],
   });
   await touchConversation(conversationId);
 
