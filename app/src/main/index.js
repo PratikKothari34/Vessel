@@ -67,7 +67,12 @@ function startBackend() {
     process.stderr.write(`[backend] ${d}`);
     backendStderr = (backendStderr + d).slice(-4000); // keep the tail only
   });
-  backendProc.on('exit', (code) => console.log(`[backend] exited (${code})`));
+  // Only an abnormal exit is worth a line. Code 0 (and the null of our own
+  // shutdown) is what quitting looks like, and saying so every time trains the
+  // reader to skip exactly the message that matters when it is not zero.
+  backendProc.on('exit', (code) => {
+    if (code) console.error(`[backend] exited unexpectedly (${code})`);
+  });
 }
 
 // Poll /health until the backend answers (or time out).

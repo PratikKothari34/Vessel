@@ -724,29 +724,30 @@ const MAX_BIND_ATTEMPTS = 4;
 
 function listen(attempt = 0) {
   const server = app.listen(PORT, '127.0.0.1', () => {
-    console.log(`Vessel backend on http://localhost:${PORT}`);
-    console.log(
+    // One write, not six. The banner is the only routine logging this process
+    // does, and assembling it first also stops an async warning from landing in
+    // the middle of it. Every line here earns its place: `sync` is the check
+    // that a test backend is isolated, and the rest name what is actually
+    // loaded, which is never obvious from the config alone.
+    const banner = [
+      `Vessel backend on http://localhost:${PORT}`,
       `  -> inference: ${BACKEND} @ ${OLLAMA_HOST} | model: ${OLLAMA_MODEL}` +
-      ` | num_ctx: ${DEFAULT_NUM_CTX}${inference.acceptsNumCtx ? '' : ' (from -c at launch)'}`,
-    );
-    console.log(
+        ` | num_ctx: ${DEFAULT_NUM_CTX}${inference.acceptsNumCtx ? '' : ' (from -c at launch)'}`,
       `  -> model rules: ${GLOBAL_BEHAVIOR ? `${GLOBAL_BEHAVIOR.length} chars from Modelfile` : 'NONE'}` +
-      `${MODELFILE.found ? '' : ' (Modelfile not found)'}`,
-    );
+        `${MODELFILE.found ? '' : ' (Modelfile not found)'}`,
+      `  -> sync: ${db.isSyncEnabled() ? 'enabled' : 'local-only'}`,
+      `  -> memory: summarizer=${memory._config.SUMMARIZER_MODEL},` +
+        ` embedder=${memory._config.EMBED_MODEL} (${inference._embedder.name})`,
+    ];
     // Without it the model falls back to its own alignment and starts refusing,
     // moralizing, and writing the user's actions -- the exact behaviours the
     // Modelfile SYSTEM exists to suppress. Silent degradation, so say it loudly.
     if (!GLOBAL_BEHAVIOR) {
-      console.warn(
-        `  !! No SYSTEM found in ${MODELFILE.path}.\n` +
-        `     Replies will not carry the global roleplay rules on any backend.`,
+      banner.push(
+        `  !! No SYSTEM found in ${MODELFILE.path}.`,
+        '     Replies will not carry the global roleplay rules on any backend.',
       );
     }
-    console.log(`  -> sync: ${db.isSyncEnabled() ? 'enabled' : 'local-only'}`);
-    console.log(
-      `  -> memory: summarizer=${memory._config.SUMMARIZER_MODEL},` +
-      ` embedder=${memory._config.EMBED_MODEL} (${inference._embedder.name})`,
-    );
     // Same model, different window = two resident instances, so every summary
     // evicts the chat model and the next message pays a full reload (~19 s
     // measured). Only reachable by setting SUMMARIZER_NUM_CTX explicitly, and
@@ -756,12 +757,13 @@ function listen(attempt = 0) {
       memory._config.SUMMARIZER_MODEL === OLLAMA_MODEL &&
       memory._config.SUMMARIZER_NUM_CTX !== DEFAULT_NUM_CTX
     ) {
-      console.warn(
-        `  !! SUMMARIZER_NUM_CTX=${memory._config.SUMMARIZER_NUM_CTX} does not match num_ctx=${DEFAULT_NUM_CTX}.\n` +
-        `     The summariser shares the chat model but not its slot, so each summary\n` +
-        `     reloads the model. Unset SUMMARIZER_NUM_CTX to keep one slot warm.`,
+      banner.push(
+        `  !! SUMMARIZER_NUM_CTX=${memory._config.SUMMARIZER_NUM_CTX} does not match num_ctx=${DEFAULT_NUM_CTX}.`,
+        '     The summariser shares the chat model but not its slot, so each summary',
+        '     reloads the model. Unset SUMMARIZER_NUM_CTX to keep one slot warm.',
       );
     }
+    console.log(banner.join('\n'));
     // On llama-server the window is whatever it was launched with. A silent
     // mismatch shows up later as a truncated story, so ask the server.
     inference.probeContext().then((n) => {

@@ -542,9 +542,18 @@ async function connectDb() {
       console.warn('[db] initial push failed (continuing local-first):', e.message);
     }
     if (SYNC_INTERVAL > 0) {
+      // Report an outage once and its recovery once, not every SYNC_INTERVAL.
+      // An unreachable remote is a steady state, and a line a minute forever
+      // buries everything else in the log without adding a single fact.
+      let syncFailing = false;
       _syncTimer = setInterval(async () => {
-        try { await raw.pull(); await raw.push(); }
-        catch (e) { console.warn('[db] periodic sync failed:', e.message); }
+        try {
+          await raw.pull();
+          await raw.push();
+          if (syncFailing) { syncFailing = false; console.warn('[db] sync recovered.'); }
+        } catch (e) {
+          if (!syncFailing) { syncFailing = true; console.warn('[db] sync failing (silenced until it recovers):', e.message); }
+        }
       }, SYNC_INTERVAL * 1000);
       if (_syncTimer.unref) _syncTimer.unref();
     }
