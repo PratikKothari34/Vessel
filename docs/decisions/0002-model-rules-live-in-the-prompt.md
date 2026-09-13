@@ -29,8 +29,8 @@ of its own. When the client does send one, that message *becomes* the system
 prompt and the Modelfile's is dropped entirely.
 
 `buildPersonaMessage` always produces a system message. So the `SYSTEM` block —
-the "no refusal, no moralizing, never write for the user" rules that are the
-entire point of an uncensored roleplay app — was dead config on every chat turn
+the "no refusal, no moralizing, never write for the user" rules the whole app
+is built around — was dead config on every chat turn
 the app has ever made.
 
 Measured against the real Ollama on `vessel`, `num_predict: 1`:

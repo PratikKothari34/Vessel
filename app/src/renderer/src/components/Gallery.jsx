@@ -8,7 +8,7 @@ export default function Gallery({ characters, loading, onOpen, onNew, onEdit }) 
       <div className="gallery-inner">
         <div className="gallery-head">
           <div>
-            <p className="kicker">Local · Private · Unfiltered</p>
+            <p className="kicker">Local · Private · Yours</p>
             <h1 className="gallery-title">Choose a <em>persona</em></h1>
             <p className="gallery-sub">
               Every conversation lives on this machine. Pick a character to begin a scenario,
