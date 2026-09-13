@@ -88,8 +88,8 @@ function forgetConversation(conversationId) { _prevPrompt.delete(conversationId)
 
 /**
  * Record one generation. `done` is the final Ollama chunk; `window` is the
- * composition breakdown from memory.buildContext(); `promptText` is the
- * concatenated outbound messages (used only for the reuse estimate).
+ * composition breakdown from memory.buildContext(); `promptMessages` is the
+ * outbound message array (used only for the prefix-reuse estimate).
  */
 function record({ conversationId, characterId, model, backend, done, window, promptMessages, aborted }) {
   const d = done || {};

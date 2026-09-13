@@ -9,7 +9,7 @@
  * and this backend must keep producing it byte for byte.
  */
 
-const { fetchRetry, nsFromMs } = require('./util');
+const { fetchRetry } = require('./util');
 
 const HOST = (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');
 const CHAT_URL = `${HOST}/api/chat`;
@@ -124,5 +124,4 @@ module.exports = {
   generate,
   embed,
   describe: () => ({ backend: 'ollama', host: HOST, model: MODEL, chatUrl: CHAT_URL }),
-  _nsFromMs: nsFromMs,
 };

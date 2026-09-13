@@ -672,13 +672,11 @@ module.exports = {
   decodeEmbedding,
   EMBED_DIM,
   EMBED_QUANTIZE,
+  // Only what a caller actually reads. The rest of the boot state has its own
+  // accessors (isSyncEnabled, isEncryptedAtRest, resolveSyncUrl) -- duplicating
+  // it here, LOCAL_DB_PATH included, only made a filesystem path easy to leak
+  // into a response by accident.
   get _config() {
-    return {
-      LOCAL_DB_PATH,
-      SYNC_ENABLED,
-      SYNC_INTERVAL,
-      ENCRYPTED_AT_REST: _encryptedAtRest,
-      TURSO_DATABASE_URL: _syncUrlInUse ? '(set)' : '',
-    };
+    return { SYNC_INTERVAL };
   },
 };

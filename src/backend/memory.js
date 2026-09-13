@@ -807,13 +807,6 @@ function scheduleMaintenance(conversationId, assistantName) {
   return state.promise;
 }
 
-// Resolve once no fold is in flight for this conversation. For shutdown and for
-// tests, which otherwise have no way to observe a background job.
-function awaitMaintenance(conversationId) {
-  const s = _maintenance.get(conversationId);
-  return s ? s.promise : Promise.resolve();
-}
-
 // Every in-flight fold, so shutdown can flush rather than drop them.
 function awaitAllMaintenance() {
   return Promise.all([..._maintenance.values()].map((s) => s.promise.catch(() => {})));
@@ -1080,7 +1073,6 @@ module.exports = {
   buildContext,
   recordTurn,
   scheduleMaintenance,
-  awaitMaintenance,
   awaitAllMaintenance,
   cancelMaintenance,
   recordUserTurn,
