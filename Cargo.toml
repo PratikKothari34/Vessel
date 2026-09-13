@@ -1,0 +1,16 @@
+# Rust workspace for the Tauri port (decision 0001, stage 4).
+#
+#   src-core   - all application logic. No GUI dependency, so its tests link in
+#                seconds and it cannot accidentally grow one.
+#   src-tauri  - the desktop shell: window, commands, events. Nothing else.
+[workspace]
+resolver = "2"
+members = ["src-core", "src-tauri"]
+
+# Profiles are only honoured in the workspace root.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
+panic = "abort"

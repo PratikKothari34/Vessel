@@ -1,0 +1,60 @@
+# The core. Everything the app actually does - database, secrets, settings,
+# embeddings, inference - lives here, and NOTHING in this crate depends on
+# Tauri or on any GUI library.
+#
+# The split is not cosmetic:
+#   - Decision 0001 puts the shell and the core in different layers. A crate
+#     boundary is what stops that from eroding: the core physically cannot reach
+#     for a `tauri::` API.
+#   - Stage 4b swaps llama-server HTTP for in-process llama.cpp behind a trait
+#     defined here. The shell never notices.
+#   - Tests link this crate alone, so they build in seconds rather than linking
+#     the whole webview stack.
+[package]
+name = "vessel-core"
+version = "1.0.3"
+description = "Vessel core: storage, secrets, retrieval and inference."
+authors = ["Pratik"]
+license = "GPL-3.0-only"
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "vessel_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Pinned EXACTLY. Decision 0001 proved this version reads the same aes256gcm
+# whole-file container that @tursodatabase/database 0.7.2 writes, canary row and
+# negative control included. The container carries a format version byte, so a
+# version bump is a re-verification, not a routine update.
+#
+# `sync` brings in the cloud replication engine (the second of the two drivers in
+# db.rs). `fts` is a DEFAULT feature and is dropped: nothing in the schema is a
+# virtual table and no query uses MATCH, so it is pure binary weight. `mimalloc`
+# is the other default and is kept - it is a straight allocator win.
+turso = { version = "=0.7.2", default-features = false, features = ["sync", "mimalloc"] }
+
+# Windows Credential Manager only. The Linux/macOS stores are off so the build
+# does not drag dbus/secret-service in on a Windows-only product.
+keyring = { version = "4.2.0", default-features = false, features = ["v1", "windows-native-keyring-store"] }
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+futures-util = "0.3"
+
+# Talks to llama-server (stage 4a). Stage 4b replaces this hop with in-process
+# llama.cpp and this dependency goes away.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+anyhow = "1.0"
+thiserror = "2.0"
+rand = "0.8"
+hex = "0.4"
+uuid = { version = "1.11", features = ["v4"] }
+dotenvy = "0.15"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

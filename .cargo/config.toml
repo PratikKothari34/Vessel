@@ -1,0 +1,24 @@
+# Toolchain pinning for the GNU host build.
+#
+# Release builds target MSVC (decision 0001; stage 4b's in-process llama.cpp and
+# CUDA require it). MSVC is not installed on this machine, so development runs on
+# `stable-x86_64-pc-windows-gnu`. That target links **msvcrt**, and mixing it with
+# a **UCRT** mingw - which is what msys2's ucrt64 environment is, and what wins on
+# a default PATH here - produces a binary that builds and then dies at startup
+# with STATUS_ENTRYPOINT_NOT_FOUND, or fails to link with `undefined reference to
+# nanosleep64`. Both are the same fault: C objects compiled against UCRT headers
+# linked against msvcrt libs.
+#
+# So every C-touching tool is pinned to ONE msvcrt toolchain (msys2's mingw64,
+# installed with `pacman -S mingw-w64-x86_64-gcc`). `windres` is resolved from
+# PATH by embed-resource and cannot be pinned here - prepend
+# C:\msys64\mingw64\bin to PATH, which `npm run tauri:*` does.
+
+[target.x86_64-pc-windows-gnu]
+linker = "C:/msys64/mingw64/bin/gcc.exe"
+ar = "C:/msys64/mingw64/bin/ar.exe"
+
+[env]
+CC_x86_64_pc_windows_gnu = "C:/msys64/mingw64/bin/gcc.exe"
+CXX_x86_64_pc_windows_gnu = "C:/msys64/mingw64/bin/g++.exe"
+AR_x86_64_pc_windows_gnu = "C:/msys64/mingw64/bin/ar.exe"
