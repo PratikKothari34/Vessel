@@ -105,8 +105,5 @@ module.exports = {
     summarize: { backend: summarizer.name, host: summarizer.host, honoursModel: summarizer.name !== 'llama-server' },
   }),
 
-  _backends: BACKENDS,
-  _chat: chat,
   _embedder: embedder,
-  _summarizer: summarizer,
 };

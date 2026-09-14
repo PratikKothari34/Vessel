@@ -283,8 +283,8 @@ Ranked by bytes saved.
 | Q4_K_M -> IQ4_XS | ~0.47 GB disk + VRAM | negligible quality |
 | 384-dim embedder (bge-small / MiniLM) | ~0.18 GB disk, 2x faster cosine | slight recall loss |
 | int8 embeddings in DB | 3072 -> 774 B/turn (3.97x) [M] | **done** — max cosine error 1.2e-3, ranking identical |
-| Electron -> Tauri | 0.19 GB disk, ~150 MB RAM | 234 lines -> Rust |
-| Node backend -> in-process Rust | 0.04 GB disk, ~70 MB RAM | 3,449 lines -> Rust |
+| Electron -> Tauri | 0.19 GB disk, ~150 MB RAM [E] | **code-complete (stage 4a)** — 239 lines of main+preload became a 524-line shell; unverified at runtime, see *Stage 4a* |
+| Node backend -> in-process Rust | 0.04 GB disk, ~70 MB RAM [E] | **code-complete (stage 4a)** — 3,996 lines became 5,690, no loopback HTTP left |
 
 **Banked so far:** VRAM 9.52 GB spilling -> **6.03 GB fully resident** [M].
 Decode 13.69 -> **46.4 tok/s p50** end to end on the real GPU [M] — **3.39x**,
@@ -426,12 +426,41 @@ llama-server -m <model.gguf> -c 12288 -ngl 99 --host 127.0.0.1 --port 8080
 `cuda_v13` because `nvidia-smi` reports CUDA UMD 13.4. Full notes in
 `.env.example`.
 
-## Code size
+## Stage 4a result - the Rust core
 
-| Area | Lines | |
-|---|---|---|
-| backend (`src/backend/`) | 3,449 | [M] |
-| of which `inference/` (Stage 3) | 700 | [M] |
-| renderer JSX | 1,233 | [M] |
-| renderer CSS | 752 | [M] |
-| `main/index.js` + `preload/index.js` | 234 | [M] |
+Decision 0001 in code. Two crates in one workspace: `src-core` (`vessel-core`,
+no GUI dependency of any kind) and `src-tauri` (the shell). The renderer is the
+same React/Vite build, untouched.
+
+What the port removes is not lines, it is a whole tier. The Electron build ran
+an Express server on 127.0.0.1:3001 and talked to it over loopback HTTP; the
+Tauri build calls the core directly through typed commands, so there is no
+socket, no origin, no CORS policy, no Host allowlist and no port to collide
+with. Roughly half of the Node security suite defended a perimeter that no
+longer exists - see the module doc on `src-core/tests/security.rs` for which
+tests were carried across and which were deleted, and why.
+
+| Area | Electron track | Rust track | |
+|---|---|---|---|
+| backend / core, production only | 3,996 | 5,690 | [M] |
+| of which `inference/` | 700 | 1,626 | [M] |
+| shell (main + preload / Tauri) | 239 | 524 | [M] |
+| tests | 2,766 | 3,058 | [M] |
+| test count | 154 | 150 | [M] |
+| renderer JSX | 1,233 | shared, unchanged | [M] |
+| renderer CSS | 752 | shared, unchanged | [M] |
+
+Rust is longer per unit of behaviour and that is the trade: explicit error
+types, no prototype chain to smuggle a key through, and a compiler that rejects
+the shape of bug the Node suite had to test for. The test counts are close
+because both suites cover the same behaviour; the Rust side folds 126 of its
+150 into the modules they test, so a failure names the function rather than an
+endpoint.
+
+**Not yet verified at runtime.** The shell needs a visible desktop window
+(WebView2), which no test here can open. The IPC ACL in
+`src-tauri/capabilities/default.json` and `permissions/ipc.toml` has never been
+exercised against a live renderer. Stage 4b - in-process llama.cpp via
+`llama-cpp-2`, which deletes the `reqwest` dependency and the last HTTP hop -
+needs Visual Studio Build Tools with the C++ workload and the CUDA Toolkit, and
+is blocked on those being installed.

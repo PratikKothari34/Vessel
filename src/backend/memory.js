@@ -1093,7 +1093,6 @@ module.exports = {
   ensureConversation,
   buildContext,
   recordTurn,
-  scheduleMaintenance,
   awaitAllMaintenance,
   cancelMaintenance,
   recordUserTurn,

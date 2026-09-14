@@ -127,9 +127,3 @@ pub fn resolve_sync_url() -> String {
         None => config::turso_url_env(),
     }
 }
-
-/// Test-only: drop the memoized copy so a test can point at a different file.
-#[cfg(test)]
-pub fn reset_cache_for_test() {
-    *lock_cache() = None;
-}
