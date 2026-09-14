@@ -365,3 +365,21 @@ async fn a_failure_never_echoes_a_credential() {
         }
     }
 }
+
+#[tokio::test]
+async fn an_engine_that_never_delimits_a_frame_is_cut_off_rather_than_buffered() {
+    // Both stream readers accumulate bytes until a delimiter arrives. Nothing in
+    // NDJSON or SSE promises one ever will, and the engine host is a field the
+    // user can type into - so a host that streams without one used to grow the
+    // buffer until the process died, with no error to explain it.
+    let _db = open().await;
+    let _steer = steer(common::DEFAULT_REPLY);
+
+    let (out, sink) = run(user("NODELIM please")).await;
+    out.expect("the stream opened, so the call itself succeeded");
+
+    let errors = sink.errors();
+    assert_eq!(errors.len(), 1, "one report, not a hang: {errors:?}");
+    assert!(errors[0].contains("megabyte"), "{errors:?}");
+    assert_eq!(sink.kinds().last(), Some(&"done"), "the stream still terminates");
+}

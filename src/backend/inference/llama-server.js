@@ -27,7 +27,7 @@
  * chunk, synthesized here, so the SSE wire and the renderer do not change.
  */
 
-const { fetchRetry, errorBody, nsFromMs, trimSlash } = require('./util');
+const { fetchRetry, errorBody, nsFromMs, trimSlash, MAX_FRAME_BYTES, UNDELIMITED } = require('./util');
 const modelfile = require('./modelfile');
 
 const CHAT_HOST = trimSlash(process.env.LLAMA_CHAT_URL || 'http://127.0.0.1:8080');
@@ -253,6 +253,13 @@ async function* iterate(res) {
     // Normalize CRLF so the \n\n frame split holds regardless of proxy.
     if (buffer.indexOf('\r') !== -1) buffer = buffer.replace(/\r\n/g, '\n');
     yield* drain(false);
+    // Same bound as the NDJSON reader, and for the same reason: a host that
+    // streams without ever closing a frame must fail loudly.
+    if (buffer.length > MAX_FRAME_BYTES) {
+      await reader.cancel().catch(() => {});
+      yield { error: UNDELIMITED };
+      return;
+    }
   }
   yield* drain(true);
 

@@ -182,6 +182,18 @@ fn handle(mut sock: TcpStream) {
                 "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n"
             );
             let _ = sock.flush();
+            if body.contains("NODELIM") {
+                // A body that never closes a frame: the shape a stale port or a
+                // proxy has, and the one case where the reader's buffer is the
+                // thing under test rather than what it parses.
+                let filler = "x".repeat(64 * 1024);
+                for _ in 0..24 {
+                    if write!(sock, "{filler}").is_err() || sock.flush().is_err() {
+                        return;
+                    }
+                }
+                return;
+            }
             if midfail {
                 // A chunk, then the shape Ollama uses to report a failure that
                 // only becomes visible after generation has started.

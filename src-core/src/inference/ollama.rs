@@ -10,7 +10,7 @@ use async_stream::stream;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value as Json};
 
-use super::util::{client, fetch_retry, trim_slash};
+use super::util::{client, fetch_retry, trim_slash, MAX_FRAME_BYTES, UNDELIMITED};
 use super::{ChatStart, DoneStats, EmbedOpts, Engine, GenOpts, Message, StreamEvent};
 
 pub struct Ollama {
@@ -134,6 +134,12 @@ fn iterate(res: reqwest::Response) -> impl futures_util::Stream<Item = StreamEve
                 if let Some(evt) = parse_line(&line) {
                     yield evt;
                 }
+            }
+            // Checked after draining, so a chunk carrying many whole lines is
+            // never mistaken for one runaway line.
+            if buffer.len() > MAX_FRAME_BYTES {
+                yield StreamEvent::Error { message: UNDELIMITED.to_string() };
+                return;
             }
         }
         let tail = String::from_utf8_lossy(&buffer).trim().to_string();

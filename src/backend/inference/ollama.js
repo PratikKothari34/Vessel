@@ -9,7 +9,7 @@
  * and this backend must keep producing it byte for byte.
  */
 
-const { fetchRetry, errorBody } = require('./util');
+const { fetchRetry, errorBody, MAX_FRAME_BYTES, UNDELIMITED } = require('./util');
 
 const HOST = (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');
 const CHAT_URL = `${HOST}/api/chat`;
@@ -68,6 +68,13 @@ async function* iterate(res) {
       const evt = parse(buffer.slice(0, nl).trim());
       buffer = buffer.slice(nl + 1);
       if (evt) yield evt;
+    }
+    // Checked after draining, so a chunk carrying many whole lines is never
+    // mistaken for one runaway line.
+    if (buffer.length > MAX_FRAME_BYTES) {
+      await reader.cancel().catch(() => {});
+      yield { raw: '', error: UNDELIMITED };
+      return;
     }
   }
   const tail = parse(buffer.trim());

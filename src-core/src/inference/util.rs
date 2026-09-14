@@ -61,6 +61,21 @@ pub async fn fetch_retry(req: reqwest::RequestBuilder, tries: u32) -> Result<req
     Err(last.unwrap_or_else(|| anyhow!("request failed")))
 }
 
+/// Largest a stream buffer may grow while waiting for a delimiter.
+///
+/// Both readers accumulate bytes until they see the end of a line or a frame.
+/// A well-behaved engine sends one small object per token, so the buffer never
+/// holds more than a few hundred bytes - but nothing in the protocol promises a
+/// delimiter will ever arrive, and `OLLAMA_HOST` is a user-editable field. Point
+/// it at something that streams without one and the buffer grows until the
+/// process dies, with no error to explain it. A megabyte is far past any real
+/// frame and small enough that hitting it is a report, not an outage.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// What a stream that never delimits itself is told to say.
+pub const UNDELIMITED: &str =
+    "The engine sent more than a megabyte with no frame boundary. It may not be a model server.";
+
 /// How much of a failed response is worth keeping.
 ///
 /// The body of an error becomes the `detail` the renderer shows. An engine host

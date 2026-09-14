@@ -31,7 +31,7 @@ use async_stream::stream;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value as Json};
 
-use super::util::{client, fetch_retry, ns_from_ms, trim_slash, warn_once};
+use super::util::{client, fetch_retry, ns_from_ms, trim_slash, warn_once, MAX_FRAME_BYTES, UNDELIMITED};
 use super::{modelfile, ChatStart, DoneStats, EmbedOpts, Engine, GenOpts, Message, StreamEvent};
 
 /// Characters carry Ollama-named sampling options. Map the ones llama.cpp
@@ -376,6 +376,12 @@ fn iterate(res: reqwest::Response, model: String) -> impl futures_util::Stream<I
                 for evt in frame(&payload_of(&raw), &mut tail, &server) {
                     yield evt;
                 }
+            }
+            // Same bound as the NDJSON reader, and for the same reason: a host
+            // that streams without ever closing a frame must fail loudly.
+            if buffer.len() > MAX_FRAME_BYTES {
+                yield StreamEvent::Error { message: UNDELIMITED.to_string() };
+                return;
             }
         }
         let rest = String::from_utf8_lossy(&buffer).trim().to_string();

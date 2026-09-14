@@ -4,6 +4,20 @@
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Largest a stream buffer may grow while waiting for a delimiter.
+//
+// Both readers accumulate bytes until they see the end of a line or a frame. A
+// well-behaved engine sends one small object per token, so the buffer never
+// holds more than a few hundred bytes -- but nothing in the protocol promises a
+// delimiter will ever arrive, and the engine host is a user-editable field.
+// Point it at something that streams without one and the buffer grows until the
+// process dies, with no error to explain it.
+const MAX_FRAME_BYTES = 1024 * 1024;
+
+// What a stream that never delimits itself is told to say.
+const UNDELIMITED =
+  'The engine sent more than a megabyte with no frame boundary. It may not be a model server.';
+
 // How much of a failed response is worth keeping. The body of an error becomes
 // the detail the renderer shows; an engine host that is not an engine at all --
 // a stale port, a proxy, a login page -- answers with a whole HTML document, and
@@ -73,4 +87,7 @@ const nsFromMs = (ms) => (Number.isFinite(ms) && ms > 0 ? Math.round(ms * 1e6) :
 
 const trimSlash = (s) => String(s || '').replace(/\/+$/, '');
 
-module.exports = { sleep, fetchRetry, errorBody, nsFromMs, trimSlash, MAX_ERROR_BODY };
+module.exports = {
+  sleep, fetchRetry, errorBody, nsFromMs, trimSlash,
+  MAX_ERROR_BODY, MAX_FRAME_BYTES, UNDELIMITED,
+};
