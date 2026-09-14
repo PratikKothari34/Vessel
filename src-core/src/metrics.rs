@@ -207,7 +207,7 @@ pub fn forget_conversation(conversation_id: &str) {
     }
 }
 
-pub fn record(sample: Sample<'_>) -> Record {
+pub fn record(sample: Sample<'_>) {
     let d = sample.done.cloned().unwrap_or_default();
     let prompt_tokens = d.prompt_eval_count;
     let eval_tokens = d.eval_count;
@@ -253,7 +253,7 @@ pub fn record(sample: Sample<'_>) -> Record {
         window: sample.window,
     };
 
-    st.ring.push(rec.clone());
+    st.ring.push(rec);
     // Drain the overflow in one move rather than shifting per dropped record:
     // lowering METRICS_RING at runtime would otherwise re-index the whole ring
     // once for every record it sheds.
@@ -262,7 +262,6 @@ pub fn record(sample: Sample<'_>) -> Record {
         let over = st.ring.len() - cap;
         st.ring.drain(..over);
     }
-    rec
 }
 
 fn pct(sorted: &[f64], p: f64) -> Option<f64> {
@@ -273,8 +272,8 @@ fn pct(sorted: &[f64], p: f64) -> Option<f64> {
     Some(sorted[i.saturating_sub(1).min(sorted.len() - 1)])
 }
 
-fn sorted_by<F: Fn(&Record) -> Option<f64>>(recs: &[Record], f: F) -> Vec<f64> {
-    let mut v: Vec<f64> = recs.iter().filter_map(&f).filter(|x| x.is_finite()).collect();
+fn sorted_by<F: Fn(&Record) -> Option<f64>>(recs: &[&Record], f: F) -> Vec<f64> {
+    let mut v: Vec<f64> = recs.iter().filter_map(|r| f(r)).filter(|x| x.is_finite()).collect();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     v
 }
@@ -283,7 +282,7 @@ fn band(sorted: &[f64]) -> serde_json::Value {
     json!({ "p50": pct(sorted, 50.0), "p95": pct(sorted, 95.0) })
 }
 
-pub fn summarize(recs: &[Record]) -> serde_json::Value {
+pub fn summarize(recs: &[&Record]) -> serde_json::Value {
     let prompt = sorted_by(recs, |r| r.prompt_tokens.map(|n| n as f64));
     let decode = sorted_by(recs, |r| r.decode_tps);
     let prefill = sorted_by(recs, |r| r.prefill_tps);
@@ -325,14 +324,17 @@ pub fn snapshot(limit: usize, conversation_id: Option<&str>) -> serde_json::Valu
         Ok(st) => st,
         Err(p) => p.into_inner(),
     };
-    let recs: Vec<Record> = match conversation_id {
+    // References, not copies. Every `Record` owns several `String`s, so cloning
+    // the ring to read it allocated once per string per record - for a view that
+    // then serializes at most `limit` of them and reads the rest only to compute
+    // percentiles. A vector of pointers costs one allocation total.
+    let recs: Vec<&Record> = match conversation_id {
         Some(id) => st
             .ring
             .iter()
             .filter(|r| r.conversation_id.as_deref() == Some(id))
-            .cloned()
             .collect(),
-        None => st.ring.clone(),
+        None => st.ring.iter().collect(),
     };
     let start = recs.len().saturating_sub(limit);
     json!({
@@ -444,8 +446,8 @@ mod tests {
             cache_reuse: None,
             window: None,
         };
-        let recs = vec![mk(Some(100), 0.0), mk(None, 0.0), mk(Some(300), 900.0)];
-        let s = summarize(&recs);
+        let recs = [mk(Some(100), 0.0), mk(None, 0.0), mk(Some(300), 900.0)];
+        let s = summarize(&recs.iter().collect::<Vec<_>>());
         assert_eq!(s["samples"], 3);
         assert_eq!(s["promptTokens"]["max"], 300.0);
         assert_eq!(s["reloads"], 1, "only the record that reloaded weights counts");
