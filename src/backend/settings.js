@@ -36,7 +36,18 @@ function load() {
 function save(patch) {
   const next = { ...load(), ...patch };
   fs.mkdirSync(path.dirname(FILE), { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(next, null, 2) + '\n');
+  // Write a sibling and rename over the target. A plain write truncates first,
+  // so crashing between the truncate and the flush leaves a half-written file —
+  // which parses as "no settings", which silently drops the user's Turso URL
+  // and reopens their database on the other driver. rename() is atomic.
+  const tmp = FILE + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
+    fs.renameSync(tmp, FILE);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* nothing to clean up */ }
+    throw e;
+  }
   _cache = next;
   return next;
 }

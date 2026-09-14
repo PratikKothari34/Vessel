@@ -33,8 +33,15 @@ pub fn file_path() -> PathBuf {
     dir.join("settings.json")
 }
 
-pub fn load() -> Settings {
-    let mut guard = cache().lock().expect("settings cache poisoned");
+/// A poisoned lock means some other caller panicked while holding it. The cache
+/// is a plain map either way, so take it back rather than turning one panic into
+/// a permanent inability to read settings - which would take the Settings panel,
+/// and with it the only way to fix a bad sync URL, down with it.
+fn lock_cache() -> std::sync::MutexGuard<'static, Option<Settings>> {
+    cache().lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn load_cached(guard: &mut Option<Settings>) -> Settings {
     if let Some(v) = guard.as_ref() {
         return v.clone();
     }
@@ -53,9 +60,19 @@ pub fn load() -> Settings {
     loaded
 }
 
+pub fn load() -> Settings {
+    load_cached(&mut lock_cache())
+}
+
 /// Merge `patch` over the current settings and persist. Returns the merged map.
+///
+/// The whole read-merge-write runs under the cache lock. Two savers that
+/// interleave around it would each merge onto the same base and the second
+/// would drop the first one's key - and the keys here decide which database
+/// driver the app opens on next start.
 pub fn save(patch: Settings) -> anyhow::Result<Settings> {
-    let mut next = load();
+    let mut guard = lock_cache();
+    let mut next = load_cached(&mut guard);
     for (k, v) in patch {
         next.insert(k, v);
     }
@@ -65,9 +82,35 @@ pub fn save(patch: Settings) -> anyhow::Result<Settings> {
     }
     let mut body = serde_json::to_string_pretty(&Value::Object(next.clone()))?;
     body.push('\n');
-    std::fs::write(&path, body)?;
-    *cache().lock().expect("settings cache poisoned") = Some(next.clone());
+    write_atomically(&path, body.as_bytes())?;
+    *guard = Some(next.clone());
     Ok(next)
+}
+
+/// Write through a sibling temp file and rename over the target.
+///
+/// A plain write truncates first, so losing power or crashing between the
+/// truncate and the flush leaves a zero-length or half-written file - which
+/// parses as "no settings", which silently drops the user's Turso URL and
+/// reopens their database on the other driver. The rename is atomic, so a
+/// reader sees either the old file or the new one.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        // Rename only orders the directory entry. Without this the new file can
+        // still be empty on disk when the entry pointing at it is durable.
+        f.sync_all()?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Read a string setting, if present.
@@ -88,5 +131,5 @@ pub fn resolve_sync_url() -> String {
 /// Test-only: drop the memoized copy so a test can point at a different file.
 #[cfg(test)]
 pub fn reset_cache_for_test() {
-    *cache().lock().expect("settings cache poisoned") = None;
+    *lock_cache() = None;
 }
