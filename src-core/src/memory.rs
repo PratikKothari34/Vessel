@@ -415,15 +415,26 @@ pub async fn acquire_lock(id: &str, wait: Duration) -> TurnLock {
 /// query vector is normalized on the way in, which turns cosine similarity into
 /// a plain dot product: the two sqrt calls and the two norm loops per candidate
 /// row disappear from the hot scan entirely.
-fn normalize_in_place(v: &mut [f32]) {
+///
+/// `false` means the vector has no usable direction and the caller must drop it:
+/// either it is all zero, or a component is not finite. The second case is the
+/// one that matters. A blob can carry an infinity - a legacy f32 row is raw
+/// bytes, and a sync pull brings rows this device never wrote - and an infinite
+/// component makes the norm infinite, the scaled components NaN, and every score
+/// against that row NaN. NaN loses no comparison, so such a row would rank above
+/// real matches AND, once it became the cutoff, let every remaining row through.
+/// One bad blob would quietly replace retrieval with noise for the whole
+/// conversation, so it is rejected here instead.
+fn normalize_in_place(v: &mut [f32]) -> bool {
     let n: f32 = v.iter().map(|x| x * x).sum();
-    if n == 0.0 {
-        return;
+    if n == 0.0 || !n.is_finite() {
+        return false;
     }
     let inv = 1.0 / n.sqrt();
     for x in v.iter_mut() {
         *x *= inv;
     }
+    true
 }
 
 /// Cosine similarity of two ALREADY-NORMALIZED vectors.
@@ -446,7 +457,13 @@ fn top_k(query: &[f32], ids: &[i64], vecs: &[f32], k: usize, min_score: f32) -> 
     let mut cutoff = min_score;
     for (i, id) in ids.iter().enumerate() {
         let score = dot(query, &vecs[i * EMBED_DIM..(i + 1) * EMBED_DIM]);
-        if score < cutoff {
+        // Negated rather than `score < cutoff`: NaN fails every comparison, so
+        // this form drops it where the direct one would let it through. Costs
+        // nothing - it is the same single compare. Clippy wants `partial_cmp`
+        // for exactly the reason the negation is here, and spelling out a
+        // three-way match on the hot scan would say less, not more.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        if !(score >= cutoff) {
             continue;
         }
         if top.len() == k {
@@ -564,10 +581,9 @@ fn absorb_rows(e: &mut CacheEntry, rows: Vec<(i64, Vec<u8>)>) {
     e.vecs.reserve(rows.len() * EMBED_DIM);
     for (id, blob) in rows {
         let Some(mut vec) = codec::decode(&blob) else { continue };
-        if vec.len() != EMBED_DIM {
+        if vec.len() != EMBED_DIM || !normalize_in_place(&mut vec) {
             continue; // no usable vector -> the row is not retrievable
         }
-        normalize_in_place(&mut vec);
         e.ids.push(id);
         e.vecs.extend_from_slice(&vec);
     }
@@ -641,7 +657,9 @@ pub async fn retrieve(db: &Db, conversation_id: &str, query_text: &str) -> Resul
     }
 
     let mut q = embed(query_text).await?;
-    normalize_in_place(&mut q);
+    if !normalize_in_place(&mut q) {
+        return Ok(Vec::new());
+    }
 
     let mut top = top_k(&q, &e.ids, &e.vecs, cfg.retrieve_k, cfg.retrieve_min_score);
     drop(e);
@@ -1799,8 +1817,58 @@ mod tests {
         assert!((dot(&a, &a) - 1.0).abs() < 1e-6);
         // A zero vector has no direction; scaling it would be a divide by zero.
         let mut z = vec![0.0f32; 4];
-        normalize_in_place(&mut z);
+        assert!(!normalize_in_place(&mut z));
         assert_eq!(z, vec![0.0; 4]);
+    }
+
+    #[test]
+    fn a_vector_with_a_non_finite_component_is_rejected() {
+        // The norm overflows to infinity and every scaled component comes out
+        // NaN. Left in the cache, that row scores NaN against every query.
+        for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, f32::MAX] {
+            let mut v = vec![1.0f32, bad, 1.0];
+            assert!(!normalize_in_place(&mut v), "{bad} was accepted");
+        }
+    }
+
+    #[test]
+    fn one_nan_row_cannot_outrank_the_real_matches_or_unblock_the_rest() {
+        // The failure this guards: NaN loses no comparison, so a direct
+        // `score < cutoff` test lets it through, the descending insert puts it
+        // FIRST, and once it is the k-th best every later row clears the
+        // cutoff too. One bad blob would turn retrieval into noise.
+        let mut q = unit(0.0);
+        normalize_in_place(&mut q);
+
+        let mut vecs = Vec::new();
+        let mut ids = Vec::new();
+        // Row 1 scores NaN, row 2 is a real match, row 3 is far away.
+        vecs.extend(std::iter::repeat_n(f32::NAN, EMBED_DIM));
+        ids.push(1);
+        for (i, seed) in [0.0f32, 9.0].iter().enumerate() {
+            let mut v = unit(*seed);
+            normalize_in_place(&mut v);
+            vecs.extend_from_slice(&v);
+            ids.push(i as i64 + 2);
+        }
+
+        let top = top_k(&q, &ids, &vecs, 4, 0.9);
+        assert_eq!(top.len(), 1, "only the real match clears the floor: {top:?}");
+        assert_eq!(top[0].0, 2);
+    }
+
+    #[test]
+    fn a_row_whose_blob_decodes_to_nonsense_is_not_cached() {
+        let mut e = CacheEntry::default();
+        let good = codec::encode_f32(&unit(0.0));
+        let poisoned = codec::encode_f32(&{
+            let mut v = unit(1.0);
+            v[7] = f32::INFINITY;
+            v
+        });
+        absorb_rows(&mut e, vec![(1, poisoned), (2, good)]);
+        assert_eq!(e.ids, vec![2], "the poisoned row was cached");
+        assert_eq!(e.vecs.len(), EMBED_DIM, "and its vector with it");
     }
 
     #[test]

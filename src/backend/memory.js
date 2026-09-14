@@ -246,10 +246,19 @@ async function acquireLock(id, waitMs = LOCK_WAIT_MS) {
 // every query vector is normalized on the way in, which turns cosine similarity
 // into a plain dot product: the two sqrt() calls and the two norm accumulator
 // loops per candidate row disappear from the hot scan entirely.
+// null means the vector has no usable direction and the caller must drop it:
+// either it is all zero, or a component is not finite. The second case is the
+// one that matters. A blob can carry an Infinity -- a legacy f32 row is raw
+// bytes, and a sync pull brings rows this device never wrote -- and an infinite
+// component makes the norm Infinity, the scaled components NaN, and every score
+// against that row NaN. NaN loses no comparison, so such a row would rank above
+// real matches AND, once it became the cutoff, let every remaining row through.
+// One bad blob would quietly replace retrieval with noise for the whole
+// conversation, so it is rejected here instead.
 function normalizeInPlace(v) {
   let n = 0;
   for (let i = 0; i < v.length; i++) n += v[i] * v[i];
-  if (n === 0) return v;
+  if (n === 0 || !Number.isFinite(n)) return null;
   const inv = 1 / Math.sqrt(n);
   for (let i = 0; i < v.length; i++) v[i] *= inv;
   return v;
@@ -314,8 +323,10 @@ function _absorbRows(e, rows) {
   for (const r of rows) {
     const vec = decodeEmbedding(r.embedding);
     if (!vec || vec.length !== EMBED_DIM) continue; // no vector -> not retrievable
+    const unit = normalizeInPlace(vec);
+    if (!unit) continue;
     e.ids.push(Number(r.id));
-    e.vecs.push(normalizeInPlace(vec));
+    e.vecs.push(unit);
   }
 }
 
@@ -377,7 +388,10 @@ async function retrieve(conversationId, queryText, k = RETRIEVE_K) {
   const cache = await loadArchiveVectors(db, conversationId);
   if (!cache.ids.length) return [];
 
+  // A query with no direction matches nothing, and scoring against it would
+  // return NaN for every row.
   const q = normalizeInPlace(Float32Array.from(await embed(queryText)));
+  if (!q) return [];
 
   // Bounded selection, not a sort. The old path allocated one { id, score }
   // object per row above the threshold and then sorted all of them to keep k --
@@ -392,7 +406,10 @@ async function retrieve(conversationId, queryText, k = RETRIEVE_K) {
   const vecs = cache.vecs;
   for (let i = 0; i < ids.length; i++) {
     const score = dot(q, vecs[i]);
-    if (score < cutoff) continue;
+    // Negated rather than `score < cutoff`: NaN fails every comparison, so this
+    // form drops it where the direct one would let it through. Costs nothing --
+    // it is the same single compare.
+    if (!(score >= cutoff)) continue;
     // Descending insert; drops the weakest once full.
     let j = filled < k ? filled++ : k - 1;
     while (j > 0 && topScore[j - 1] < score) {
@@ -1090,6 +1107,10 @@ module.exports = {
   setTitle,
   deleteConversation,
   forgetArchive,
+  // Pure vector helpers, exported for the unit tests only. They sit below the
+  // database and the engine, so testing them through retrieve() would need both
+  // just to exercise arithmetic.
+  _internals: { normalizeInPlace, _absorbRows },
   _config: {
     CHAT_MODEL, CHAT_NUM_CTX,
     SUMMARIZER_MODEL, SUMMARIZER_NUM_CTX, SUMMARIZER_NUM_GPU, EMBED_MODEL, EMBED_NUM_GPU,
