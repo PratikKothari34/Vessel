@@ -504,6 +504,27 @@ pub fn get_if_ready() -> Option<Arc<Db>> {
     DB.get().cloned()
 }
 
+/// A throwaway, unencrypted database at an explicit path, for tests only.
+///
+/// Every other way into a `Db` resolves `LOCAL_DB_PATH` and can therefore reach
+/// the user's real file. Modules whose tests write and delete rows - `memory`,
+/// above all - get a handle built from a path they chose themselves, and
+/// `#[cfg(test)]` keeps it out of every shipped binary.
+#[cfg(test)]
+pub(crate) async fn open_scratch(path: &Path) -> Result<Db> {
+    let db = open_local_plain(path).await?;
+    let conn = db.connect()?;
+    init_schema(&conn).await?;
+    Ok(Db {
+        conn,
+        handle: Handle::Local(db),
+        sync_enabled: false,
+        encrypted_at_rest: false,
+        unencrypted_reason: Some(UnencryptedReason::NoKey),
+        path: path.to_path_buf(),
+    })
+}
+
 async fn connect() -> Result<Db> {
     let path = config::local_db_abs()?;
     let encryption_key = keystore::db_encryption_key();

@@ -25,5 +25,7 @@ pub mod db;
 pub mod embed;
 pub mod inference;
 pub mod keystore;
+pub mod memory;
+pub mod metrics;
 pub mod settings;
 pub mod util;

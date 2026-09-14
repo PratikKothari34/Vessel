@@ -155,7 +155,7 @@ fn row_to_character(row: &Map<String, Json>) -> Character {
     let sampling = match row
         .get("sampling")
         .and_then(Json::as_str)
-        .map(|t| serde_json::from_str::<Json>(t))
+        .map(serde_json::from_str::<Json>)
     {
         Some(Ok(Json::Object(m))) => m,
         _ => Map::new(),
