@@ -62,3 +62,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# Integration tests are their own crate, so they do not inherit the library's
+# dependencies - `#[tokio::test]` needs the runtime named here as well.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }

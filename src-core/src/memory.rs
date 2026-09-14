@@ -943,12 +943,12 @@ async fn ensure_base_variant(db: &Db, turn_id: i64, content: &str) -> Result<()>
 /// `turns.content` so the summary and the archive read the chosen text.
 pub async fn append_variant(db: &Db, turn_id: i64, content: &str) -> Result<i64> {
     ensure_base_variant(db, turn_id, content).await?;
-    db.execute(
-        "INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 0, ?)",
-        vec![TValue::Integer(turn_id), TValue::Text(content.into()), TValue::Text(now_iso())],
-    )
-    .await?;
-    let variant_id = db.last_insert_rowid();
+    let variant_id = db
+        .insert(
+            "INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 0, ?)",
+            vec![TValue::Integer(turn_id), TValue::Text(content.into()), TValue::Text(now_iso())],
+        )
+        .await?;
     db.execute(
         "UPDATE variants SET is_active = 0 WHERE turn_id = ?",
         vec![TValue::Integer(turn_id)],
@@ -1128,17 +1128,17 @@ pub async fn record_turn(
     // The driver reports the inserted rowid, so the variant row is tied to the
     // turn we just wrote rather than to whatever "newest assistant turn"
     // happened to be by the time a follow-up SELECT ran.
-    db.execute(
-        "INSERT INTO turns (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        vec![
-            TValue::Text(conversation_id.into()),
-            TValue::Text("assistant".into()),
-            TValue::Text(assistant_reply.into()),
-            TValue::Text(ts.clone()),
-        ],
-    )
-    .await?;
-    let mut turn_id = db.last_insert_rowid();
+    let mut turn_id = db
+        .insert(
+            "INSERT INTO turns (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            vec![
+                TValue::Text(conversation_id.into()),
+                TValue::Text("assistant".into()),
+                TValue::Text(assistant_reply.into()),
+                TValue::Text(ts.clone()),
+            ],
+        )
+        .await?;
     if turn_id <= 0 {
         // Defensive: a driver that does not report the rowid falls back to the
         // lookup rather than writing an orphaned variant.

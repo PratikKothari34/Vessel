@@ -35,8 +35,10 @@ use crate::{config, keystore, settings};
 /// user turned on cloud sync and accepted the tradeoff" from "the keychain
 /// broke and we silently wrote their stories in cleartext", and those need very
 /// different warnings in the UI.
+// kebab-case, not lowercase: the renderer keys its explanation table off these
+// exact strings, and the Node backend emitted `no-key`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum UnencryptedReason {
     /// Cloud sync owns the file; the sync engine cannot encrypt locally.
     Sync,
@@ -46,18 +48,78 @@ pub enum UnencryptedReason {
     Migration,
 }
 
-/// The open database handle. It is held for its whole lifetime even though the
-/// local variant is never read again: a dropped `Connection` recycles itself
-/// into a pool that the `Database` owns, so letting the handle go would pull
-/// that pool out from under every live connection. The sync variant is read, for
+/// The open database handle. It is held for the process's whole lifetime: a
+/// dropped `Connection` recycles itself into a pool that the `Database` owns, so
+/// letting the handle go would pull that pool out from under every live
+/// connection. Both variants are read - to open connections, and (sync only) to
 /// `push`/`pull`.
 enum Handle {
-    Local(#[allow(dead_code)] turso::Database),
+    Local(turso::Database),
     Sync(turso::sync::Database),
 }
 
+/// How many reads may be in flight at once.
+///
+/// Not a tuning knob - a correctness one. A turso `Connection` rejects
+/// overlapping use with "concurrent use forbidden", and this app overlaps
+/// constantly: a turn records while the previous turn's fold is still embedding
+/// in the background, and the sidebar refreshes on top of both. One shared
+/// connection turns every one of those into an error.
+///
+/// Four, because the concurrent work is bounded and known - the streaming turn,
+/// its background maintenance, a UI read, and the sync heartbeat - and idle
+/// connections are not free. A fifth reader waits a few milliseconds instead of
+/// failing.
+const POOL_SIZE: usize = 4;
+
+/// Reader connections that are open but not in use. `slots` is what bounds the
+/// pool; `idle` only decides whether a lease reuses a connection or opens one.
+struct Pool {
+    idle: std::sync::Mutex<Vec<turso::Connection>>,
+    slots: tokio::sync::Semaphore,
+}
+
+/// A connection borrowed from the pool, returned on drop.
+struct Lease<'a> {
+    pool: &'a Pool,
+    conn: Option<turso::Connection>,
+    _slot: tokio::sync::SemaphorePermit<'a>,
+}
+
+impl std::ops::Deref for Lease<'_> {
+    type Target = turso::Connection;
+    fn deref(&self) -> &turso::Connection {
+        self.conn.as_ref().expect("a lease holds its connection until it is dropped")
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            // A poisoned lock means another task panicked mid-query. The
+            // connection is still usable and the list is still a list, so take
+            // it back rather than leaking a slot's worth of connection.
+            let mut idle = self.pool.idle.lock().unwrap_or_else(|p| p.into_inner());
+            if idle.len() < POOL_SIZE {
+                idle.push(conn);
+            }
+        }
+    }
+}
+
+/// One writer, many readers - the engine's own rule, made explicit.
+///
+/// MEASURED: eight concurrent inserts over eight connections fail six times with
+/// "database is locked". The engine takes a single write lock for the whole file
+/// and does NOT wait for it, so overlapping writers do not queue, they error.
+/// Serializing writes here is what turns that into a short wait, and it costs
+/// nothing real: the writes are single statements against a local file.
+///
+/// Reads stay parallel, which is where the time actually goes - retrieval scans
+/// every archived vector in a conversation.
 pub struct Db {
-    conn: turso::Connection,
+    writer: tokio::sync::Mutex<turso::Connection>,
+    readers: Pool,
     handle: Handle,
     sync_enabled: bool,
     encrypted_at_rest: bool,
@@ -66,9 +128,25 @@ pub struct Db {
 }
 
 impl Db {
-    pub fn conn(&self) -> &turso::Connection {
-        &self.conn
+    /// Borrow a reader, opening one if the pool has none idle.
+    async fn reader(&self) -> Result<Lease<'_>> {
+        let slot = self
+            .readers
+            .slots
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("the database connection pool was closed"))?;
+        if let Some(conn) = self.readers.idle.lock().unwrap_or_else(|p| p.into_inner()).pop() {
+            return Ok(Lease { pool: &self.readers, conn: Some(conn), _slot: slot });
+        }
+        let conn = match &self.handle {
+            Handle::Local(db) => db.connect()?,
+            Handle::Sync(s) => s.connect().await?,
+        };
+        prepare_connection(&conn).await?;
+        Ok(Lease { pool: &self.readers, conn: Some(conn), _slot: slot })
     }
+
     pub fn is_sync_enabled(&self) -> bool {
         self.sync_enabled
     }
@@ -105,8 +183,8 @@ impl Db {
     // identifiers, both of which come from our own code, never from input.
 
     pub async fn query(&self, sql: &str, params: Vec<TValue>) -> Result<Vec<Map<String, Json>>> {
-        let mut rows = self
-            .conn
+        let conn = self.reader().await?;
+        let mut rows = conn
             .query(sql, turso::params_from_iter(params))
             .await
             .with_context(|| format!("query failed: {}", first_words(sql)))?;
@@ -131,7 +209,8 @@ impl Db {
     /// retrieval scan reads 768-component embeddings — turning those into JSON
     /// arrays and back would dominate the scan).
     pub async fn query_values(&self, sql: &str, params: Vec<TValue>) -> Result<Vec<Vec<TValue>>> {
-        let mut rows = self.conn.query(sql, turso::params_from_iter(params)).await?;
+        let conn = self.reader().await?;
+        let mut rows = conn.query(sql, turso::params_from_iter(params)).await?;
         let width = rows.column_count();
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -145,18 +224,24 @@ impl Db {
     }
 
     pub async fn execute(&self, sql: &str, params: Vec<TValue>) -> Result<u64> {
-        self.conn
-            .execute(sql, turso::params_from_iter(params))
+        let conn = self.writer.lock().await;
+        conn.execute(sql, turso::params_from_iter(params))
             .await
             .with_context(|| format!("execute failed: {}", first_words(sql)))
     }
 
-    pub async fn execute_batch(&self, sql: &str) -> Result<()> {
-        Ok(self.conn.execute_batch(sql).await?)
-    }
-
-    pub fn last_insert_rowid(&self) -> i64 {
-        self.conn.last_insert_rowid()
+    /// An INSERT that reports the rowid it wrote.
+    ///
+    /// `last_insert_rowid` is a property of a CONNECTION, not of the database,
+    /// so reading it after a separate `execute` returns whatever that connection
+    /// last inserted. Holding the write lock across both is what ties the id to
+    /// the statement rather than to whoever wrote last.
+    pub async fn insert(&self, sql: &str, params: Vec<TValue>) -> Result<i64> {
+        let conn = self.writer.lock().await;
+        conn.execute(sql, turso::params_from_iter(params))
+            .await
+            .with_context(|| format!("insert failed: {}", first_words(sql)))?;
+        Ok(conn.last_insert_rowid())
     }
 }
 
@@ -476,13 +561,32 @@ async fn run_migrations(conn: &turso::Connection) -> Result<()> {
     Ok(())
 }
 
+/// Per-connection state. `foreign_keys` is NOT a database property - it is set
+/// per connection and defaults to off - so every connection the pool opens must
+/// set it, or `ON DELETE CASCADE` quietly stops firing and deleting a character
+/// leaves its conversations and turns behind.
+async fn prepare_connection(conn: &turso::Connection) -> Result<()> {
+    Ok(conn.execute_batch("PRAGMA foreign_keys = ON;").await?)
+}
+
 async fn init_schema(conn: &turso::Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA foreign_keys = ON;").await?;
+    prepare_connection(conn).await?;
     conn.execute_batch(SCHEMA).await?;
     run_migrations(conn).await
 }
 
 // ---- Connect ---------------------------------------------------------------
+
+/// Readers open on first use, not at startup: a session that only ever writes
+/// should not pay to open three connections it will never read from. The
+/// connection that opened the file becomes the writer, since it is the one that
+/// already ran the schema.
+fn new_pool() -> Pool {
+    Pool {
+        idle: std::sync::Mutex::new(Vec::new()),
+        slots: tokio::sync::Semaphore::new(POOL_SIZE),
+    }
+}
 
 static DB: OnceCell<Arc<Db>> = OnceCell::const_new();
 
@@ -516,7 +620,8 @@ pub(crate) async fn open_scratch(path: &Path) -> Result<Db> {
     let conn = db.connect()?;
     init_schema(&conn).await?;
     Ok(Db {
-        conn,
+        writer: tokio::sync::Mutex::new(conn),
+        readers: new_pool(),
         handle: Handle::Local(db),
         sync_enabled: false,
         encrypted_at_rest: false,
@@ -580,7 +685,8 @@ async fn connect() -> Result<Db> {
                 start_sync_heartbeat(sdb.clone());
 
                 return Ok(Db {
-                    conn,
+                    writer: tokio::sync::Mutex::new(conn),
+                    readers: new_pool(),
                     handle: Handle::Sync(sdb),
                     sync_enabled: true,
                     encrypted_at_rest: false,
@@ -605,7 +711,8 @@ async fn connect() -> Result<Db> {
     let conn = db.connect()?;
     init_schema(&conn).await?;
     Ok(Db {
-        conn,
+        writer: tokio::sync::Mutex::new(conn),
+        readers: new_pool(),
         handle: Handle::Local(db),
         sync_enabled: false,
         encrypted_at_rest: encrypted,
@@ -738,6 +845,157 @@ mod tests {
             }
         }
         out
+    }
+
+    // ---- Concurrency ------------------------------------------------------
+    // The app overlaps database work constantly: a turn records while the
+    // previous turn's fold embeds in the background and the sidebar refreshes on
+    // top of both. These pin the two ways that used to break.
+
+    async fn scratch_db() -> (tempfile::TempDir, Arc<Db>) {
+        let (dir, path) = scratch();
+        (dir, Arc::new(open_scratch(&path).await.unwrap()))
+    }
+
+    fn conv_row(id: &str) -> Vec<TValue> {
+        vec![
+            TValue::Text(id.into()),
+            TValue::Text("t".into()),
+            TValue::Text("2026-01-01".into()),
+            TValue::Text("2026-01-01".into()),
+        ]
+    }
+
+    const INSERT_CONV: &str =
+        "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_writes_wait_instead_of_failing() {
+        // MEASURED before the writer lock existed: eight of these came back
+        // "database is locked". The engine takes one write lock for the whole
+        // file and does not wait for it, so overlapping writers error rather
+        // than queue.
+        let (_dir, db) = scratch_db().await;
+        let mut tasks = Vec::new();
+        for i in 0..16 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                db.execute(INSERT_CONV, conv_row(&format!("id-{i}"))).await
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap().expect("a concurrent write must not fail");
+        }
+        let rows = db.query("SELECT COUNT(*) AS n FROM conversations", vec![]).await.unwrap();
+        assert_eq!(rows[0]["n"], 16);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reads_keep_running_while_writes_are_in_flight() {
+        // Serializing writes must not serialize reads with them: retrieval scans
+        // every archived vector in a conversation, and it runs during a turn.
+        let (_dir, db) = scratch_db().await;
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                db.execute(INSERT_CONV, conv_row(&format!("w-{i}"))).await.map(|_| ())
+            }));
+        }
+        for _ in 0..8 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..10 {
+                    db.query("SELECT COUNT(*) AS n FROM conversations", vec![]).await?;
+                }
+                Ok(())
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap().expect("a read must not fail because a write is running");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_insert_reports_its_own_row_not_the_last_one_written() {
+        // `last_insert_rowid` belongs to a connection, so reading it after a
+        // separate `execute` would hand a turn somebody else's rowid - and the
+        // variant rows written against that id would attach to the wrong turn.
+        let (_dir, db) = scratch_db().await;
+        db.execute(INSERT_CONV, conv_row("c1")).await.unwrap();
+
+        let mut tasks = Vec::new();
+        for i in 0..16 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                let content = format!("turn-{i}");
+                let id = db
+                    .insert(
+                        "INSERT INTO turns (conversation_id, role, content, created_at)
+                         VALUES (?, ?, ?, ?)",
+                        vec![
+                            TValue::Text("c1".into()),
+                            TValue::Text("user".into()),
+                            TValue::Text(content.clone()),
+                            TValue::Text("2026-01-01".into()),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                (id, content)
+            }));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for t in tasks {
+            let (id, content) = t.await.unwrap();
+            assert!(seen.insert(id), "two inserts reported the same rowid: {id}");
+            let row = db
+                .query_one("SELECT content FROM turns WHERE id = ?", vec![TValue::Integer(id)])
+                .await
+                .unwrap()
+                .expect("the reported rowid must exist");
+            assert_eq!(row["content"], serde_json::json!(content), "rowid {id} names another row");
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_character_still_cascades() {
+        // `foreign_keys` is per connection and defaults to OFF. If a pooled
+        // connection ever skipped the pragma, a delete would leave the rows
+        // behind instead of erroring, and nothing else would notice.
+        let (_dir, db) = scratch_db().await;
+        db.execute(
+            "INSERT INTO characters (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            vec![
+                TValue::Text("ch1".into()),
+                TValue::Text("Aria".into()),
+                TValue::Text("2026-01-01".into()),
+                TValue::Text("2026-01-01".into()),
+            ],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO conversations (id, character_id, title, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)",
+            vec![
+                TValue::Text("c1".into()),
+                TValue::Text("ch1".into()),
+                TValue::Text("t".into()),
+                TValue::Text("2026-01-01".into()),
+                TValue::Text("2026-01-01".into()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        db.execute("DELETE FROM characters WHERE id = ?", vec![TValue::Text("ch1".into())])
+            .await
+            .unwrap();
+
+        let rows = db.query("SELECT COUNT(*) AS n FROM conversations", vec![]).await.unwrap();
+        assert_eq!(rows[0]["n"], 0, "the character went but its conversation stayed");
     }
 
     #[tokio::test]

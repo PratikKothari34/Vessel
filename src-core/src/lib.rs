@@ -20,6 +20,7 @@
 //! Host-guard perimeter: there is no socket for a browser to reach.
 
 pub mod characters;
+pub mod chat;
 pub mod config;
 pub mod db;
 pub mod embed;
@@ -27,5 +28,6 @@ pub mod inference;
 pub mod keystore;
 pub mod memory;
 pub mod metrics;
+pub mod prompt;
 pub mod settings;
 pub mod util;

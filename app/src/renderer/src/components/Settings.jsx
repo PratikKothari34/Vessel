@@ -74,7 +74,8 @@ export default function Settings({ health, onClose }) {
   };
   const onDisable = () => save({ tursoUrl: '', tursoToken: '' });
 
-  const canRelaunch = typeof window !== 'undefined' && window.scenario?.relaunch;
+  // Both hosts can restart themselves; a browser-only dev renderer cannot.
+  const canRelaunch = Boolean(api.relaunch);
 
   return (
     <div className="overlay-backdrop" onClick={onClose}>
@@ -163,7 +164,7 @@ export default function Settings({ health, onClose }) {
                 </button>
               )}
               {note && canRelaunch && (
-                <button className="btn" onClick={() => window.scenario.relaunch()}>
+                <button className="btn" onClick={() => api.relaunch()}>
                   Restart now
                 </button>
               )}
