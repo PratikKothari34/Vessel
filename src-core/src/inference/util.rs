@@ -40,7 +40,7 @@ pub async fn fetch_retry(req: reqwest::RequestBuilder, tries: u32) -> Result<req
             Ok(res) if res.status().is_success() => return Ok(res),
             Ok(res) => {
                 let status = res.status();
-                let body = res.text().await.unwrap_or_default();
+                let body = error_body(res).await;
                 last = Some(anyhow!("{} {}", status.as_u16(), body));
                 if !status.is_server_error() {
                     break;
@@ -59,6 +59,43 @@ pub async fn fetch_retry(req: reqwest::RequestBuilder, tries: u32) -> Result<req
         }
     }
     Err(last.unwrap_or_else(|| anyhow!("request failed")))
+}
+
+/// How much of a failed response is worth keeping.
+///
+/// The body of an error becomes the `detail` the renderer shows. An engine host
+/// that is not an engine at all - a stale port, a proxy, a login page - answers
+/// with a whole HTML document, and reading it in full both buffers it and puts
+/// it in front of the user. A couple of lines is what identifies the failure.
+const MAX_ERROR_BODY: usize = 2048;
+
+/// Read a failed response, stopping once there is enough to name the failure.
+async fn error_body(res: reqwest::Response) -> String {
+    use futures_util::StreamExt;
+    let mut out = String::new();
+    let mut body = res.bytes_stream();
+    while let Some(Ok(chunk)) = body.next().await {
+        out.push_str(&String::from_utf8_lossy(&chunk));
+        if out.len() >= MAX_ERROR_BODY {
+            break;
+        }
+    }
+    clip(out)
+}
+
+/// Cut to [`MAX_ERROR_BODY`] on a character boundary, marking the cut. Slicing
+/// on the byte index alone panics whenever a multi-byte character straddles it.
+fn clip(mut s: String) -> String {
+    if s.len() <= MAX_ERROR_BODY {
+        return s;
+    }
+    let mut end = MAX_ERROR_BODY;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push_str("...");
+    s
 }
 
 /// Ollama reports durations in nanoseconds; llama.cpp reports them in float
@@ -105,6 +142,21 @@ mod tests {
         assert_eq!(ns_from_ms(0.0), 0);
         assert_eq!(ns_from_ms(-3.0), 0);
         assert_eq!(ns_from_ms(f64::NAN), 0);
+    }
+
+    #[test]
+    fn a_runaway_error_body_is_cut_at_a_character_boundary() {
+        // An engine host that is not an engine answers with a whole document,
+        // and a byte-index slice through one of its characters panics.
+        let out = clip("\u{e9}".repeat(MAX_ERROR_BODY));
+        assert!(out.len() <= MAX_ERROR_BODY + 3, "kept {} bytes", out.len());
+        assert!(out.ends_with("..."), "a cut body must say it was cut");
+        assert!(out.trim_end_matches('.').chars().all(|c| c == '\u{e9}'));
+    }
+
+    #[test]
+    fn a_short_error_body_is_kept_whole() {
+        assert_eq!(clip("model not found".into()), "model not found");
     }
 
     #[test]

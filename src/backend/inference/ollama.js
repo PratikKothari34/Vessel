@@ -9,7 +9,7 @@
  * and this backend must keep producing it byte for byte.
  */
 
-const { fetchRetry } = require('./util');
+const { fetchRetry, errorBody } = require('./util');
 
 const HOST = (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');
 const CHAT_URL = `${HOST}/api/chat`;
@@ -36,9 +36,7 @@ async function chatStream({ messages, options, signal }) {
   });
 
   if (!res.ok) {
-    let detail;
-    try { detail = await res.json(); } catch { detail = await res.text().catch(() => ''); }
-    return { ok: false, status: res.status, detail };
+    return { ok: false, status: res.status, detail: await errorBody(res) };
   }
 
   return { ok: true, events: iterate(res) };

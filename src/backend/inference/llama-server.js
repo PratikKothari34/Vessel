@@ -27,7 +27,7 @@
  * chunk, synthesized here, so the SSE wire and the renderer do not change.
  */
 
-const { fetchRetry, nsFromMs, trimSlash } = require('./util');
+const { fetchRetry, errorBody, nsFromMs, trimSlash } = require('./util');
 const modelfile = require('./modelfile');
 
 const CHAT_HOST = trimSlash(process.env.LLAMA_CHAT_URL || 'http://127.0.0.1:8080');
@@ -185,9 +185,7 @@ async function chatStream({ messages, options, signal }) {
   });
 
   if (!res.ok) {
-    let detail;
-    try { detail = await res.json(); } catch { detail = await res.text().catch(() => ''); }
-    return { ok: false, status: res.status, detail };
+    return { ok: false, status: res.status, detail: await errorBody(res) };
   }
 
   return { ok: true, events: iterate(res) };

@@ -93,6 +93,40 @@ test('an abort signal is honoured and not retried around', async () => {
   });
 });
 
+test('a JSON error body comes back parsed', async () => {
+  await withServer((_req, res) => {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'model not found' }));
+  }, async (url) => {
+    const res = await fetch(url);
+    assert.deepEqual(await util.errorBody(res), { error: 'model not found' });
+  });
+});
+
+test('a non-JSON error page comes back as text rather than as nothing', async () => {
+  // The old read-as-JSON-then-fall-back-to-text pattern always produced '':
+  // the failed JSON read had already disturbed the body. This is the case the
+  // fallback existed for -- an engine host that is not an engine.
+  await withServer((_req, res) => {
+    res.writeHead(502, { 'Content-Type': 'text/html' });
+    res.end('<html><body>Bad Gateway</body></html>');
+  }, async (url) => {
+    const body = await util.errorBody(await fetch(url));
+    assert.match(body, /Bad Gateway/);
+  });
+});
+
+test('a runaway error body is cut and says so', async () => {
+  await withServer((_req, res) => {
+    res.writeHead(500);
+    res.end('x'.repeat(util.MAX_ERROR_BODY * 4));
+  }, async (url) => {
+    const body = await util.errorBody(await fetch(url));
+    assert.ok(body.length <= util.MAX_ERROR_BODY + 3, `kept ${body.length} chars`);
+    assert.ok(body.endsWith('...'), 'a cut body must say it was cut');
+  });
+});
+
 test('nsFromMs converts llama.cpp float milliseconds to Ollama nanoseconds', () => {
   assert.equal(util.nsFromMs(1), 1e6);
   assert.equal(util.nsFromMs(1234.5), 1234500000);
