@@ -1,0 +1,36 @@
+# The app's whole IPC surface, named once.
+#
+# Declaring any app permission turns the ACL check ON for app commands, not just
+# plugin ones (tauri's `has_app_acl_manifest`). Without this file every command
+# in `generate_handler!` is reachable from the webview and nothing records which
+# ones were meant to be - so a command added for a test, or a half-finished one,
+# ships reachable. With it, a command is callable only if it is listed here AND
+# granted by a capability, and adding one is a deliberate two-line act.
+#
+# Core plugin commands (`core:app`, `core:window`, `core:event`, ...) stay denied
+# because no capability grants them: the renderer talks to this surface only.
+
+[[permission]]
+identifier = "ipc"
+description = "Every command the renderer is allowed to invoke."
+commands.allow = [
+  "health",
+  "metrics_snapshot",
+  "metrics_reset",
+  "get_settings",
+  "save_settings",
+  "list_characters",
+  "create_character",
+  "get_character",
+  "update_character",
+  "delete_character",
+  "list_conversations",
+  "get_conversation",
+  "set_conversation_title",
+  "delete_conversation",
+  "set_active_variant",
+  "chat",
+  "cancel_chat",
+  "flush_sync",
+  "relaunch",
+]

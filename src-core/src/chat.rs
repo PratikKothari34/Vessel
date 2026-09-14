@@ -280,8 +280,30 @@ enum Shape {
     DirectorOnly,
 }
 
+/// Ceiling on the text one request may carry.
+///
+/// The Express build got this from `express.json({ limit: "10mb" })`; over IPC
+/// there is no body parser to impose it, so the check moves here. It is not a
+/// trust boundary - the renderer is the only caller - it is a bound: without it
+/// a pasted novel is written to the database and handed to the engine, and the
+/// failure surfaces as an out-of-memory or a stalled model instead of a
+/// sentence the user can act on.
+const MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
+
+fn request_bytes(req: &ChatRequest) -> usize {
+    req.messages.iter().map(|m| m.content.len() + m.role.len()).sum::<usize>()
+        + req.director.as_deref().map_or(0, str::len)
+}
+
 fn classify(req: &ChatRequest) -> Result<Shape, ChatError> {
     let has_director = req.director.as_deref().is_some_and(|d| !d.trim().is_empty());
+
+    if request_bytes(req) > MAX_REQUEST_BYTES {
+        return Err(ChatError::new(
+            ErrorKind::BadRequest,
+            "Message is too large. Trim it and send again.",
+        ));
+    }
 
     // `messages` may legitimately be absent for a regenerate or a director-only
     // note. Otherwise a real message is required.
@@ -696,6 +718,28 @@ mod tests {
     fn a_blank_director_note_does_not_count_as_one() {
         let r = ChatRequest { director: Some("   ".into()), ..Default::default() };
         assert_eq!(classify(&r).unwrap_err().kind, ErrorKind::BadRequest);
+    }
+
+    #[test]
+    fn a_request_larger_than_the_ceiling_is_refused_before_anything_opens() {
+        // The Express body limit is gone with the HTTP; this is what replaces it.
+        let r = req(vec![Message::new("user", "x".repeat(MAX_REQUEST_BYTES + 1))]);
+        assert_eq!(classify(&r).unwrap_err().kind, ErrorKind::BadRequest);
+    }
+
+    #[test]
+    fn the_ceiling_counts_the_whole_request_not_one_message() {
+        // Many merely-large messages add up to the same problem as one huge one.
+        let half = "x".repeat(MAX_REQUEST_BYTES / 2 + 1);
+        let r = req(vec![Message::new("user", half.clone()), Message::new("user", half)]);
+        assert_eq!(classify(&r).unwrap_err().kind, ErrorKind::BadRequest);
+    }
+
+    #[test]
+    fn a_request_at_the_ceiling_still_goes_through() {
+        let mut r = req(vec![Message::new("user", "x".repeat(MAX_REQUEST_BYTES - 4))]);
+        r.messages[0].role = "user".into();
+        assert_eq!(classify(&r).unwrap(), Shape::Normal);
     }
 
     #[test]
