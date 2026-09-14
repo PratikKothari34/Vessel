@@ -19,8 +19,11 @@
 //! becomes a Tauri command, which deletes the whole DNS-rebinding / CORS /
 //! Host-guard perimeter: there is no socket for a browser to reach.
 
+pub mod characters;
 pub mod config;
 pub mod db;
 pub mod embed;
+pub mod inference;
 pub mod keystore;
 pub mod settings;
+pub mod util;
