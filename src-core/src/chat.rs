@@ -639,8 +639,8 @@ async fn stream_and_record(
                 .await
                 .map(|_| ())
         }
-    } else if engine_error.is_none() && prep.latest_user.is_some() {
-        memory::record_user_turn(db, &conv_id, prep.latest_user.as_ref().unwrap()).await.map(|_| ())
+    } else if let (None, Some(user)) = (engine_error.as_ref(), prep.latest_user.as_ref()) {
+        memory::record_user_turn(db, &conv_id, user).await.map(|_| ())
     } else {
         // Nothing recorded (an engine error, or an aborted director/regenerate
         // with no text) - drop the conversation row if this request created it.
