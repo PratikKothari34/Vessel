@@ -60,5 +60,23 @@ uuid = { version = "1.11", features = ["v4"] }
 dotenvy = "0.15"
 tracing = "0.1"
 
+# Stage 4b: llama.cpp in this process, behind the `local-llama` feature.
+#
+# Optional and OFF by default on purpose. Turning it on links llama.cpp, which
+# needs a C++ toolchain to build (and the CUDA toolkit for the cuda feature).
+# The default build stays pure Rust so `cargo test -p vessel-core` runs anywhere
+# and CI does not need a 3 GB toolchain to check the parts that are not the
+# engine.
+llama-cpp-2 = { version = "0.1.156", optional = true }
+
+[features]
+default = []
+# CPU build. Correct everywhere, slow enough that it is a fallback rather than
+# the target: the measured configuration is all 99 layers on the 4060.
+local-llama = ["dep:llama-cpp-2"]
+# What this machine actually builds. Separate from `local-llama` so a CUDA
+# toolchain is required only when CUDA is wanted.
+local-llama-cuda = ["local-llama", "llama-cpp-2/cuda"]
+
 [dev-dependencies]
 tempfile = "3"

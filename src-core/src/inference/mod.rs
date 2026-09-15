@@ -36,6 +36,13 @@
 //! when stage 4b adds the in-process llama.cpp engine the compiler names every
 //! site that has to handle it instead of letting a missing impl reach runtime.
 
+pub mod gguf;
+/// The in-process engine. Gated because it links llama.cpp: a build without the
+/// feature carries no native dependency and no CUDA toolchain requirement, and
+/// that stays the default so the repo still builds anywhere. `gguf` is NOT
+/// gated - it is pure path logic, and its tests are worth running either way.
+#[cfg(feature = "local-llama")]
+pub mod llama_local;
 pub mod llama_server;
 pub mod modelfile;
 pub mod ollama;
@@ -143,6 +150,14 @@ pub trait Engine {
     /// Whether the context window is a per-request option. Ollama takes it per
     /// request; llama-server fixes it at launch with `-c`.
     fn accepts_num_ctx(&self) -> bool;
+    /// Whether the `model` argument to `generate` and `embed` selects anything.
+    ///
+    /// Ollama swaps models per request, so it does. The other two serve exactly
+    /// the weights they were started with and accept-and-ignore the argument -
+    /// which is how `SUMMARIZER_MODEL` once got silently replaced by the roleplay
+    /// chat model. Asking the backend beats comparing `name()` against a string
+    /// literal that a new backend would not update.
+    fn honours_model(&self) -> bool;
     fn describe(&self) -> Json;
 
     async fn chat_stream(&self, messages: Vec<Message>, options: &Map<String, Json>) -> Result<ChatStart>;
@@ -153,6 +168,8 @@ pub trait Engine {
 pub enum Backend {
     Ollama(ollama::Ollama),
     LlamaServer(llama_server::LlamaServer),
+    #[cfg(feature = "local-llama")]
+    LlamaLocal(llama_local::LlamaLocal),
 }
 
 macro_rules! dispatch {
@@ -165,12 +182,16 @@ macro_rules! dispatch {
         match $self {
             Backend::Ollama(b) => b.$method($($arg),*).await,
             Backend::LlamaServer(b) => b.$method($($arg),*).await,
+            #[cfg(feature = "local-llama")]
+            Backend::LlamaLocal(b) => b.$method($($arg),*).await,
         }
     };
     ($self:expr, $method:ident($($arg:expr),*)) => {
         match $self {
             Backend::Ollama(b) => b.$method($($arg),*),
             Backend::LlamaServer(b) => b.$method($($arg),*),
+            #[cfg(feature = "local-llama")]
+            Backend::LlamaLocal(b) => b.$method($($arg),*),
         }
     };
 }
@@ -188,6 +209,9 @@ impl Engine for Backend {
     fn accepts_num_ctx(&self) -> bool {
         dispatch!(self, accepts_num_ctx())
     }
+    fn honours_model(&self) -> bool {
+        dispatch!(self, honours_model())
+    }
     fn describe(&self) -> Json {
         dispatch!(self, describe())
     }
@@ -202,11 +226,35 @@ impl Engine for Backend {
     }
 }
 
-fn build(kind: &str) -> Backend {
-    match kind {
+/// The names `pick` accepts. Listed once so the error message cannot drift out
+/// of step with the match below it.
+const BACKENDS: &[&str] = &["ollama", "llama-server", "llama-local"];
+
+/// Construct one backend.
+///
+/// Fallible because the in-process engine resolves a GGUF path and loads it:
+/// "the model file is not where I looked" is a startup error with something to
+/// act on, not a per-request failure found halfway through the first message.
+/// The two HTTP backends cannot fail here - nothing is contacted until a
+/// request is made.
+fn build(kind: &str) -> Result<Backend> {
+    Ok(match kind {
         "llama-server" => Backend::LlamaServer(llama_server::LlamaServer::from_env()),
+        #[cfg(feature = "local-llama")]
+        "llama-local" => Backend::LlamaLocal(llama_local::LlamaLocal::from_env()?),
+        #[cfg(not(feature = "local-llama"))]
+        "llama-local" => {
+            // Naming a backend the binary cannot contain is a build problem, and
+            // saying so beats "not a known backend" - the name IS known, this
+            // build just does not carry it.
+            return Err(anyhow!(
+                "llama-local was selected, but this build was compiled without the local-llama \
+                 feature. Rebuild with --features local-llama-cuda (or local-llama for CPU), or \
+                 use llama-server."
+            ));
+        }
         _ => Backend::Ollama(ollama::Ollama::from_env()),
-    }
+    })
 }
 
 /// Resolve one backend name from the environment, rejecting anything unknown.
@@ -218,14 +266,15 @@ fn pick(var: &str, fallback: &str) -> Result<Backend> {
     let raw = std::env::var(var).unwrap_or_default();
     let key = raw.trim().to_ascii_lowercase();
     if key.is_empty() {
-        return Ok(build(fallback));
+        return build(fallback);
     }
-    if key != "ollama" && key != "llama-server" {
+    if !BACKENDS.contains(&key.as_str()) {
         return Err(anyhow!(
-            "{var}=\"{raw}\" is not a known backend. Use one of: ollama, llama-server."
+            "{var}=\"{raw}\" is not a known backend. Use one of: {}.",
+            BACKENDS.join(", ")
         ));
     }
-    Ok(build(&key))
+    build(&key)
 }
 
 struct Engines {
@@ -276,6 +325,12 @@ pub fn summarizer() -> Result<&'static Backend> {
 /// rather than discovering as a truncated story.
 pub async fn probe_context() -> Option<u32> {
     let chat = chat().ok()?;
+    #[cfg(feature = "local-llama")]
+    if let Backend::LlamaLocal(b) = chat {
+        // Answered by the engine thread, so a reply also proves the weights
+        // finished loading rather than echoing the config back.
+        return b.probe_ctx().await;
+    }
     let Backend::LlamaServer(_) = chat else { return None };
     let res = util::client()
         .get(format!("{}/props", chat.host()))
@@ -311,7 +366,7 @@ pub fn describe() -> Json {
         "summarize": {
             "backend": e.summarizer.name(),
             "host": e.summarizer.host(),
-            "honoursModel": e.summarizer.name() != "llama-server",
+            "honoursModel": e.summarizer.honours_model(),
         },
     })
 }
@@ -343,7 +398,29 @@ mod tests {
 
     #[test]
     fn only_ollama_takes_the_context_window_per_request() {
-        assert!(build("ollama").accepts_num_ctx());
-        assert!(!build("llama-server").accepts_num_ctx());
+        assert!(build("ollama").unwrap().accepts_num_ctx());
+        assert!(!build("llama-server").unwrap().accepts_num_ctx());
+    }
+
+    #[test]
+    fn only_ollama_lets_the_caller_choose_the_model() {
+        // What the health view prints as honoursModel. It used to be a string
+        // comparison against "llama-server", which a third backend would have
+        // silently passed.
+        assert!(build("ollama").unwrap().honours_model());
+        assert!(!build("llama-server").unwrap().honours_model());
+    }
+
+    /// A name this build cannot carry must not read as a typo.
+    #[test]
+    #[cfg(not(feature = "local-llama"))]
+    fn a_backend_the_build_omits_says_so_rather_than_calling_it_unknown() {
+        std::env::set_var("VESSEL_TEST_BACKEND3", "llama-local");
+        let err = match pick("VESSEL_TEST_BACKEND3", "ollama") {
+            Err(e) => e.to_string(),
+            Ok(b) => panic!("a feature-gated backend built as {}", b.name()),
+        };
+        assert!(err.contains("compiled without the local-llama"), "{err}");
+        std::env::remove_var("VESSEL_TEST_BACKEND3");
     }
 }

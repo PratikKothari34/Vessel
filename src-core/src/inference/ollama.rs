@@ -48,6 +48,11 @@ impl Engine for Ollama {
     fn accepts_num_ctx(&self) -> bool {
         true
     }
+    /// Ollama loads whichever model the request names, so SUMMARIZER_MODEL and
+    /// EMBED_MODEL mean what they say. That is why the summarizer defaults here.
+    fn honours_model(&self) -> bool {
+        true
+    }
     fn describe(&self) -> Json {
         json!({
             "backend": "ollama",

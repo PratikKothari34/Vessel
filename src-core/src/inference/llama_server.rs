@@ -31,7 +31,10 @@ use async_stream::stream;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value as Json};
 
-use super::util::{client, fetch_retry, ns_from_ms, trim_slash, warn_once, MAX_FRAME_BYTES, UNDELIMITED};
+use super::util::{
+    client, fetch_retry, ns_from_ms, ollama_chunk, ollama_done, trim_slash, warn_once,
+    MAX_FRAME_BYTES, UNDELIMITED,
+};
 use super::{modelfile, ChatStart, DoneStats, EmbedOpts, Engine, GenOpts, Message, StreamEvent};
 
 /// Characters carry Ollama-named sampling options. Map the ones llama.cpp
@@ -178,36 +181,6 @@ fn done_stats(timings: Option<&Json>, usage: Option<&Json>, finish_reason: Optio
     }
 }
 
-fn done_raw(model: &str, stats: &DoneStats) -> String {
-    let mut chunk = json!({
-        "model": model,
-        "created_at": crate::util::now_iso(),
-        "message": { "role": "assistant", "content": "" },
-        "done": true,
-        "done_reason": stats.done_reason.clone().unwrap_or_else(|| "stop".into()),
-        "load_duration": 0,
-        "total_duration": stats.total_duration.unwrap_or(0),
-    });
-    let obj = chunk.as_object_mut().expect("object");
-    // Absent rather than null, exactly as the Ollama chunk has them: the
-    // renderer and the metrics reader both treat a missing key as "unknown".
-    for (key, val) in [
-        ("prompt_eval_count", stats.prompt_eval_count),
-        ("prompt_eval_duration", stats.prompt_eval_duration),
-        ("eval_count", stats.eval_count),
-        ("eval_duration", stats.eval_duration),
-        // Not an Ollama field. The metrics module reads it when present and
-        // reports measured KV reuse alongside the char-prefix estimate that
-        // works on both backends.
-        ("cached_tokens", stats.cached_tokens),
-    ] {
-        if let Some(v) = val {
-            obj.insert(key.to_string(), json!(v));
-        }
-    }
-    chunk.to_string()
-}
-
 impl Engine for LlamaServer {
     fn name(&self) -> &'static str {
         "llama-server"
@@ -221,6 +194,12 @@ impl Engine for LlamaServer {
     /// The context window is fixed at launch. Callers use this to decide whether
     /// to send num_ctx at all, and to warn when the two disagree.
     fn accepts_num_ctx(&self) -> bool {
+        false
+    }
+    /// One process, one model, named by `-m` at launch. The `model` field of a
+    /// request is accepted and ignored, so SUMMARIZER_MODEL silently does
+    /// nothing here - the health view says so rather than hiding it.
+    fn honours_model(&self) -> bool {
         false
     }
     fn describe(&self) -> Json {
@@ -395,7 +374,7 @@ fn iterate(res: reqwest::Response, model: String) -> impl futures_util::Stream<I
         // aborted read must record as aborted, exactly as it does on Ollama.
         if tail.saw_done || tail.finish_reason.is_some() || tail.usage.is_some() || tail.timings.is_some() {
             let stats = done_stats(tail.timings.as_ref(), tail.usage.as_ref(), tail.finish_reason.as_deref());
-            yield StreamEvent::Done { raw: done_raw(&model, &stats), stats: Box::new(stats) };
+            yield StreamEvent::Done { raw: ollama_done(&model, &stats), stats: Box::new(stats) };
         }
     }
 }
@@ -406,13 +385,7 @@ struct LlamaServerChunk {
 
 impl LlamaServerChunk {
     fn content(&self, text: &str) -> String {
-        json!({
-            "model": self.model,
-            "created_at": crate::util::now_iso(),
-            "message": { "role": "assistant", "content": text },
-            "done": false,
-        })
-        .to_string()
+        ollama_chunk(&self.model, text)
     }
 }
 
@@ -550,7 +523,7 @@ mod tests {
     fn the_synthesized_done_line_is_ollama_shaped() {
         let t = json!({ "prompt_n": 10, "cache_n": 5, "prompt_ms": 1.0, "predicted_n": 2, "predicted_ms": 2.0 });
         let s = done_stats(Some(&t), None, Some("length"));
-        let raw: Json = serde_json::from_str(&done_raw("vessel", &s)).unwrap();
+        let raw: Json = serde_json::from_str(&ollama_done("vessel", &s)).unwrap();
         assert_eq!(raw["done"], json!(true));
         assert_eq!(raw["done_reason"], json!("length"));
         assert_eq!(raw["message"]["content"], json!(""));
@@ -561,7 +534,7 @@ mod tests {
     #[test]
     fn absent_telemetry_is_absent_rather_than_null() {
         let s = done_stats(None, None, None);
-        let raw: Json = serde_json::from_str(&done_raw("vessel", &s)).unwrap();
+        let raw: Json = serde_json::from_str(&ollama_done("vessel", &s)).unwrap();
         for key in ["prompt_eval_count", "eval_count", "cached_tokens", "prompt_eval_duration"] {
             assert!(raw.get(key).is_none(), "{key} should be absent, got {raw}");
         }

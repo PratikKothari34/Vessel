@@ -147,6 +147,53 @@ pub fn warn_once(key: &str, msg: &str) {
     }
 }
 
+/// Build the Ollama-shaped chat chunk the renderer parses.
+///
+/// Shared rather than duplicated because it is the wire contract: decision 0001
+/// keeps the renderer unchanged, so every backend that is not Ollama has to
+/// synthesize exactly this shape, and two copies of it drift the moment one is
+/// edited.
+pub fn ollama_chunk(model: &str, text: &str) -> String {
+    serde_json::json!({
+        "model": model,
+        "created_at": crate::util::now_iso(),
+        "message": { "role": "assistant", "content": text },
+        "done": false,
+    })
+    .to_string()
+}
+
+/// The final chunk of a stream, carrying the numbers.
+pub fn ollama_done(model: &str, stats: &crate::inference::DoneStats) -> String {
+    let mut chunk = serde_json::json!({
+        "model": model,
+        "created_at": crate::util::now_iso(),
+        "message": { "role": "assistant", "content": "" },
+        "done": true,
+        "done_reason": stats.done_reason.clone().unwrap_or_else(|| "stop".into()),
+        "load_duration": stats.load_duration.unwrap_or(0),
+        "total_duration": stats.total_duration.unwrap_or(0),
+    });
+    let obj = chunk.as_object_mut().expect("object");
+    // Absent rather than null, exactly as the Ollama chunk has them: the
+    // renderer and the metrics reader both treat a missing key as "unknown".
+    for (key, val) in [
+        ("prompt_eval_count", stats.prompt_eval_count),
+        ("prompt_eval_duration", stats.prompt_eval_duration),
+        ("eval_count", stats.eval_count),
+        ("eval_duration", stats.eval_duration),
+        // Not an Ollama field. The metrics module reads it when present and
+        // reports measured KV reuse alongside the char-prefix estimate that
+        // works on both backends.
+        ("cached_tokens", stats.cached_tokens),
+    ] {
+        if let Some(v) = val {
+            obj.insert(key.to_string(), serde_json::json!(v));
+        }
+    }
+    chunk.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
