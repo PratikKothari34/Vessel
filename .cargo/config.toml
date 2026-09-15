@@ -1,18 +1,30 @@
-# Toolchain pinning for the GNU host build.
+# Toolchain configuration for the Rust track.
 #
-# Release builds target MSVC (decision 0001; stage 4b's in-process llama.cpp and
-# CUDA require it). MSVC is not installed on this machine, so development runs on
-# `stable-x86_64-pc-windows-gnu`. That target links **msvcrt**, and mixing it with
-# a **UCRT** mingw - which is what msys2's ucrt64 environment is, and what wins on
-# a default PATH here - produces a binary that builds and then dies at startup
-# with STATUS_ENTRYPOINT_NOT_FOUND, or fails to link with `undefined reference to
-# nanosleep64`. Both are the same fault: C objects compiled against UCRT headers
-# linked against msvcrt libs.
+# MSVC is the default toolchain and the release target (decision 0001: stage 4b
+# in-process llama.cpp and CUDA both require it). Build Tools 17.14 is installed
+# with the VCTools workload, C++ CMake tools and Windows 11 SDK 10.0.26100, so
+# the plain invocation is the correct one and is what the docs use:
 #
-# So every C-touching tool is pinned to ONE msvcrt toolchain (msys2's mingw64,
-# installed with `pacman -S mingw-w64-x86_64-gcc`). `windres` is resolved from
-# PATH by embed-resource and cannot be pinned here - prepend
-# C:\msys64\mingw64\bin to PATH, which `npm run tauri:*` does.
+#   cargo test -p vessel-core
+#   cargo clippy --workspace --all-targets
+#
+# Measured on that toolchain: 126 unit + 12 chat_turn + 12 security, all green,
+# and clippy silent across the workspace including src-tauri.
+#
+# The blocks below exist only for the legacy `+stable-x86_64-pc-windows-gnu`
+# builds that predate the MSVC install. They are target-scoped, so they are inert
+# on an MSVC build and cost nothing to keep.
+#
+# Why they are needed when building GNU at all: that target links **msvcrt**, and
+# mixing it with a **UCRT** mingw - which is what the msys2 ucrt64 environment is,
+# and what wins on a default PATH here - produces a binary that builds and then
+# dies at startup with STATUS_ENTRYPOINT_NOT_FOUND, or fails to link with
+# `undefined reference to nanosleep64`. Both are the same fault: C objects
+# compiled against UCRT headers linked against msvcrt libs. So every C-touching
+# tool is pinned to ONE msvcrt toolchain (msys2 mingw64, installed with
+# `pacman -S mingw-w64-x86_64-gcc`). `windres` is resolved from PATH by
+# embed-resource and cannot be pinned here - prepend C:\msys64\mingw64\bin to
+# PATH for a GNU build.
 
 [target.x86_64-pc-windows-gnu]
 linker = "C:/msys64/mingw64/bin/gcc.exe"

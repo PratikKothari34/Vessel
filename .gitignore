@@ -45,8 +45,11 @@ CLAUDE.md
 # Path-keyed memory: local working copy, not published
 docs/memory/
 
-# Rust build output. `target-gnu` is the local GNU-toolchain dir (see
-# .cargo/config.toml); `target` is what the MSVC release build will use.
+# Rust build output. `target` is the MSVC build dir (the default toolchain);
+# `target-gnu` is the legacy GNU one (see .cargo/config.toml). Both are
+# DIRECTORY JUNCTIONS into C:/build/vessel, so the multi-GB build output sits
+# outside the OneDrive-synced tree. Recreate with `New-Item -ItemType Junction`
+# after a fresh clone; nothing in the build cares that they are junctions.
 /target/
 /target-gnu/
 /src-tauri/target/
