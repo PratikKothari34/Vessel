@@ -517,27 +517,72 @@ with. Roughly half of the Node security suite defended a perimeter that no
 longer exists - see the module doc on `src-core/tests/security.rs` for which
 tests were carried across and which were deleted, and why.
 
+Re-counted 2026-09-17. The Rust figures are **after** the one-time
+`cargo fmt` pass, which splits long lines and so inflates every Rust row against
+the numbers this table carried before; the Electron rows are unaffected.
+
 | Area | Electron track | Rust track | |
 |---|---|---|---|
-| backend / core, production only | 3,996 | 5,690 | [M] |
-| of which `inference/` | 700 | 1,626 | [M] |
-| shell (main + preload / Tauri) | 239 | 524 | [M] |
-| tests | 2,766 | 3,058 | [M] |
-| test count | 154 | 150 | [M] |
-| renderer JSX | 1,233 | shared, unchanged | [M] |
+| backend / core, production only | 4,298 | 7,498 | [M] |
+| of which `inference/` | 793 | 2,619 | [M] |
+| shell (main + preload / Tauri) | 239 | 561 | [M] |
+| tests | 3,461 | 3,971 | [M] |
+| test count | 202 | 165 | [M] |
+| renderer JS/JSX | 1,536 | shared, unchanged | [M] |
 | renderer CSS | 752 | shared, unchanged | [M] |
 
 Rust is longer per unit of behaviour and that is the trade: explicit error
 types, no prototype chain to smuggle a key through, and a compiler that rejects
 the shape of bug the Node suite had to test for. The test counts are close
-because both suites cover the same behaviour; the Rust side folds 126 of its
-150 into the modules they test, so a failure names the function rather than an
-endpoint.
+because both suites cover the same behaviour; the Rust side folds 138 of its
+165 into the modules they test, so a failure names the function rather than an
+endpoint. The Electron suite is the larger of the two because it also has to
+test a perimeter the Rust track does not have: 32 of its 202 are red-team tests
+against the HTTP surface.
 
 **Not yet verified at runtime.** The shell needs a visible desktop window
 (WebView2), which no test here can open. The IPC ACL in
 `src-tauri/capabilities/default.json` and `permissions/ipc.toml` has never been
-exercised against a live renderer. Stage 4b - in-process llama.cpp via
-`llama-cpp-2`, which deletes the `reqwest` dependency and the last HTTP hop -
-needs Visual Studio Build Tools with the C++ workload and the CUDA Toolkit, and
-is blocked on those being installed.
+exercised against a live renderer.
+
+## Stage 4b result - llama.cpp inside the process
+
+The blocker on this stage was the toolchain, and it is gone: MSVC Build Tools
+with the C++ workload and the CUDA Toolkit went on 2026-09-15, and the plain
+`cargo test -p vessel-core` has been the correct invocation since.
+
+`src-core/src/inference/llama_local.rs` is the engine, behind a feature so a
+CUDA toolchain is only required when CUDA is wanted:
+
+| Feature | What it builds | |
+|---|---|---|
+| *(default)* | llama-server over HTTP, as stage 4a | [M] |
+| `local-llama` | in-process llama.cpp, CPU | [M] |
+| `local-llama-cuda` | in-process llama.cpp, CUDA | [M] |
+
+Selecting `INFERENCE_BACKEND=llama-local` in a build without the feature is a
+startup error that says so, not a silent fallback. The feature build adds 12
+tests (the sampler and the emitter), for 177.
+
+What it buys, and what it does not:
+
+- **The summariser shares the chat weights.** One model is resident; `generate`
+  runs on its own KV sequence. That is the `gemma3:4b` deletion decision 0001
+  priced at 3.3 GB and a 19,365 ms reload per summary - though with the rolling
+  summary now off by default (decision 0004), the reload it deletes is one most
+  users were never paying.
+- **`cached_tokens` is measured, not estimated.** The resident token vector is
+  compared against the new prompt and the shared head is the reuse; everything
+  past it is dropped from the sequence explicitly.
+- **KV reuse is per process, not per conversation.** The cache lives in
+  sequence 0 and survives from turn to turn; it does **not** survive a restart.
+  The slot save/restore that decision 0001 lists under "persistent
+  per-conversation KV cache" is still open.
+- **It does not embed.** `EMBED_BACKEND` stays on ollama or llama-server.
+- `reqwest` does not go away yet - the default build still uses it, and so does
+  the embedder on either path.
+
+**Not measured on the 4060.** The decode/prefill numbers in this document are
+llama-server's (stage 3). Nothing here re-measures them for the in-process
+engine; the two run the same llama.cpp, but that is an expectation, not a
+figure.

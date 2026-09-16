@@ -45,6 +45,13 @@ and are **archived with embeddings** (nomic-embed-text); relevant ones are
 recalled per message by cosine-ranking the stored embeddings in JS (the Turso
 sync engine has no native vector search).
 
+Ollama is the default, not the only option. `INFERENCE_BACKEND=llama-server`
+points the same backend at a llama.cpp server instead, which on an RTX 4060 8GB
+measured faster on every axis - decode 46.5 vs 39.4 tok/s, prefill ~2,200 vs
+~1,600 - and holds one model for the life of the process so nothing can evict
+it. It needs a server you start yourself; `.env.example` has the launch line and
+the flags that matter.
+
 A **rolling summary** (gemma3:4b) can narrate what fell out of the window as
 well, but it ships **off**. Measured over 2,000 exchanges it left recall
 unchanged (33.8% vs 39.4%, p=0.30) while cutting accuracy when the model
@@ -178,13 +185,38 @@ Vessel/
 │   ├── server.js           # Express + SSE /chat + REST
 │   ├── db.js               # Turso sync client + schema + embedding codec
 │   ├── memory.js           # summary + retrieval engine
-│   └── characters.js       # character CRUD
-└── app/                    # Electron + React (Vite)
-    └── src/
-        ├── main/           # spawns backend, creates window
-        ├── preload/
-        └── renderer/src/   # React UI (Gallery, Chat, Editor, Settings, Memory)
+│   ├── characters.js       # character CRUD
+│   └── inference/          # ollama / llama-server adapters behind one interface
+├── app/                    # Electron + React (Vite)
+│   └── src/
+│       ├── main/           # spawns backend, creates window
+│       ├── preload/
+│       └── renderer/src/   # React UI (Gallery, Chat, Editor, Settings, Memory)
+├── test/                   # node:test suites — see Tests below
+└── docs/
+    ├── MASTER.md           # every measured number, in one place
+    └── decisions/          # why the load-bearing choices were made
 ```
+
+A Rust port of the backend lives beside this one in `src-core/` (all the logic)
+and `src-tauri/` (a Tauri shell), tracking
+`docs/decisions/0001-target-architecture.md`. It is not what the installer
+builds, and nothing above depends on it.
+
+---
+
+## Tests
+
+Two suites, no test dependencies in either.
+
+```bash
+npm test                      # 202 tests — the Node backend, unit + integration
+cargo test -p vessel-core     # 165 tests — the Rust core
+```
+
+`npm test` spawns its own backend on a scratch database with a fake inference
+engine, so it never touches your real data, your keychain or a model. It needs
+nothing running.
 
 ---
 

@@ -24,9 +24,9 @@ Three things, which are really one thing:
 ### The routing bug made the other two invisible
 
 `inference/index.js` sent `generate()` to the **chat** backend. llama-server
-accepts a `model` argument and ignores it — one server, one model — so under the
-shipped `INFERENCE_BACKEND=llama-server` config every summary was written by
-`vessel` while `/health` reported `gemma3:4b`.
+accepts a `model` argument and ignores it — one server, one model — so with
+`INFERENCE_BACKEND=llama-server` set, every summary was written by `vessel`
+while `/health` reported `gemma3:4b`.
 
 That is not a cosmetic mismatch. Scored on 13 facts the transcript actually
 contains, over a two-round rolling update:
@@ -117,3 +117,19 @@ backstop it was always meant to be.
 - `--parallel 1` is now required at llama-server launch. Unrelated to the
   summariser, found in the same pass: `--parallel` *divides* `-c`, so the shipped
   default of 4 was truncating every conversation to a quarter of its window.
+
+## Amended by stage 4b
+
+`INFERENCE_BACKEND=llama-local` (decision 0001, stage 4b — the in-process
+llama.cpp engine, Rust track only, behind a build feature) is a deliberate
+exception to points 1 and 2. It holds exactly one model, so it chats and
+summarises off the same resident weights: `SUMMARIZER_MODEL` is ignored and the
+summary runs wherever the chat model is, GPU included.
+
+That is not a regression of this decision, it is the thing this decision was
+pricing. The CPU rule exists because a second model on an 8 GB card evicts the
+first; with one model there is nothing to evict. Everywhere else — ollama,
+llama-server — points 1 and 2 stand unchanged, and point 3 stands everywhere.
+
+Also amended by 0004: all of the above applies only when `SUMMARY_ENABLED=1`,
+which is no longer the default.
