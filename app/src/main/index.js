@@ -209,7 +209,7 @@ app.on('before-quit', (e) => {
     app.exit(0);
   };
   const req = http.request(
-    { host: '127.0.0.1', port: BACKEND_PORT, path: '/shutdown', method: 'POST', headers: { 'x-vessel-shutdown': '1' }, timeout: 3000 },
+    { host: '127.0.0.1', port: BACKEND_PORT, path: '/shutdown', method: 'POST', headers: { 'x-vessel-app': '1' }, timeout: 3000 },
     (res) => { res.resume(); res.on('end', finish); },
   );
   req.on('error', finish);

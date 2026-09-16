@@ -15,9 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{open, run, user, Collector};
+use turso::Value as TValue;
 use vessel_core::chat::{self, ChatRequest, ErrorKind};
 use vessel_core::inference::Message;
-use vessel_core::{memory, metrics};
+use vessel_core::{db, memory, metrics};
 
 // ---- Tests ----------------------------------------------------------------
 
@@ -274,4 +275,94 @@ async fn folding_runs_in_the_background_and_the_summary_lands() {
         "every archived turn needs a vector, or it can never be recalled"
     );
     assert!(conv.verbatim.len() <= 4, "the verbatim window stays bounded");
+}
+
+
+// ---- Variants on a turn that has none -------------------------------------
+
+/// Strip a turn of its variant rows, which is the state a pre-variants row --
+/// or one pulled from an older synced database -- arrives in. Migrations add
+/// columns; they never back-fill rows.
+async fn strip_variants(db: &db::Db, turn_id: i64) {
+    db.execute("DELETE FROM variants WHERE turn_id = ?", vec![TValue::Integer(turn_id)])
+        .await
+        .expect("strip variants");
+}
+
+#[tokio::test]
+async fn regenerating_a_turn_with_no_variant_rows_preserves_the_original_reply() {
+    // The back-fill has to read turns.content, not the new text it was handed.
+    // Seeded from the caller, the first re-roll on such a turn wrote the
+    // regeneration in as the "original", mirrored it over turns.content, and
+    // left two identical variants -- the reply it was meant to preserve was the
+    // one it destroyed, and the swipe led nowhere.
+    let db = open().await;
+    let id = memory::new_id();
+    memory::ensure_conversation(&db, &id, None).await.expect("conversation");
+    memory::record_turn(&db, &id, None, "the reply that predates variants", "Character")
+        .await
+        .expect("record");
+
+    let last = memory::get_last_assistant_turn(&db, &id).await.unwrap().expect("a reply");
+    strip_variants(&db, last.id).await;
+
+    memory::record_regeneration(&db, &id, "the second roll").await.expect("regenerate");
+
+    let v = memory::get_variants(&db, last.id).await.expect("variants");
+    assert_eq!(v.variants.len(), 2, "the base was back-filled, not overwritten");
+    assert_eq!(v.variants[0].content, "the reply that predates variants", "the original survived");
+    assert_eq!(v.variants[1].content, "the second roll");
+    assert_eq!(v.active_index, 1, "the newest roll is the active one");
+}
+
+#[tokio::test]
+async fn a_back_filled_original_can_still_be_swiped_back_to() {
+    // Keeping the row is only half of it: the point of a variant is that the
+    // user can return to the reply the regeneration replaced.
+    let db = open().await;
+    let id = memory::new_id();
+    memory::ensure_conversation(&db, &id, None).await.expect("conversation");
+    memory::record_turn(&db, &id, None, "the reply that predates variants", "Character")
+        .await
+        .expect("record");
+    let last = memory::get_last_assistant_turn(&db, &id).await.unwrap().expect("a reply");
+    strip_variants(&db, last.id).await;
+    memory::record_regeneration(&db, &id, "the second roll").await.expect("regenerate");
+
+    let v = memory::get_variants(&db, last.id).await.expect("variants");
+    let back = memory::set_active_variant(&db, &id, last.id, v.variants[0].id)
+        .await
+        .expect("swipe back");
+
+    assert_eq!(back.content, "the reply that predates variants");
+    let now = memory::get_last_assistant_turn(&db, &id).await.unwrap().expect("a reply");
+    assert_eq!(now.content, "the reply that predates variants", "turns.content follows the swipe");
+}
+
+#[tokio::test]
+async fn exactly_one_variant_is_active_after_any_number_of_rolls() {
+    let db = open().await;
+    let id = memory::new_id();
+    memory::ensure_conversation(&db, &id, None).await.expect("conversation");
+    memory::record_turn(&db, &id, None, "roll one", "Character").await.expect("record");
+    let last = memory::get_last_assistant_turn(&db, &id).await.unwrap().expect("a reply");
+
+    for text in ["roll two", "roll three", "roll four"] {
+        memory::record_regeneration(&db, &id, text).await.expect("regenerate");
+        let v = memory::get_variants(&db, last.id).await.expect("variants");
+        assert_eq!(
+            v.variants.iter().filter(|x| x.active).count(),
+            1,
+            "after {text}"
+        );
+        assert_eq!(v.active_index, v.variants.len() - 1, "the newest roll is active");
+    }
+
+    let v = memory::get_variants(&db, last.id).await.expect("variants");
+    let texts: Vec<&str> = v.variants.iter().map(|x| x.content.as_str()).collect();
+    assert_eq!(
+        texts,
+        ["roll one", "roll two", "roll three", "roll four"],
+        "oldest first, which is the order the swipe UI reads"
+    );
 }

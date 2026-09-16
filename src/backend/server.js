@@ -124,21 +124,51 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173')
   .split(',').map((o) => o.trim()).filter(Boolean);
 app.use(cors({
   origin(origin, cb) {
+    // No Origin at all is the packaged renderer: a file:// page in Electron
+    // sends none, verified with a hidden window against an origin-echo server.
+    // The dev renderer sends http://localhost:5173, which is the default
+    // allowlist entry.
     if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     return cb(null, false);
   },
 }));
+
+// CSRF: a state-changing request must carry a header no cross-site page can set.
+//
+// The Host guard above stops DNS rebinding, but not the simpler attack: a page
+// the user is merely visiting can fetch('http://localhost:3001/...') directly,
+// because the Host it sends IS localhost. And denying the origin in cors() does
+// not stop it -- the callback withholds the response HEADER, it does not cancel
+// the request, so a simple POST still reaches the route and still writes.
+//
+// What has actually been blocking that is an accident: express.json() parses
+// only application/json, and a cross-site form post cannot set that content type
+// without a preflight, so the body arrived undefined and the route 400'd. That
+// is one parser option away from being a live CSRF hole on every write route.
+//
+// So require it explicitly instead. A custom header is not a simple request:
+// setting one forces a preflight, and the preflight is answered by the cors()
+// origin check above, which no attacker origin passes. Safe methods are exempt
+// (a GET changes nothing, and /metrics and /health are read-only); OPTIONS has
+// to pass to reach the CORS layer at all.
+const CSRF_HEADER = 'x-vessel-app';
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+app.use((req, res, next) => {
+  if (SAFE_METHODS.has(req.method)) return next();
+  if (req.get(CSRF_HEADER) === '1') return next();
+  return res.status(403).json({ error: 'Missing app header.' });
+});
+
 app.use(express.json({ limit: '10mb' }));
 
-app.use((err, _req, res, next) => {
-  if (err) {
-    const tooBig = err.type === 'entity.too.large';
-    return res.status(tooBig ? 413 : 400).json({
-      error: tooBig ? 'Request body too large.' : 'Malformed JSON body.',
-      detail: err.message,
-    });
-  }
-  next();
+// Body-parser failures only. Express calls a 4-arity middleware when, and only
+// when, an error is in flight, so there is no non-error path through here.
+app.use((err, _req, res, _next) => {
+  const tooBig = err.type === 'entity.too.large';
+  return res.status(tooBig ? 413 : 400).json({
+    error: tooBig ? 'Request body too large.' : 'Malformed JSON body.',
+    detail: err.message,
+  });
 });
 
 // ---- Health --------------------------------------------------------------
@@ -645,12 +675,11 @@ app.put('/conversations/:id/active-variant', async (req, res) => {
 // SIGTERM flush below never runs. The shell instead POSTs here so the final
 // cloud sync happens before the process exits. Loopback-only, same local trust
 // model as the rest of the API; a no-op flush when sync is disabled.
-app.post('/shutdown', async (req, res) => {
-  // Custom header forces a CORS preflight, so a drive-by webpage's "simple"
-  // cross-site POST can't kill the backend; the Electron shell sets it freely.
-  if (req.get('x-vessel-shutdown') !== '1') {
-    return res.status(403).json({ error: 'Forbidden.' });
-  }
+// The bespoke x-vessel-shutdown header this used to demand is gone: the CSRF
+// guard now requires the same kind of header on every write route, so a
+// drive-by page cannot reach this one either, and there is one rule to know
+// instead of two.
+app.post('/shutdown', async (_req, res) => {
   try { await db.syncNow(); } catch { /* best effort */ }
   res.json({ ok: true });
   const t = setTimeout(() => process.exit(0), 100);

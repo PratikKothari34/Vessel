@@ -7,8 +7,8 @@
  * thin on purpose: the guards that matter are the ones stopping a *browser*
  * from becoming the attacker's proxy into that trusted socket. A page the user
  * opens can reach localhost, and DNS rebinding lets it do so same-origin. So
- * the Host guard, the CORS policy and the /shutdown header are not hardening
- * theatre -- they are the actual boundary.
+ * the Host guard, the CORS policy and the app header every write must carry are
+ * not hardening theatre -- they are the actual boundary.
  *
  * The rest is the usual injection surface: JSON bodies that carry __proto__,
  * ids that carry path separators, reply text that carries SSE framing, and
@@ -115,24 +115,75 @@ test('a request with no Origin (the packaged file:// renderer) is allowed', asyn
   assert.equal(res.status, 200);
 });
 
-// ---- Shutdown ------------------------------------------------------------
+// ---- CSRF ----------------------------------------------------------------
+//
+// The Host guard does not cover this: a page the user is merely visiting can
+// fetch('http://localhost:PORT/...') directly, and the Host it sends IS
+// localhost. Nor does cors() -- the origin callback withholds the response
+// header, it does not cancel the request, so a simple POST still reaches the
+// route and still writes. The app header is what actually stops it, because
+// setting a custom header is not a simple request: the browser must preflight,
+// and the preflight is answered by the origin check no attacker origin passes.
 
-test('POST /shutdown without the custom header is forbidden', async () => {
-  // The header is the point: it forces a CORS preflight, so a drive-by page
-  // cannot kill the backend with a simple cross-site POST.
-  const res = await app.post('/shutdown', {});
-  assert.equal(res.status, 403);
+test('every write route refuses a request without the app header', async () => {
+  // What a drive-by page can send: the request executes server-side, so the
+  // refusal has to come before the route body, not from the response headers.
+  const writes = [
+    ['POST', '/characters', { name: 'csrf' }],
+    ['PUT', `/characters/${hero.id}`, { name: 'renamed by a stranger' }],
+    ['DELETE', `/characters/${hero.id}`, undefined],
+    ['POST', '/chat', { characterId: hero.id, messages: [{ role: 'user', content: 'hi' }] }],
+    ['DELETE', '/metrics', undefined],
+    ['PUT', '/settings', { tursoUrl: '' }],
+    ['POST', '/shutdown', {}],
+  ];
+  for (const [method, route, body] of writes) {
+    const res = await app.req(method, route, body, { headers: { 'x-vessel-app': null } });
+    assert.equal(res.status, 403, `${method} ${route}`);
+    assert.equal(res.json.error, 'Missing app header.', `${method} ${route}`);
+  }
+  // Nothing above touched the database, and the process is still up -- which is
+  // the assertion for /shutdown specifically.
   assert.equal((await app.get('/health')).status, 200, 'still alive');
+  assert.equal((await app.get(`/characters/${hero.id}`)).json.name, hero.name, 'unrenamed');
 });
 
-test('POST /shutdown with a foreign Host is forbidden even with the header', async () => {
+test('reads are exempt, because a read changes nothing', async () => {
+  for (const route of ['/health', '/metrics', '/settings', '/characters', '/conversations']) {
+    const res = await app.get(route, { headers: { 'x-vessel-app': null } });
+    assert.equal(res.status, 200, route);
+  }
+});
+
+test('the header is checked before the body is parsed', async () => {
+  // Order matters twice over: a 10 MB body from a page that cannot pass the
+  // guard should never be buffered, and a malformed body must not turn the 403
+  // into a 400 that says the guard was never the reason.
+  const res = await app.post('/characters', '{"name": "broken', {
+    headers: { 'Content-Type': 'application/json', 'x-vessel-app': null },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(res.json.error, 'Missing app header.');
+});
+
+test('a value other than 1 does not satisfy the guard', async () => {
+  for (const value of ['0', 'true', '', 'yes', '11']) {
+    const res = await app.post('/characters', { name: 'csrf' }, { headers: { 'x-vessel-app': value } });
+    assert.equal(res.status, 403, `x-vessel-app: ${JSON.stringify(value)}`);
+  }
+});
+
+// ---- Shutdown ------------------------------------------------------------
+
+test('POST /shutdown with a foreign Host is forbidden even with the app header', async () => {
   // The Host guard has to win here, because the header alone is enough to kill
   // the process. Sent over node:http so the Host override is real -- fetch
   // drops it, and this assertion would then shut the test backend down.
   const res = await raw('POST', '/shutdown', {
-    host: 'evil.example', headers: { 'x-vessel-shutdown': '1' }, body: {},
+    host: 'evil.example', headers: { 'x-vessel-app': '1' }, body: {},
   });
   assert.equal(res.status, 403);
+  assert.equal(res.json.error, 'Forbidden host.', 'the Host guard, not the app header');
   assert.equal((await app.get('/health')).status, 200, 'still alive');
 });
 

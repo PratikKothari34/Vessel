@@ -481,14 +481,22 @@ async fn migrate_plaintext_to_encrypted(path: &Path, hexkey: &str) -> Result<()>
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS characters (
-  id         TEXT PRIMARY KEY,
-  name       TEXT NOT NULL,
-  avatar     TEXT DEFAULT '',
-  persona    TEXT DEFAULT '',
-  greeting   TEXT DEFAULT '',
-  sampling   TEXT DEFAULT '{}',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  id             TEXT PRIMARY KEY,
+  name           TEXT NOT NULL,
+  avatar         TEXT DEFAULT '',
+  persona        TEXT DEFAULT '',
+  greeting       TEXT DEFAULT '',
+  sampling       TEXT DEFAULT '{}',
+  -- Added later, and repeated in the migration list for databases that predate
+  -- them. Declaring them here as well saves a fresh install five ALTER TABLE
+  -- statements on first launch; the migration then finds them present.
+  response_style TEXT DEFAULT 'balanced',
+  tagline        TEXT DEFAULT '',
+  about          TEXT DEFAULT '',
+  chat_starters  TEXT DEFAULT '[]',
+  tags           TEXT DEFAULT '[]',
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS conversations (

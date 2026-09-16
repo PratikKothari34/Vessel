@@ -204,14 +204,23 @@ async function initSchema(db) {
 
   await db.exec(`
     CREATE TABLE IF NOT EXISTS characters (
-      id         TEXT PRIMARY KEY,
-      name       TEXT NOT NULL,
-      avatar     TEXT DEFAULT '',
-      persona    TEXT DEFAULT '',
-      greeting   TEXT DEFAULT '',
-      sampling   TEXT DEFAULT '{}',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      id             TEXT PRIMARY KEY,
+      name           TEXT NOT NULL,
+      avatar         TEXT DEFAULT '',
+      persona        TEXT DEFAULT '',
+      greeting       TEXT DEFAULT '',
+      sampling       TEXT DEFAULT '{}',
+      -- Added later, and repeated in runMigrations for databases that predate
+      -- them. Declaring them here as well costs nothing and saves a fresh
+      -- install five ALTER TABLE round trips it would otherwise pay on first
+      -- launch; the migration then finds them present and does nothing.
+      response_style TEXT DEFAULT 'balanced',
+      tagline        TEXT DEFAULT '',
+      about          TEXT DEFAULT '',
+      chat_starters  TEXT DEFAULT '[]',
+      tags           TEXT DEFAULT '[]',
+      created_at     TEXT NOT NULL,
+      updated_at     TEXT NOT NULL
     );
   `);
 
@@ -274,6 +283,10 @@ async function initSchema(db) {
 }
 
 // Additive migrations for existing DBs. Each guarded so re-running is safe.
+//
+// A fresh database already has all of these from initSchema, so the PRAGMA is
+// the only statement that runs. They stay here because a database created by an
+// older build does not.
 async function runMigrations(db) {
   const cols = await db.raw.all(`PRAGMA table_info(characters);`);
   const has = (name) => cols.some((r) => r.name === name);

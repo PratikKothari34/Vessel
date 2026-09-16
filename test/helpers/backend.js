@@ -43,6 +43,14 @@ const SERVER_JS = path.join(PROJECT_ROOT, 'src', 'backend', 'server.js');
 
 const BOOT_TIMEOUT_MS = 30000;
 
+// fetch() rejects a null header value rather than skipping it, so a test that
+// asks for a header to be absent has to have it removed here.
+function dropNulls(headers) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) if (v !== null) out[k] = v;
+  return out;
+}
+
 function freePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -167,12 +175,22 @@ async function start(opts = {}) {
     throw new Error(`test backend did not report local-only sync -- refusing to continue:\n${out}`);
   }
 
+  // The renderer sends this on every request and the backend requires it on
+  // every write, so the default here is what the app actually does. A test that
+  // wants the request WITHOUT it passes `{ headers: { 'x-vessel-app': null } }`.
   async function req(method, route, body, init = {}) {
+    // headers is pulled out of init: spreading init whole would put the caller's
+    // raw headers object back over the merged one below, dropping the defaults.
+    const { headers: extra, ...rest } = init;
     const res = await fetch(url + route, {
       method,
-      headers: { ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(init.headers || {}) },
+      headers: dropNulls({
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        'x-vessel-app': '1',
+        ...(extra || {}),
+      }),
       body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)),
-      ...init,
+      ...rest,
     });
     const text = await res.text();
     let json = null;
@@ -208,7 +226,11 @@ async function start(opts = {}) {
 async function collectSse(endpoint, body, init = {}) {
   const res = await fetch(endpoint, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
+    headers: dropNulls({
+      'Content-Type': 'application/json',
+      'x-vessel-app': '1',
+      ...(init.headers || {}),
+    }),
     body: JSON.stringify(body),
     signal: init.signal,
   });

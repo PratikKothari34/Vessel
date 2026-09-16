@@ -29,10 +29,16 @@ function invoke(cmd, args) {
   });
 }
 
+// Proof to the backend that this request came from the app and not from a page
+// the user happens to have open. A cross-site fetch cannot set a custom header
+// without a preflight, and the preflight is refused for any origin but ours.
+// Sent on every request; the backend only insists on it for the ones that write.
+const APP_HEADER = { 'X-Vessel-App': '1' };
+
 async function json(method, path, body) {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    headers: body ? { 'Content-Type': 'application/json', ...APP_HEADER } : APP_HEADER,
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
@@ -165,7 +171,7 @@ function streamViaSse(payload, { onMeta, onToken, onDone, onError } = {}) {
     try {
       res = await fetch(`${BASE}/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...APP_HEADER },
         body: JSON.stringify(payload),
         signal: controller.signal,
       });

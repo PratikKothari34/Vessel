@@ -963,9 +963,18 @@ pub async fn get_last_assistant_turn(db: &Db, conversation_id: &str) -> Result<O
     }))
 }
 
-/// Ensure a turn has at least its current content registered as a variant.
-/// Turns created before variants existed get back-filled lazily.
-async fn ensure_base_variant(db: &Db, turn_id: i64, content: &str) -> Result<()> {
+/// Back-fill the variant a turn should already have, seeded from its OWN text.
+///
+/// `record_turn` writes a base variant with every assistant reply, so the normal
+/// path never needs this. Two kinds of row do: turns written before the variants
+/// table existed, and turns pulled from an older synced database -- migrations
+/// add columns, they never back-fill rows.
+///
+/// The seed has to come from `turns.content`, not from the caller. Seeding it
+/// with the caller's NEW text made the first regenerate on such a turn overwrite
+/// the original reply with the regeneration and leave two identical variants, so
+/// the swipe the feature exists for had nothing to swipe back to.
+async fn ensure_base_variant(db: &Db, turn_id: i64) -> Result<()> {
     let have = db
         .query_one(
             "SELECT COUNT(*) AS n FROM variants WHERE turn_id = ?",
@@ -973,40 +982,47 @@ async fn ensure_base_variant(db: &Db, turn_id: i64, content: &str) -> Result<()>
         )
         .await?
         .unwrap_or_default();
-    if int(&have, "n") == 0 {
-        db.execute(
-            "INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 1, ?)",
-            vec![
-                TValue::Integer(turn_id),
-                TValue::Text(content.into()),
-                TValue::Text(now_iso()),
-            ],
-        )
-        .await?;
+    if int(&have, "n") > 0 {
+        return Ok(());
     }
+    let Some(turn) = db
+        .query_one(
+            "SELECT content FROM turns WHERE id = ?",
+            vec![TValue::Integer(turn_id)],
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    db.execute(
+        "INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 1, ?)",
+        vec![
+            TValue::Integer(turn_id),
+            TValue::Text(text(&turn, "content")),
+            TValue::Text(now_iso()),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
 /// Append a variant to an assistant turn, make it active, and mirror it into
 /// `turns.content` so the summary and the archive read the chosen text.
 pub async fn append_variant(db: &Db, turn_id: i64, content: &str) -> Result<i64> {
-    ensure_base_variant(db, turn_id, content).await?;
-    let variant_id = db
-        .insert(
-            "INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 0, ?)",
-            vec![TValue::Integer(turn_id), TValue::Text(content.into()), TValue::Text(now_iso())],
-        )
-        .await?;
+    ensure_base_variant(db, turn_id).await?;
+    // Clear the siblings BEFORE inserting, so the new row lands active and the
+    // three writes this took are two.
     db.execute(
         "UPDATE variants SET is_active = 0 WHERE turn_id = ?",
         vec![TValue::Integer(turn_id)],
     )
     .await?;
-    db.execute(
-        "UPDATE variants SET is_active = 1 WHERE id = ?",
-        vec![TValue::Integer(variant_id)],
-    )
-    .await?;
+    let variant_id = db
+        .insert(
+            "INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 1, ?)",
+            vec![TValue::Integer(turn_id), TValue::Text(content.into()), TValue::Text(now_iso())],
+        )
+        .await?;
     db.execute(
         "UPDATE turns SET content = ? WHERE id = ?",
         vec![TValue::Text(content.into()), TValue::Integer(turn_id)],

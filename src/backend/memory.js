@@ -783,35 +783,53 @@ async function getLastAssistantTurn(conversationId) {
   return row && row.role === 'assistant' ? { id: Number(row.id), content: row.content } : null;
 }
 
-// Ensure a turn has at least its current content registered as a variant.
-// (Older turns created before variants existed get back-filled lazily.)
-async function ensureBaseVariant(turnId, content) {
+// Back-fill the variant a turn should already have, seeded from its OWN text.
+//
+// recordTurn writes a base variant with every assistant reply, so the normal
+// path never needs this. Two kinds of row do: turns written before the variants
+// table existed, and turns pulled from an older synced database -- runMigrations
+// adds columns, it never back-fills rows.
+//
+// The seed has to come from turns.content, not from the caller. Seeding it with
+// the caller's NEW text made the first regenerate on such a turn overwrite the
+// original reply with the regeneration and leave two identical variants, so the
+// swipe the feature exists for had nothing to swipe back to. Silent, and
+// unrecoverable once turns.content was mirrored over too.
+async function ensureBaseVariant(turnId) {
   const db = await getDb();
   const have = await db.execute({ sql: 'SELECT COUNT(*) AS n FROM variants WHERE turn_id = ?', args: [turnId] });
-  if (Number(have.rows[0].n) === 0) {
-    await db.execute({
-      sql: 'INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 1, ?)',
-      args: [turnId, content, nowIso()],
-    });
-  }
+  if (Number(have.rows[0].n) > 0) return;
+  const turn = await db.execute({ sql: 'SELECT content FROM turns WHERE id = ?', args: [turnId] });
+  if (!turn.rows.length) return;
+  await db.execute({
+    sql: 'INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 1, ?)',
+    args: [turnId, turn.rows[0].content, nowIso()],
+  });
 }
 
 // Append a new variant to an assistant turn, make it active, and mirror it into
 // turns.content (so memory/summary read the chosen text). Returns variant info.
 async function appendVariant(turnId, content) {
   const db = await getDb();
-  await ensureBaseVariant(turnId, content); // no-op if base already exists
-  await db.execute({
-    sql: 'INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 0, ?)',
+  await ensureBaseVariant(turnId); // no-op if the base already exists
+  // Clear the siblings BEFORE inserting, so the new row can land active and the
+  // three writes this took are two. The driver reports the inserted rowid, so
+  // the id is the row we just wrote rather than whatever a follow-up
+  // ORDER BY id DESC found -- same reasoning as recordTurn.
+  await db.execute({ sql: 'UPDATE variants SET is_active = 0 WHERE turn_id = ?', args: [turnId] });
+  const inserted = await db.execute({
+    sql: 'INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 1, ?)',
     args: [turnId, content, nowIso()],
   });
-  // Activate the just-inserted variant (highest id for this turn).
-  const last = await db.execute({
-    sql: 'SELECT id FROM variants WHERE turn_id = ? ORDER BY id DESC LIMIT 1', args: [turnId],
-  });
-  const variantId = Number(last.rows[0].id);
-  await db.execute({ sql: 'UPDATE variants SET is_active = 0 WHERE turn_id = ?', args: [turnId] });
-  await db.execute({ sql: 'UPDATE variants SET is_active = 1 WHERE id = ?', args: [variantId] });
+  let variantId = Number(inserted.lastInsertRowid);
+  if (!Number.isInteger(variantId) || variantId <= 0) {
+    // Defensive: a driver that does not report lastInsertRowid falls back to the
+    // old lookup rather than returning an id the UI cannot address.
+    const last = await db.execute({
+      sql: 'SELECT id FROM variants WHERE turn_id = ? ORDER BY id DESC LIMIT 1', args: [turnId],
+    });
+    variantId = Number(last.rows[0].id);
+  }
   await db.execute({ sql: 'UPDATE turns SET content = ? WHERE id = ?', args: [content, turnId] });
   return variantId;
 }
