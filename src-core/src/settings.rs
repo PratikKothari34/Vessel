@@ -27,9 +27,12 @@ fn cache() -> &'static Mutex<Option<Settings>> {
 /// `settings.json` sits beside the database file, so a relocated DB takes its
 /// settings with it.
 pub fn file_path() -> PathBuf {
-    let abs = std::path::absolute(config::local_db_path())
-        .unwrap_or_else(|_| config::local_db_path());
-    let dir = abs.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let abs =
+        std::path::absolute(config::local_db_path()).unwrap_or_else(|_| config::local_db_path());
+    let dir = abs
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     dir.join("settings.json")
 }
 

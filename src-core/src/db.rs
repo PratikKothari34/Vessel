@@ -89,7 +89,9 @@ struct Lease<'a> {
 impl std::ops::Deref for Lease<'_> {
     type Target = turso::Connection;
     fn deref(&self) -> &turso::Connection {
-        self.conn.as_ref().expect("a lease holds its connection until it is dropped")
+        self.conn
+            .as_ref()
+            .expect("a lease holds its connection until it is dropped")
     }
 }
 
@@ -136,15 +138,29 @@ impl Db {
             .acquire()
             .await
             .map_err(|_| anyhow!("the database connection pool was closed"))?;
-        if let Some(conn) = self.readers.idle.lock().unwrap_or_else(|p| p.into_inner()).pop() {
-            return Ok(Lease { pool: &self.readers, conn: Some(conn), _slot: slot });
+        if let Some(conn) = self
+            .readers
+            .idle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pop()
+        {
+            return Ok(Lease {
+                pool: &self.readers,
+                conn: Some(conn),
+                _slot: slot,
+            });
         }
         let conn = match &self.handle {
             Handle::Local(db) => db.connect()?,
             Handle::Sync(s) => s.connect().await?,
         };
         prepare_connection(&conn).await?;
-        Ok(Lease { pool: &self.readers, conn: Some(conn), _slot: slot })
+        Ok(Lease {
+            pool: &self.readers,
+            conn: Some(conn),
+            _slot: slot,
+        })
     }
 
     pub fn is_sync_enabled(&self) -> bool {
@@ -201,7 +217,11 @@ impl Db {
     }
 
     /// First row only, or `None`.
-    pub async fn query_one(&self, sql: &str, params: Vec<TValue>) -> Result<Option<Map<String, Json>>> {
+    pub async fn query_one(
+        &self,
+        sql: &str,
+        params: Vec<TValue>,
+    ) -> Result<Option<Map<String, Json>>> {
         Ok(self.query(sql, params).await?.into_iter().next())
     }
 
@@ -255,7 +275,9 @@ pub fn value_to_json(v: TValue) -> Json {
     match v {
         TValue::Null => Json::Null,
         TValue::Integer(i) => Json::from(i),
-        TValue::Real(f) => serde_json::Number::from_f64(f).map(Json::Number).unwrap_or(Json::Null),
+        TValue::Real(f) => serde_json::Number::from_f64(f)
+            .map(Json::Number)
+            .unwrap_or(Json::Null),
         TValue::Text(s) => Json::String(s),
         // Blobs are embeddings. No caller sends one to the renderer; surfacing
         // the length keeps a debug dump readable without shipping 774 bytes.
@@ -292,7 +314,9 @@ fn clear_orphaned_sync_metadata(abs: &Path) {
         }
     }
     if cleared > 0 {
-        tracing::warn!("[db] cleared {cleared} orphaned sync metadata file(s) (main DB was missing).");
+        tracing::warn!(
+            "[db] cleared {cleared} orphaned sync metadata file(s) (main DB was missing)."
+        );
     }
 }
 
@@ -330,7 +354,9 @@ fn encryption_opts(hexkey: &str) -> turso::EncryptionOpts {
 }
 
 async fn open_local_plain(path: &Path) -> Result<turso::Database> {
-    Ok(turso::Builder::new_local(&path.to_string_lossy()).build().await?)
+    Ok(turso::Builder::new_local(&path.to_string_lossy())
+        .build()
+        .await?)
 }
 
 async fn open_local_encrypted(path: &Path, hexkey: &str) -> Result<turso::Database> {
@@ -359,9 +385,12 @@ async fn is_plaintext_db(path: &Path) -> bool {
         return false;
     };
     let Ok(conn) = db.connect() else { return false };
-    conn.query("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1", ())
-        .await
-        .is_ok()
+    conn.query(
+        "SELECT name FROM sqlite_master WHERE type='table' LIMIT 1",
+        (),
+    )
+    .await
+    .is_ok()
 }
 
 /// One-time migration: copy an existing PLAINTEXT database into a new encrypted
@@ -426,7 +455,10 @@ async fn migrate_plaintext_to_encrypted(path: &Path, hexkey: &str) -> Result<()>
             let mut rows = src.query(&format!("SELECT * FROM {name}"), ()).await?;
             let cols = rows.column_names();
             let placeholders = vec!["?"; cols.len()].join(",");
-            let insert = format!("INSERT INTO {name} ({}) VALUES ({placeholders})", cols.join(","));
+            let insert = format!(
+                "INSERT INTO {name} ({}) VALUES ({placeholders})",
+                cols.join(",")
+            );
             while let Some(r) = rows.next().await? {
                 let mut vals = Vec::with_capacity(cols.len());
                 for i in 0..cols.len() {
@@ -740,14 +772,24 @@ async fn open_local(
         tracing::warn!(
             "[db] local database is NOT encrypted at rest (no keychain key and no DB_ENCRYPTION_KEY)."
         );
-        return Ok((open_local_plain(path).await?, false, Some(UnencryptedReason::NoKey)));
+        return Ok((
+            open_local_plain(path).await?,
+            false,
+            Some(UnencryptedReason::NoKey),
+        ));
     };
 
     if is_plaintext_db(path).await {
         if let Err(e) = migrate_plaintext_to_encrypted(path, key).await {
             // Keep the user's data reachable.
-            tracing::error!("[db] encryption migration FAILED - keeping the existing database as-is: {e}");
-            return Ok((open_local_plain(path).await?, false, Some(UnencryptedReason::Migration)));
+            tracing::error!(
+                "[db] encryption migration FAILED - keeping the existing database as-is: {e}"
+            );
+            return Ok((
+                open_local_plain(path).await?,
+                false,
+                Some(UnencryptedReason::Migration),
+            ));
         }
     }
 
@@ -838,7 +880,9 @@ mod tests {
             .await
             .unwrap();
         }
-        conn.execute("PRAGMA wal_checkpoint(truncate)", ()).await.ok();
+        conn.execute("PRAGMA wal_checkpoint(truncate)", ())
+            .await
+            .ok();
     }
 
     async fn names(conn: &turso::Connection) -> Vec<String> {
@@ -894,7 +938,10 @@ mod tests {
         for t in tasks {
             t.await.unwrap().expect("a concurrent write must not fail");
         }
-        let rows = db.query("SELECT COUNT(*) AS n FROM conversations", vec![]).await.unwrap();
+        let rows = db
+            .query("SELECT COUNT(*) AS n FROM conversations", vec![])
+            .await
+            .unwrap();
         assert_eq!(rows[0]["n"], 16);
     }
 
@@ -907,20 +954,25 @@ mod tests {
         for i in 0..8 {
             let db = db.clone();
             tasks.push(tokio::spawn(async move {
-                db.execute(INSERT_CONV, conv_row(&format!("w-{i}"))).await.map(|_| ())
+                db.execute(INSERT_CONV, conv_row(&format!("w-{i}")))
+                    .await
+                    .map(|_| ())
             }));
         }
         for _ in 0..8 {
             let db = db.clone();
             tasks.push(tokio::spawn(async move {
                 for _ in 0..10 {
-                    db.query("SELECT COUNT(*) AS n FROM conversations", vec![]).await?;
+                    db.query("SELECT COUNT(*) AS n FROM conversations", vec![])
+                        .await?;
                 }
                 Ok(())
             }));
         }
         for t in tasks {
-            t.await.unwrap().expect("a read must not fail because a write is running");
+            t.await
+                .unwrap()
+                .expect("a read must not fail because a write is running");
         }
     }
 
@@ -959,11 +1011,18 @@ mod tests {
             let (id, content) = t.await.unwrap();
             assert!(seen.insert(id), "two inserts reported the same rowid: {id}");
             let row = db
-                .query_one("SELECT content FROM turns WHERE id = ?", vec![TValue::Integer(id)])
+                .query_one(
+                    "SELECT content FROM turns WHERE id = ?",
+                    vec![TValue::Integer(id)],
+                )
                 .await
                 .unwrap()
                 .expect("the reported rowid must exist");
-            assert_eq!(row["content"], serde_json::json!(content), "rowid {id} names another row");
+            assert_eq!(
+                row["content"],
+                serde_json::json!(content),
+                "rowid {id} names another row"
+            );
         }
     }
 
@@ -998,12 +1057,21 @@ mod tests {
         .await
         .unwrap();
 
-        db.execute("DELETE FROM characters WHERE id = ?", vec![TValue::Text("ch1".into())])
+        db.execute(
+            "DELETE FROM characters WHERE id = ?",
+            vec![TValue::Text("ch1".into())],
+        )
+        .await
+        .unwrap();
+
+        let rows = db
+            .query("SELECT COUNT(*) AS n FROM conversations", vec![])
             .await
             .unwrap();
-
-        let rows = db.query("SELECT COUNT(*) AS n FROM conversations", vec![]).await.unwrap();
-        assert_eq!(rows[0]["n"], 0, "the character went but its conversation stayed");
+        assert_eq!(
+            rows[0]["n"], 0,
+            "the character went but its conversation stayed"
+        );
     }
 
     #[tokio::test]
@@ -1022,7 +1090,10 @@ mod tests {
             Ok(conn) => conn.query("SELECT name FROM characters", ()).await.is_ok(),
             Err(_) => false,
         };
-        assert!(!readable, "an encrypted file must not be readable without the key");
+        assert!(
+            !readable,
+            "an encrypted file must not be readable without the key"
+        );
     }
 
     #[tokio::test]
@@ -1032,7 +1103,10 @@ mod tests {
         init_schema(&db.connect().unwrap()).await.unwrap();
         drop(db);
 
-        let err = open_local(&path, Some(KEY_B)).await.unwrap_err().to_string();
+        let err = open_local(&path, Some(KEY_B))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("Refusing to fall back to an unencrypted database"),
             "unexpected error: {err}"
@@ -1057,7 +1131,10 @@ mod tests {
 
         let backup = PathBuf::from(format!("{}.plaintext-backup", path.display()));
         assert!(backup.exists(), "the pre-migration file must be kept");
-        assert!(!is_plaintext_db(&path).await, "the live file is encrypted now");
+        assert!(
+            !is_plaintext_db(&path).await,
+            "the live file is encrypted now"
+        );
     }
 
     #[tokio::test]
@@ -1101,7 +1178,10 @@ mod tests {
         assert!(encrypted);
         drop(db);
         let backup = PathBuf::from(format!("{}.plaintext-backup", path.display()));
-        assert!(!backup.exists(), "nothing was migrated, so nothing to back up");
+        assert!(
+            !backup.exists(),
+            "nothing was migrated, so nothing to back up"
+        );
     }
 
     #[test]
@@ -1134,14 +1214,26 @@ mod tests {
         run_migrations(&conn).await.unwrap();
 
         let mut cols = Vec::new();
-        let mut rows = conn.query("PRAGMA table_info(characters)", ()).await.unwrap();
+        let mut rows = conn
+            .query("PRAGMA table_info(characters)", ())
+            .await
+            .unwrap();
         while let Some(r) = rows.next().await.unwrap() {
             if let TValue::Text(n) = r.get_value(1).unwrap() {
                 cols.push(n);
             }
         }
-        for expected in ["response_style", "tagline", "about", "chat_starters", "tags"] {
-            assert!(cols.contains(&expected.to_string()), "missing column {expected}");
+        for expected in [
+            "response_style",
+            "tagline",
+            "about",
+            "chat_starters",
+            "tags",
+        ] {
+            assert!(
+                cols.contains(&expected.to_string()),
+                "missing column {expected}"
+            );
         }
     }
 }

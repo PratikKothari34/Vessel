@@ -121,7 +121,10 @@ fn lock_live() -> std::sync::MutexGuard<'static, HashMap<String, Vec<Cancel>>> {
 }
 
 fn register(conversation_id: &str, c: &Cancel) {
-    lock_live().entry(conversation_id.to_string()).or_default().push(c.clone());
+    lock_live()
+        .entry(conversation_id.to_string())
+        .or_default()
+        .push(c.clone());
 }
 
 fn unregister(conversation_id: &str, c: &Cancel) {
@@ -184,9 +187,13 @@ pub enum ChatEvent {
     },
     /// One token's worth of text. Already extracted from the engine's wire
     /// format, so the renderer only appends.
-    Chunk { delta: String },
+    Chunk {
+        delta: String,
+    },
     /// The generation failed partway. The stream ends after this.
-    Error { error: String },
+    Error {
+        error: String,
+    },
     Done,
 }
 
@@ -237,7 +244,12 @@ pub enum ErrorKind {
 
 impl ChatError {
     fn new(kind: ErrorKind, error: impl Into<String>) -> Self {
-        Self { kind, error: error.into(), detail: None, character_id: None }
+        Self {
+            kind,
+            error: error.into(),
+            detail: None,
+            character_id: None,
+        }
     }
     fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
@@ -265,7 +277,9 @@ fn has_usable_message(messages: &[Message]) -> bool {
 }
 
 fn has_user_message(messages: &[Message]) -> bool {
-    messages.iter().any(|m| m.role == "user" && !m.content.trim().is_empty())
+    messages
+        .iter()
+        .any(|m| m.role == "user" && !m.content.trim().is_empty())
 }
 
 /// What kind of turn this is. Resolving it once, up front, removes the three
@@ -291,12 +305,18 @@ enum Shape {
 const MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
 
 fn request_bytes(req: &ChatRequest) -> usize {
-    req.messages.iter().map(|m| m.content.len() + m.role.len()).sum::<usize>()
+    req.messages
+        .iter()
+        .map(|m| m.content.len() + m.role.len())
+        .sum::<usize>()
         + req.director.as_deref().map_or(0, str::len)
 }
 
 fn classify(req: &ChatRequest) -> Result<Shape, ChatError> {
-    let has_director = req.director.as_deref().is_some_and(|d| !d.trim().is_empty());
+    let has_director = req
+        .director
+        .as_deref()
+        .is_some_and(|d| !d.trim().is_empty());
 
     if request_bytes(req) > MAX_REQUEST_BYTES {
         return Err(ChatError::new(
@@ -361,8 +381,11 @@ async fn prepare(
     conversation_id: &str,
 ) -> Result<Prepared, ChatError> {
     let internal = |e: anyhow::Error| {
-        ChatError::new(ErrorKind::Internal, "Memory subsystem failed to assemble context.")
-            .with_detail(e.to_string())
+        ChatError::new(
+            ErrorKind::Internal,
+            "Memory subsystem failed to assemble context.",
+        )
+        .with_detail(e.to_string())
     };
 
     // Resolve the character: the explicit id, else the conversation's bound one.
@@ -374,7 +397,10 @@ async fn prepare(
     // deleted on another synced device, or in a second window, while this chat
     // was open - so report it as the not-found it is, and let the UI send the
     // user back to the gallery instead of retrying something that can never work.
-    let mut char_id = req.character_id.clone().filter(|c| characters::is_valid_id(c));
+    let mut char_id = req
+        .character_id
+        .clone()
+        .filter(|c| characters::is_valid_id(c));
     if let Some(id) = char_id.clone() {
         let exists = characters::get(&id).await.map_err(internal)?;
         if exists.is_none() {
@@ -398,9 +424,12 @@ async fn prepare(
     // Persona is stable for the whole conversation and belongs in the cacheable
     // prefix. The director note changes per request, so it joins recall in the
     // volatile tail - see the ordering note on `memory::build_context`.
-    let leading: Vec<Message> = prompt::persona_message(character.as_ref()).into_iter().collect();
-    let trailing: Vec<Message> =
-        prompt::director_message(req.director.as_deref()).into_iter().collect();
+    let leading: Vec<Message> = prompt::persona_message(character.as_ref())
+        .into_iter()
+        .collect();
+    let trailing: Vec<Message> = prompt::director_message(req.director.as_deref())
+        .into_iter()
+        .collect();
 
     // A regenerate builds from the PERSISTED verbatim window: the user message
     // is already there, and passing it again would duplicate it. Director-only
@@ -451,7 +480,11 @@ async fn prepare(
         character,
         outbound: built.messages,
         // A director-only request has no story user turn to record afterwards.
-        latest_user: if shape == Shape::DirectorOnly { None } else { built.latest_user },
+        latest_user: if shape == Shape::DirectorOnly {
+            None
+        } else {
+            built.latest_user
+        },
         retrieved: built.retrieved,
         stats: Some(built.stats),
     })
@@ -485,9 +518,9 @@ fn build_options(character: Option<&Character>) -> Map<String, Json> {
 pub async fn run(req: ChatRequest, sink: Arc<dyn Sink>) -> Result<String, ChatError> {
     let shape = classify(&req)?;
 
-    let db = db::get()
-        .await
-        .map_err(|e| ChatError::new(ErrorKind::Internal, "Database unavailable.").with_detail(e.to_string()))?;
+    let db = db::get().await.map_err(|e| {
+        ChatError::new(ErrorKind::Internal, "Database unavailable.").with_detail(e.to_string())
+    })?;
 
     let conv_id = req
         .conversation_id
@@ -527,8 +560,11 @@ async fn stream_and_record(
 ) -> Result<String, ChatError> {
     let conv_id = prep.conversation_id.clone();
     let engine = inference::chat().map_err(|e| {
-        ChatError::new(ErrorKind::Unavailable, "No inference backend is configured.")
-            .with_detail(e.to_string())
+        ChatError::new(
+            ErrorKind::Unavailable,
+            "No inference backend is configured.",
+        )
+        .with_detail(e.to_string())
     })?;
     let options = build_options(prep.character.as_ref());
 
@@ -548,7 +584,11 @@ async fn stream_and_record(
         Ok(ChatStart::Refused { status, detail }) => {
             let _ = memory::delete_conversation_if_empty(db, &conv_id).await;
             return Err(ChatError::new(
-                if status == 404 { ErrorKind::NotFound } else { ErrorKind::Refused },
+                if status == 404 {
+                    ErrorKind::NotFound
+                } else {
+                    ErrorKind::Refused
+                },
                 format!("{} returned {status}.", engine.name()),
             )
             .with_detail(detail.to_string()));
@@ -571,7 +611,11 @@ async fn stream_and_record(
         recalled: prep
             .retrieved
             .iter()
-            .map(|r| Recalled { role: r.role.clone(), content: r.content.clone(), score: r.score })
+            .map(|r| Recalled {
+                role: r.role.clone(),
+                content: r.content.clone(),
+                score: r.score,
+            })
             .collect(),
     });
 
@@ -631,20 +675,30 @@ async fn stream_and_record(
     // reload. Only an engine error skips recording.
     let partial = reply.trim();
     let outcome = if engine_error.is_none() && !partial.is_empty() {
-        let name = prep.character.as_ref().map(|c| c.name.as_str()).unwrap_or("Character");
+        let name = prep
+            .character
+            .as_ref()
+            .map(|c| c.name.as_str())
+            .unwrap_or("Character");
         if shape == Shape::Regenerate {
-            memory::record_regeneration(db, &conv_id, partial).await.map(|_| ())
+            memory::record_regeneration(db, &conv_id, partial)
+                .await
+                .map(|_| ())
         } else {
             memory::record_turn(db, &conv_id, prep.latest_user.as_ref(), partial, name)
                 .await
                 .map(|_| ())
         }
     } else if let (None, Some(user)) = (engine_error.as_ref(), prep.latest_user.as_ref()) {
-        memory::record_user_turn(db, &conv_id, user).await.map(|_| ())
+        memory::record_user_turn(db, &conv_id, user)
+            .await
+            .map(|_| ())
     } else {
         // Nothing recorded (an engine error, or an aborted director/regenerate
         // with no text) - drop the conversation row if this request created it.
-        memory::delete_conversation_if_empty(db, &conv_id).await.map(|_| ())
+        memory::delete_conversation_if_empty(db, &conv_id)
+            .await
+            .map(|_| ())
     };
     if let Err(e) = outcome {
         tracing::error!("[memory] record failed for {conv_id}: {e}");
@@ -657,11 +711,18 @@ async fn stream_and_record(
 /// usually. Keep their message so it survives a reload.
 async fn finish_aborted_before_start(db: &db::Db, prep: &Prepared) {
     let outcome = match prep.latest_user.as_ref() {
-        Some(u) => memory::record_user_turn(db, &prep.conversation_id, u).await.map(|_| ()),
-        None => memory::delete_conversation_if_empty(db, &prep.conversation_id).await.map(|_| ()),
+        Some(u) => memory::record_user_turn(db, &prep.conversation_id, u)
+            .await
+            .map(|_| ()),
+        None => memory::delete_conversation_if_empty(db, &prep.conversation_id)
+            .await
+            .map(|_| ()),
     };
     if let Err(e) = outcome {
-        tracing::error!("[memory] abort cleanup failed for {}: {e}", prep.conversation_id);
+        tracing::error!(
+            "[memory] abort cleanup failed for {}: {e}",
+            prep.conversation_id
+        );
     }
 }
 
@@ -670,12 +731,18 @@ mod tests {
     use super::*;
 
     fn req(messages: Vec<Message>) -> ChatRequest {
-        ChatRequest { messages, ..Default::default() }
+        ChatRequest {
+            messages,
+            ..Default::default()
+        }
     }
 
     #[test]
     fn a_plain_message_is_a_normal_turn() {
-        assert_eq!(classify(&req(vec![Message::new("user", "hi")])).unwrap(), Shape::Normal);
+        assert_eq!(
+            classify(&req(vec![Message::new("user", "hi")])).unwrap(),
+            Shape::Normal
+        );
     }
 
     #[test]
@@ -684,12 +751,19 @@ mod tests {
         assert_eq!(e.kind, ErrorKind::BadRequest);
         // A regenerate and a director note both legitimately carry no messages.
         assert_eq!(
-            classify(&ChatRequest { regenerate: true, ..Default::default() }).unwrap(),
+            classify(&ChatRequest {
+                regenerate: true,
+                ..Default::default()
+            })
+            .unwrap(),
             Shape::Regenerate
         );
         assert_eq!(
-            classify(&ChatRequest { director: Some("be colder".into()), ..Default::default() })
-                .unwrap(),
+            classify(&ChatRequest {
+                director: Some("be colder".into()),
+                ..Default::default()
+            })
+            .unwrap(),
             Shape::DirectorOnly
         );
     }
@@ -698,8 +772,11 @@ mod tests {
     fn messages_that_carry_no_content_are_refused_not_silently_dropped() {
         // Dropping them used to append a second assistant turn with no user turn
         // between, which breaks the alternation the summarizer depends on.
-        let e = classify(&req(vec![Message::new("user", "   "), Message::new("tool", "x")]))
-            .unwrap_err();
+        let e = classify(&req(vec![
+            Message::new("user", "   "),
+            Message::new("tool", "x"),
+        ]))
+        .unwrap_err();
         assert_eq!(e.kind, ErrorKind::BadRequest);
         assert!(e.error.contains("No valid messages"));
     }
@@ -716,14 +793,20 @@ mod tests {
 
     #[test]
     fn a_blank_director_note_does_not_count_as_one() {
-        let r = ChatRequest { director: Some("   ".into()), ..Default::default() };
+        let r = ChatRequest {
+            director: Some("   ".into()),
+            ..Default::default()
+        };
         assert_eq!(classify(&r).unwrap_err().kind, ErrorKind::BadRequest);
     }
 
     #[test]
     fn a_request_larger_than_the_ceiling_is_refused_before_anything_opens() {
         // The Express body limit is gone with the HTTP; this is what replaces it.
-        let r = req(vec![Message::new("user", "x".repeat(MAX_REQUEST_BYTES + 1))]);
+        let r = req(vec![Message::new(
+            "user",
+            "x".repeat(MAX_REQUEST_BYTES + 1),
+        )]);
         assert_eq!(classify(&r).unwrap_err().kind, ErrorKind::BadRequest);
     }
 
@@ -731,13 +814,19 @@ mod tests {
     fn the_ceiling_counts_the_whole_request_not_one_message() {
         // Many merely-large messages add up to the same problem as one huge one.
         let half = "x".repeat(MAX_REQUEST_BYTES / 2 + 1);
-        let r = req(vec![Message::new("user", half.clone()), Message::new("user", half)]);
+        let r = req(vec![
+            Message::new("user", half.clone()),
+            Message::new("user", half),
+        ]);
         assert_eq!(classify(&r).unwrap_err().kind, ErrorKind::BadRequest);
     }
 
     #[test]
     fn a_request_at_the_ceiling_still_goes_through() {
-        let mut r = req(vec![Message::new("user", "x".repeat(MAX_REQUEST_BYTES - 4))]);
+        let mut r = req(vec![Message::new(
+            "user",
+            "x".repeat(MAX_REQUEST_BYTES - 4),
+        )]);
         r.messages[0].role = "user".into();
         assert_eq!(classify(&r).unwrap(), Shape::Normal);
     }
@@ -818,14 +907,18 @@ mod tests {
         register("conv-b", &theirs);
         cancel("conv-a");
         assert!(mine.is_cancelled());
-        assert!(!theirs.is_cancelled(), "a delete must not stop an unrelated chat");
+        assert!(
+            !theirs.is_cancelled(),
+            "a delete must not stop an unrelated chat"
+        );
         unregister("conv-a", &mine);
         unregister("conv-b", &theirs);
     }
 
     #[test]
     fn an_error_reads_as_one_line_with_its_detail() {
-        let e = ChatError::new(ErrorKind::Unavailable, "Cannot reach ollama.").with_detail("timed out");
+        let e =
+            ChatError::new(ErrorKind::Unavailable, "Cannot reach ollama.").with_detail("timed out");
         assert_eq!(e.to_string(), "Cannot reach ollama.: timed out");
         let bare = ChatError::new(ErrorKind::BadRequest, "Nope.");
         assert_eq!(bare.to_string(), "Nope.");

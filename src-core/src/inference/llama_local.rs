@@ -60,7 +60,9 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
 use super::util::{ollama_chunk, ollama_done, warn_once};
-use super::{gguf, modelfile, ChatStart, DoneStats, EmbedOpts, Engine, GenOpts, Message, StreamEvent};
+use super::{
+    gguf, modelfile, ChatStart, DoneStats, EmbedOpts, Engine, GenOpts, Message, StreamEvent,
+};
 
 /// The conversation lives here and is never cleared between turns. That is the
 /// persistent prompt cache.
@@ -75,7 +77,10 @@ const SEQ_AUX: i32 = 1;
 fn env_num<T: std::str::FromStr>(key: &str, fallback: T) -> T {
     match std::env::var(key) {
         Ok(raw) => raw.trim().parse().unwrap_or_else(|_| {
-            warn_once(key, &format!("llama-local: {key}=\"{raw}\" is not a number; using the default."));
+            warn_once(
+                key,
+                &format!("llama-local: {key}=\"{raw}\" is not a number; using the default."),
+            );
             fallback
         }),
         Err(_) => fallback,
@@ -171,7 +176,11 @@ impl Sampling {
                         true
                     }
                     Json::Array(a) => {
-                        self.stop = a.iter().filter_map(Json::as_str).map(str::to_string).collect();
+                        self.stop = a
+                            .iter()
+                            .filter_map(Json::as_str)
+                            .map(str::to_string)
+                            .collect();
                         true
                     }
                     _ => false,
@@ -228,7 +237,12 @@ impl Sampling {
     /// which is the opposite of what a summary needs. Same reasoning and the
     /// same numbers as the llama-server adapter.
     fn for_summary() -> Self {
-        Self { temperature: 0.3, top_p: 0.9, repeat_penalty: 1.05, ..Self::default() }
+        Self {
+            temperature: 0.3,
+            top_p: 0.9,
+            repeat_penalty: 1.05,
+            ..Self::default()
+        }
     }
 }
 
@@ -264,7 +278,13 @@ impl Emitter {
         // An empty stop string matches at position 0 and would end every turn
         // before its first token.
         let stops = stops.into_iter().filter(|s| !s.is_empty()).collect();
-        Self { pending: Vec::new(), text: String::new(), emitted: 0, stops, stop: None }
+        Self {
+            pending: Vec::new(),
+            text: String::new(),
+            emitted: 0,
+            stops,
+            stop: None,
+        }
     }
 
     /// Feed one token's bytes. Returns the text that is safe to send now.
@@ -272,7 +292,11 @@ impl Emitter {
         self.pending.extend_from_slice(bytes);
         self.decode();
         if self.stop.is_none() {
-            self.stop = self.stops.iter().filter_map(|s| self.text.find(s.as_str())).min();
+            self.stop = self
+                .stops
+                .iter()
+                .filter_map(|s| self.text.find(s.as_str()))
+                .min();
         }
         let limit = self.stop.unwrap_or_else(|| self.holdback());
         self.take(limit)
@@ -423,7 +447,15 @@ impl LlamaLocal {
             .spawn(move || worker(cfg, rx))
             .map_err(|e| anyhow!("llama-local: could not start the engine thread - {e}"))?;
 
-        Ok(Self { gguf, model, n_ctx, n_gpu_layers, kv, model_params, jobs: tx })
+        Ok(Self {
+            gguf,
+            model,
+            n_ctx,
+            n_gpu_layers,
+            kv,
+            model_params,
+            jobs: tx,
+        })
     }
 
     /// The window the context was actually built with, asked of the engine
@@ -433,7 +465,10 @@ impl LlamaLocal {
     pub async fn probe_ctx(&self) -> Option<u32> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.send(Job::Info(tx)).ok()?;
-        let info = tokio::time::timeout(std::time::Duration::from_millis(1500), rx).await.ok()?.ok()?;
+        let info = tokio::time::timeout(std::time::Duration::from_millis(1500), rx)
+            .await
+            .ok()?
+            .ok()?;
         info.get("nCtx").and_then(Json::as_u64).map(|n| n as u32)
     }
 
@@ -486,13 +521,21 @@ impl Engine for LlamaLocal {
         })
     }
 
-    async fn chat_stream(&self, messages: Vec<Message>, options: &Map<String, Json>) -> Result<ChatStart> {
+    async fn chat_stream(
+        &self,
+        messages: Vec<Message>,
+        options: &Map<String, Json>,
+    ) -> Result<ChatStart> {
         let mut sampling = Sampling::default();
         sampling.apply(&self.model_params);
         sampling.apply(options);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        self.send(Job::Chat { messages, sampling: Box::new(sampling), out: tx })?;
+        self.send(Job::Chat {
+            messages,
+            sampling: Box::new(sampling),
+            out: tx,
+        })?;
         Ok(ChatStart::Streaming(Box::pin(stream! {
             while let Some(evt) = rx.recv().await {
                 yield evt;
@@ -517,8 +560,12 @@ impl Engine for LlamaLocal {
             );
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.send(Job::Generate { prompt: prompt.to_string(), out: tx })?;
-        rx.await.map_err(|_| anyhow!("llama-local: the engine thread stopped mid-generation."))?
+        self.send(Job::Generate {
+            prompt: prompt.to_string(),
+            out: tx,
+        })?;
+        rx.await
+            .map_err(|_| anyhow!("llama-local: the engine thread stopped mid-generation."))?
     }
 
     /// Deliberately unimplemented.
@@ -555,13 +602,21 @@ struct WorkerCfg {
 fn worker(cfg: WorkerCfg, mut rx: UnboundedReceiver<Job>) {
     let backend = match LlamaBackend::init() {
         Ok(b) => b,
-        Err(e) => return serve_error(rx, &format!("llama-local: llama.cpp would not initialise - {e}")),
+        Err(e) => {
+            return serve_error(
+                rx,
+                &format!("llama-local: llama.cpp would not initialise - {e}"),
+            )
+        }
     };
     let params = LlamaModelParams::default().with_n_gpu_layers(cfg.n_gpu_layers);
     let model = match LlamaModel::load_from_file(&backend, &cfg.gguf, &params) {
         Ok(m) => m,
         Err(e) => {
-            return serve_error(rx, &format!("llama-local: could not load {} - {e}", cfg.gguf.display()))
+            return serve_error(
+                rx,
+                &format!("llama-local: could not load {} - {e}", cfg.gguf.display()),
+            )
         }
     };
     let mut session = match Session::new(&cfg, &backend, &model) {
@@ -588,7 +643,9 @@ fn serve_error(mut rx: UnboundedReceiver<Job>, message: &str) {
     while let Some(job) = rx.blocking_recv() {
         match job {
             Job::Chat { out, .. } => {
-                let _ = out.send(StreamEvent::Error { message: message.to_string() });
+                let _ = out.send(StreamEvent::Error {
+                    message: message.to_string(),
+                });
             }
             Job::Generate { out, .. } => {
                 let _ = out.send(Err(anyhow!("{message}")));
@@ -626,15 +683,28 @@ impl<'a> Session<'a> {
         let ctx = model
             .new_context(backend, params)
             .map_err(|e| anyhow!("llama-local: could not build a context - {e}"))?;
-        let name = model.meta_val_str("general.name").unwrap_or_else(|_| "vessel".into());
-        Ok(Self { model, ctx, name, resident: Vec::new() })
+        let name = model
+            .meta_val_str("general.name")
+            .unwrap_or_else(|_| "vessel".into());
+        Ok(Self {
+            model,
+            ctx,
+            name,
+            resident: Vec::new(),
+        })
     }
 
     fn handle(&mut self, job: Job, cfg: &WorkerCfg) {
         match job {
-            Job::Chat { messages, sampling, out } => {
+            Job::Chat {
+                messages,
+                sampling,
+                out,
+            } => {
                 if let Err(e) = self.chat(messages, &sampling, cfg, &out) {
-                    let _ = out.send(StreamEvent::Error { message: e.to_string() });
+                    let _ = out.send(StreamEvent::Error {
+                        message: e.to_string(),
+                    });
                 }
             }
             Job::Generate { prompt, out } => {
@@ -664,7 +734,9 @@ impl<'a> Session<'a> {
             .iter()
             .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow!("llama-local: a message could not be passed to the template - {e}"))?;
+            .map_err(|e| {
+                anyhow!("llama-local: a message could not be passed to the template - {e}")
+            })?;
         let prompt = self
             .model
             .apply_chat_template(&template, &chat, true)
@@ -687,7 +759,13 @@ impl<'a> Session<'a> {
 
     /// Decode `tokens[from..]` into `seq`, asking for logits only on the last
     /// one - the rest are prefill and their logits are never read.
-    fn decode_prompt(&mut self, tokens: &[LlamaToken], from: usize, seq: i32, cfg: &WorkerCfg) -> Result<()> {
+    fn decode_prompt(
+        &mut self,
+        tokens: &[LlamaToken],
+        from: usize,
+        seq: i32,
+        cfg: &WorkerCfg,
+    ) -> Result<()> {
         let chunk = cfg.n_batch as usize;
         let mut batch = LlamaBatch::new(chunk, 1);
         let mut i = from;
@@ -699,7 +777,9 @@ impl<'a> Session<'a> {
                     .add(*token, (i + k) as i32, &[seq], i + k == tokens.len() - 1)
                     .map_err(|e| anyhow!("llama-local: prompt batch overflow - {e}"))?;
             }
-            self.ctx.decode(&mut batch).map_err(|e| anyhow!("llama-local: prefill failed - {e}"))?;
+            self.ctx
+                .decode(&mut batch)
+                .map_err(|e| anyhow!("llama-local: prefill failed - {e}"))?;
             i = end;
         }
         Ok(())
@@ -791,7 +871,9 @@ impl<'a> Session<'a> {
             batch
                 .add(token, pos as i32, &[SEQ_CHAT], true)
                 .map_err(|e| anyhow!("llama-local: decode batch overflow - {e}"))?;
-            self.ctx.decode(&mut batch).map_err(|e| anyhow!("llama-local: decode failed - {e}"))?;
+            self.ctx
+                .decode(&mut batch)
+                .map_err(|e| anyhow!("llama-local: decode failed - {e}"))?;
         }
 
         if done_reason != "abort" {
@@ -838,11 +920,15 @@ impl<'a> Session<'a> {
         }
         // Start clean every time: this prefix differs on every call, so there is
         // nothing to reuse and a stale tail would be read as context.
-        let _ = self.ctx.clear_kv_cache_seq(Some(SEQ_AUX as u32), None, None);
+        let _ = self
+            .ctx
+            .clear_kv_cache_seq(Some(SEQ_AUX as u32), None, None);
         let result = self.summarize_inner(&tokens, cfg);
         // Give the memory back whether or not it worked - the story's cache is
         // sharing this context.
-        let _ = self.ctx.clear_kv_cache_seq(Some(SEQ_AUX as u32), None, None);
+        let _ = self
+            .ctx
+            .clear_kv_cache_seq(Some(SEQ_AUX as u32), None, None);
         result
     }
 
@@ -939,7 +1025,13 @@ mod tests {
     fn an_unknown_option_is_dropped_and_leaves_everything_else_alone() {
         let mut s = Sampling::default();
         s.apply(&opts(json!({ "mirostat": 2, "temperature": 0.4 })));
-        assert_eq!(s, Sampling { temperature: 0.4, ..Sampling::default() });
+        assert_eq!(
+            s,
+            Sampling {
+                temperature: 0.4,
+                ..Sampling::default()
+            }
+        );
     }
 
     #[test]
@@ -1005,7 +1097,10 @@ mod tests {
     #[test]
     fn text_that_could_not_begin_a_stop_is_not_held_back_at_all() {
         let mut e = Emitter::new(vec!["END".to_string()]);
-        assert_eq!(e.push(b"a long stretch of prose").as_deref(), Some("a long stretch of prose"));
+        assert_eq!(
+            e.push(b"a long stretch of prose").as_deref(),
+            Some("a long stretch of prose")
+        );
     }
 
     #[test]

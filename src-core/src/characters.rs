@@ -21,7 +21,9 @@ use crate::db;
 pub fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Sampling overrides are stored as a JSON string. Only these keys survive, so a
@@ -48,7 +50,9 @@ const SAMPLING_BOUNDS: &[(&str, f64, f64)] = &[
 /// absent, and only a real number (or a string that parses as one) counts.
 pub fn clean_sampling(s: Option<&Json>) -> Map<String, Json> {
     let mut out = Map::new();
-    let Some(Json::Object(obj)) = s else { return out };
+    let Some(Json::Object(obj)) = s else {
+        return out;
+    };
     for (key, min, max) in SAMPLING_BOUNDS {
         let v = match obj.get(*key) {
             Some(Json::Number(n)) => n.as_f64(),
@@ -56,7 +60,9 @@ pub fn clean_sampling(s: Option<&Json>) -> Map<String, Json> {
             Some(Json::String(t)) => t.trim().parse::<f64>().ok(),
             _ => None,
         };
-        let Some(v) = v.filter(|v| v.is_finite()) else { continue };
+        let Some(v) = v.filter(|v| v.is_finite()) else {
+            continue;
+        };
         if let Some(n) = serde_json::Number::from_f64(v.clamp(*min, *max)) {
             out.insert((*key).to_string(), Json::Number(n));
         }
@@ -102,7 +108,9 @@ pub fn clean_avatar(v: &str) -> String {
     let s = cap(v, CAP_AVATAR);
     let s = s.trim();
     let lower = s.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("data:image/")
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("data:image/")
     {
         s.to_string()
     } else {
@@ -112,7 +120,9 @@ pub fn clean_avatar(v: &str) -> String {
 
 /// Trim, drop empties, cap both the number of entries and each entry's length.
 pub fn clean_list(a: Option<&Json>, max: usize, max_len: usize) -> Vec<String> {
-    let Some(Json::Array(items)) = a else { return Vec::new() };
+    let Some(Json::Array(items)) = a else {
+        return Vec::new();
+    };
     items
         .iter()
         .map(|x| cap(x.as_str().unwrap_or("").trim(), max_len))
@@ -124,7 +134,10 @@ pub fn clean_list(a: Option<&Json>, max: usize, max_len: usize) -> Vec<String> {
 fn parse_list(json: Option<&Json>) -> Vec<String> {
     let raw = json.and_then(Json::as_str).unwrap_or("[]");
     match serde_json::from_str::<Json>(raw) {
-        Ok(Json::Array(a)) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+        Ok(Json::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -148,7 +161,10 @@ pub struct Character {
 }
 
 fn s(row: &Map<String, Json>, key: &str) -> String {
-    row.get(key).and_then(Json::as_str).unwrap_or("").to_string()
+    row.get(key)
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn row_to_character(row: &Map<String, Json>) -> Character {
@@ -222,7 +238,10 @@ pub async fn get(id: &str) -> Result<Option<Character>> {
     }
     let db = db::get().await?;
     let row = db
-        .query_one("SELECT * FROM characters WHERE id = ?", vec![TValue::Text(id.into())])
+        .query_one(
+            "SELECT * FROM characters WHERE id = ?",
+            vec![TValue::Text(id.into())],
+        )
         .await?;
     Ok(row.as_ref().map(row_to_character))
 }
@@ -248,15 +267,29 @@ pub async fn create(p: CharacterPatch) -> Result<Option<Character>> {
         vec![
             TValue::Text(id.clone()),
             TValue::Text(name),
-            TValue::Text(clean_avatar(present(&p.avatar).and_then(Json::as_str).unwrap_or(""))),
+            TValue::Text(clean_avatar(
+                present(&p.avatar).and_then(Json::as_str).unwrap_or(""),
+            )),
             TValue::Text(cap_opt(present(&p.tagline), CAP_TAGLINE)),
             TValue::Text(cap_opt(present(&p.about), CAP_ABOUT)),
             TValue::Text(cap_opt(present(&p.persona), CAP_PERSONA)),
             TValue::Text(cap_opt(present(&p.greeting), CAP_GREETING)),
-            TValue::Text(serde_json::to_string(&clean_list(present(&p.chat_starters), 12, 200))?),
-            TValue::Text(serde_json::to_string(&clean_list(present(&p.tags), 12, 40))?),
-            TValue::Text(serde_json::to_string(&clean_sampling(present(&p.sampling)))?),
-            TValue::Text(clean_style(present(&p.response_style).and_then(Json::as_str))),
+            TValue::Text(serde_json::to_string(&clean_list(
+                present(&p.chat_starters),
+                12,
+                200,
+            ))?),
+            TValue::Text(serde_json::to_string(&clean_list(
+                present(&p.tags),
+                12,
+                40,
+            ))?),
+            TValue::Text(serde_json::to_string(&clean_sampling(present(
+                &p.sampling,
+            )))?),
+            TValue::Text(clean_style(
+                present(&p.response_style).and_then(Json::as_str),
+            )),
             TValue::Text(ts.clone()),
             TValue::Text(ts),
         ],
@@ -270,7 +303,9 @@ pub async fn update(id: &str, p: CharacterPatch) -> Result<Option<Character>> {
     if !is_valid_id(id) {
         return Err(anyhow!("Invalid character id."));
     }
-    let Some(existing) = get(id).await? else { return Ok(None) };
+    let Some(existing) = get(id).await? else {
+        return Ok(None);
+    };
 
     let name = match present(&p.name) {
         Some(v) => cap(v.as_str().unwrap_or("").trim(), CAP_NAME),
@@ -350,7 +385,10 @@ pub async fn delete(id: &str) -> Result<bool> {
     }
     let db = db::get().await?;
     Ok(db
-        .execute("DELETE FROM characters WHERE id = ?", vec![TValue::Text(id.into())])
+        .execute(
+            "DELETE FROM characters WHERE id = ?",
+            vec![TValue::Text(id.into())],
+        )
         .await?
         > 0)
 }
@@ -394,9 +432,18 @@ mod tests {
 
     #[test]
     fn avatars_are_limited_to_web_images() {
-        assert_eq!(clean_avatar("https://example.test/a.png"), "https://example.test/a.png");
-        assert_eq!(clean_avatar("  HTTP://example.test/a.png "), "HTTP://example.test/a.png");
-        assert_eq!(clean_avatar("data:image/png;base64,AAAA"), "data:image/png;base64,AAAA");
+        assert_eq!(
+            clean_avatar("https://example.test/a.png"),
+            "https://example.test/a.png"
+        );
+        assert_eq!(
+            clean_avatar("  HTTP://example.test/a.png "),
+            "HTTP://example.test/a.png"
+        );
+        assert_eq!(
+            clean_avatar("data:image/png;base64,AAAA"),
+            "data:image/png;base64,AAAA"
+        );
         assert_eq!(clean_avatar("file:///C:/Windows/win.ini"), "");
         assert_eq!(clean_avatar("javascript:alert(1)"), "");
         assert_eq!(clean_avatar("data:text/html,<script>"), "");

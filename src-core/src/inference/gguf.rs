@@ -86,14 +86,20 @@ fn store_root() -> Option<PathBuf> {
             return Some(PathBuf::from(dir.trim()));
         }
     }
-    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
     Some(Path::new(&home).join(".ollama").join("models"))
 }
 
 /// `<root>/manifests/registry.ollama.ai/<namespace>/<name>/<tag>`
 pub fn manifest_path(root: &Path, reference: &str) -> PathBuf {
     let (namespace, name, tag) = parse_model_ref(reference);
-    root.join("manifests").join("registry.ollama.ai").join(namespace).join(name).join(tag)
+    root.join("manifests")
+        .join("registry.ollama.ai")
+        .join(namespace)
+        .join(name)
+        .join(tag)
 }
 
 /// Resolve the weights path, or say precisely what to do about it.
@@ -111,7 +117,10 @@ pub fn resolve(model_ref: &str) -> Result<PathBuf> {
             ));
         }
         if !path.is_file() {
-            return Err(anyhow!("LLAMA_GGUF points at {}, which is not a file.", path.display()));
+            return Err(anyhow!(
+                "LLAMA_GGUF points at {}, which is not a file.",
+                path.display()
+            ));
         }
         return Ok(path);
     }
@@ -127,7 +136,8 @@ pub fn resolve(model_ref: &str) -> Result<PathBuf> {
             manifest.display()
         )
     })?;
-    let blob = weights_blob_name(&text).with_context(|| format!("reading {}", manifest.display()))?;
+    let blob =
+        weights_blob_name(&text).with_context(|| format!("reading {}", manifest.display()))?;
     let path = root.join("blobs").join(&blob);
     if !path.is_file() {
         return Err(anyhow!(
@@ -145,16 +155,26 @@ mod tests {
 
     #[test]
     fn a_bare_name_resolves_to_the_library_namespace_and_latest_tag() {
-        assert_eq!(parse_model_ref("vessel"), ("library".into(), "vessel".into(), "latest".into()));
+        assert_eq!(
+            parse_model_ref("vessel"),
+            ("library".into(), "vessel".into(), "latest".into())
+        );
     }
 
     #[test]
     fn a_publisher_prefix_and_an_explicit_tag_are_both_kept() {
         assert_eq!(
             parse_model_ref("Tohur/natsumura-storytelling-rp-llama-3.1:8b"),
-            ("Tohur".into(), "natsumura-storytelling-rp-llama-3.1".into(), "8b".into())
+            (
+                "Tohur".into(),
+                "natsumura-storytelling-rp-llama-3.1".into(),
+                "8b".into()
+            )
         );
-        assert_eq!(parse_model_ref("gemma3:4b"), ("library".into(), "gemma3".into(), "4b".into()));
+        assert_eq!(
+            parse_model_ref("gemma3:4b"),
+            ("library".into(), "gemma3".into(), "4b".into())
+        );
     }
 
     #[test]
@@ -172,10 +192,12 @@ mod tests {
 
     #[test]
     fn a_manifest_with_no_weights_layer_is_an_error_not_an_empty_path() {
-        let manifest =
-            r#"{"layers":[{"mediaType":"application/vnd.ollama.image.license","digest":"sha256:ab"}]}"#;
+        let manifest = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.license","digest":"sha256:ab"}]}"#;
         let err = weights_blob_name(manifest).unwrap_err().to_string();
-        assert!(err.contains("no application/vnd.ollama.image.model layer"), "{err}");
+        assert!(
+            err.contains("no application/vnd.ollama.image.model layer"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -193,8 +215,15 @@ mod tests {
     #[test]
     fn the_manifest_path_is_built_the_way_ollama_lays_the_store_out() {
         let got = manifest_path(Path::new("/store"), "vessel");
-        let tail: PathBuf =
-            ["manifests", "registry.ollama.ai", "library", "vessel", "latest"].iter().collect();
+        let tail: PathBuf = [
+            "manifests",
+            "registry.ollama.ai",
+            "library",
+            "vessel",
+            "latest",
+        ]
+        .iter()
+        .collect();
         assert!(got.ends_with(tail), "{}", got.display());
     }
 }

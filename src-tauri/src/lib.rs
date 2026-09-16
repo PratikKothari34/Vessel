@@ -20,9 +20,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
 use vessel_core::inference::Engine;
-use vessel_core::{
-    characters, chat, db, inference, keystore, memory, metrics, prompt, settings,
-};
+use vessel_core::{characters, chat, db, inference, keystore, memory, metrics, prompt, settings};
 
 /// Cap on the shutdown wait for a background fold.
 ///
@@ -45,10 +43,16 @@ pub struct CmdError {
 
 impl CmdError {
     fn new(error: impl Into<String>) -> Self {
-        Self { error: error.into(), detail: None }
+        Self {
+            error: error.into(),
+            detail: None,
+        }
     }
     fn detailed(error: impl Into<String>, e: impl std::fmt::Display) -> Self {
-        Self { error: error.into(), detail: Some(e.to_string()) }
+        Self {
+            error: error.into(),
+            detail: Some(e.to_string()),
+        }
     }
 }
 
@@ -56,7 +60,9 @@ type Cmd<T> = Result<T, CmdError>;
 
 /// The open database, or a command error. Every data command starts here.
 async fn open() -> Cmd<Arc<db::Db>> {
-    db::get().await.map_err(|e| CmdError::detailed("Database unavailable.", e))
+    db::get()
+        .await
+        .map_err(|e| CmdError::detailed("Database unavailable.", e))
 }
 
 // ---- Health ---------------------------------------------------------------
@@ -134,7 +140,9 @@ async fn save_settings(turso_url: Option<String>, turso_token: Option<String>) -
     if let Some(raw) = turso_url {
         let url: String = raw.trim().chars().take(2048).collect();
         if !url.is_empty() && !is_sync_url(&url) {
-            return Err(CmdError::new("Database URL must start with libsql:// or https://."));
+            return Err(CmdError::new(
+                "Database URL must start with libsql:// or https://.",
+            ));
         }
         let mut patch = serde_json::Map::new();
         patch.insert("tursoUrl".into(), Json::String(url));
@@ -153,9 +161,11 @@ async fn save_settings(turso_url: Option<String>, turso_token: Option<String>) -
 
 /// `^(libsql|https?)://\S+$`, without pulling in a regex engine for one check.
 fn is_sync_url(url: &str) -> bool {
-    let rest = ["libsql://", "https://", "http://"]
-        .iter()
-        .find_map(|p| url.get(..p.len()).filter(|s| s.eq_ignore_ascii_case(p)).map(|_| &url[p.len()..]));
+    let rest = ["libsql://", "https://", "http://"].iter().find_map(|p| {
+        url.get(..p.len())
+            .filter(|s| s.eq_ignore_ascii_case(p))
+            .map(|_| &url[p.len()..])
+    });
     matches!(rest, Some(r) if !r.is_empty() && !r.chars().any(char::is_whitespace))
 }
 
@@ -224,7 +234,9 @@ async fn delete_character(id: String) -> Cmd<Json> {
     // way - it proceeds unlocked once the wait is spent - so there is no
     // partial-acquire case to unwind. The guards are held until this returns.
     let _locks: Vec<memory::TurnLock> = futures_util::future::join_all(
-        owned.iter().map(|c| memory::acquire_lock(&c.id, chat::DELETE_LOCK_WAIT)),
+        owned
+            .iter()
+            .map(|c| memory::acquire_lock(&c.id, chat::DELETE_LOCK_WAIT)),
     )
     .await;
 
@@ -310,7 +322,11 @@ async fn delete_conversation(id: String) -> Cmd<Json> {
 /// Which variant of an assistant turn is active (swipe selection). Updates the
 /// canonical turn text that memory and the summary read.
 #[tauri::command]
-async fn set_active_variant(id: String, turn_id: i64, variant_id: i64) -> Cmd<memory::ActiveVariant> {
+async fn set_active_variant(
+    id: String,
+    turn_id: i64,
+    variant_id: i64,
+) -> Cmd<memory::ActiveVariant> {
     if !memory::is_valid_id(&id) {
         return Err(CmdError::new("Invalid conversation id."));
     }
@@ -359,7 +375,9 @@ fn cancel_chat(conversation_id: String) -> usize {
 #[tauri::command]
 async fn flush_sync() -> Cmd<bool> {
     let db = open().await?;
-    db.sync_now().await.map_err(|e| CmdError::detailed("Sync failed.", e))
+    db.sync_now()
+        .await
+        .map_err(|e| CmdError::detailed("Sync failed.", e))
 }
 
 /// Restart the app so a settings change takes effect. Replaces
@@ -378,7 +396,12 @@ fn banner(db: &db::Db) {
     let num_ctx = chat::default_num_ctx();
     let chat_engine = inference::chat().ok();
     let (name, host, model, takes_ctx) = match chat_engine {
-        Some(e) => (e.name(), e.host().to_string(), e.model().to_string(), e.accepts_num_ctx()),
+        Some(e) => (
+            e.name(),
+            e.host().to_string(),
+            e.model().to_string(),
+            e.accepts_num_ctx(),
+        ),
         None => ("none", String::new(), String::new(), false),
     };
     let embedder = inference::embedder().map(|e| e.name()).unwrap_or("none");
@@ -387,7 +410,11 @@ fn banner(db: &db::Db) {
         "Vessel".to_string(),
         format!(
             "  -> inference: {name} @ {host} | model: {model} | num_ctx: {num_ctx}{}",
-            if takes_ctx { "" } else { " (from -c at launch)" }
+            if takes_ctx {
+                ""
+            } else {
+                " (from -c at launch)"
+            }
         ),
         format!(
             "  -> model rules: {}{}",
@@ -396,9 +423,20 @@ fn banner(db: &db::Db) {
             } else {
                 format!("{} chars from Modelfile", gb.chars().count())
             },
-            if mf.found { "" } else { " (Modelfile not found)" }
+            if mf.found {
+                ""
+            } else {
+                " (Modelfile not found)"
+            }
         ),
-        format!("  -> sync: {}", if db.is_sync_enabled() { "enabled" } else { "local-only" }),
+        format!(
+            "  -> sync: {}",
+            if db.is_sync_enabled() {
+                "enabled"
+            } else {
+                "local-only"
+            }
+        ),
         format!(
             "  -> memory: summarizer={}, embedder={} ({embedder})",
             m.summarizer_model, m.embed_model
@@ -421,8 +459,11 @@ fn banner(db: &db::Db) {
             "  !! SUMMARIZER_NUM_CTX={} does not match num_ctx={num_ctx}.",
             m.summarizer_num_ctx
         ));
-        lines.push("     The summariser shares the chat model but not its slot, so each summary".into());
-        lines.push("     reloads the model. Unset SUMMARIZER_NUM_CTX to keep one slot warm.".into());
+        lines.push(
+            "     The summariser shares the chat model but not its slot, so each summary".into(),
+        );
+        lines
+            .push("     reloads the model. Unset SUMMARIZER_NUM_CTX to keep one slot warm.".into());
     }
     tracing::info!("{}", lines.join("\n"));
 
@@ -455,8 +496,7 @@ pub fn run() {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_target(false)
         .init();

@@ -56,7 +56,9 @@ pub fn db_encryption_key() -> Option<String> {
             let key = hex::encode(buf);
             match entry(KEY_ACCOUNT_DB).and_then(|e| e.set_password(&key)) {
                 Ok(()) => {
-                    tracing::info!("[keystore] generated and stored a new local-DB encryption key.");
+                    tracing::info!(
+                        "[keystore] generated and stored a new local-DB encryption key."
+                    );
                     Some(key)
                 }
                 // No safe place to persist it: staying plaintext is recoverable,

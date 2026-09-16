@@ -1,0 +1,9 @@
+# Pinned so the Rust tracks formats the same on any machine and never shows up
+# in a review diff again. Everything else is rustfmt's default on purpose --
+# the point of a formatter is that nobody argues with it.
+#
+# newline_style is the one setting that is genuinely environment-dependent:
+# the default, "Auto", writes the platform's ending, which on Windows would
+# rewrite every one of these LF files to CRLF the first time anyone runs it.
+newline_style = "Unix"
+max_width = 100

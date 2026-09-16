@@ -1,0 +1,6 @@
+# core.autocrlf is true on this machine, so without this a fresh clone would
+# check every .rs file out as CRLF and the next `cargo fmt` -- pinned to LF in
+# rustfmt.toml -- would rewrite all twenty of them. The formatter and the
+# checkout have to agree, or one of them produces a diff on every clone.
+*.rs text eol=lf
+rustfmt.toml text eol=lf

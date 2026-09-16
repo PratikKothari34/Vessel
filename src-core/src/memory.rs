@@ -116,7 +116,11 @@ impl Config {
         let same_model = summarizer_model == chat_model;
         let summarizer_num_ctx = int_env(
             "SUMMARIZER_NUM_CTX",
-            if same_model { chat_num_ctx as i64 } else { 8192 },
+            if same_model {
+                chat_num_ctx as i64
+            } else {
+                8192
+            },
             512,
         ) as u32;
 
@@ -140,7 +144,11 @@ impl Config {
 
         let max_summary_chars = int_env("MAX_SUMMARY_CHARS", 6000, 500) as usize;
         let summary_enabled = !matches!(
-            std::env::var("SUMMARY_ENABLED").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+            std::env::var("SUMMARY_ENABLED")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
             "" | "0" | "false" | "off" | "no",
         );
         // Deliberately well under the cap: models treat a character count as a
@@ -225,7 +233,10 @@ pub struct Conversation {
 }
 
 fn text(row: &serde_json::Map<String, serde_json::Value>, key: &str) -> String {
-    row.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    row.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn opt_text(row: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
@@ -255,7 +266,10 @@ pub async fn ensure_conversation(
         return Err(anyhow!("ensureConversation: invalid id"));
     }
     if let Some(row) = db
-        .query_one("SELECT * FROM conversations WHERE id = ?", vec![TValue::Text(id.into())])
+        .query_one(
+            "SELECT * FROM conversations WHERE id = ?",
+            vec![TValue::Text(id.into())],
+        )
         .await?
     {
         return Ok(row_to_conversation(&row));
@@ -264,7 +278,10 @@ pub async fn ensure_conversation(
     let mut bound = character_id.filter(|c| is_valid_id(c)).map(str::to_string);
     if let Some(c) = bound.clone() {
         let exists = db
-            .query_one("SELECT 1 FROM characters WHERE id = ?", vec![TValue::Text(c)])
+            .query_one(
+                "SELECT 1 FROM characters WHERE id = ?",
+                vec![TValue::Text(c)],
+            )
             .await?;
         if exists.is_none() {
             bound = None;
@@ -285,7 +302,10 @@ pub async fn ensure_conversation(
     .await?;
 
     let row = db
-        .query_one("SELECT * FROM conversations WHERE id = ?", vec![TValue::Text(id.into())])
+        .query_one(
+            "SELECT * FROM conversations WHERE id = ?",
+            vec![TValue::Text(id.into())],
+        )
         .await?
         .ok_or_else(|| anyhow!("ensureConversation: row vanished after insert"))?;
     Ok(row_to_conversation(&row))
@@ -304,7 +324,10 @@ fn row_to_conversation(row: &serde_json::Map<String, serde_json::Value>) -> Conv
 
 pub async fn get_summary(db: &Db, id: &str) -> Result<String> {
     let row = db
-        .query_one("SELECT summary FROM conversations WHERE id = ?", vec![TValue::Text(id.into())])
+        .query_one(
+            "SELECT summary FROM conversations WHERE id = ?",
+            vec![TValue::Text(id.into())],
+        )
         .await?;
     Ok(row.as_ref().map(|r| text(r, "summary")).unwrap_or_default())
 }
@@ -336,7 +359,11 @@ async fn get_verbatim_limit(db: &Db, id: &str, limit: usize) -> Result<Vec<Turn>
         .await?;
     let mut out: Vec<Turn> = rows
         .iter()
-        .map(|r| Turn { id: int(r, "id"), role: text(r, "role"), content: text(r, "content") })
+        .map(|r| Turn {
+            id: int(r, "id"),
+            role: text(r, "role"),
+            content: text(r, "content"),
+        })
         .collect();
     out.reverse();
     Ok(out)
@@ -353,13 +380,22 @@ pub async fn embed(text: &str) -> Result<Vec<f32>> {
     }
     let cfg = config();
     let vec = inference::embedder()?
-        .embed(&cfg.embed_model, text, EmbedOpts { num_gpu: Some(cfg.embed_num_gpu) })
+        .embed(
+            &cfg.embed_model,
+            text,
+            EmbedOpts {
+                num_gpu: Some(cfg.embed_num_gpu),
+            },
+        )
         .await?;
     // Every archived row is stored at EMBED_DIM. A model that returned anything
     // else would write vectors that can never be compared against the existing
     // ones, so this fails the turn rather than corrupting the archive.
     if vec.len() != EMBED_DIM {
-        return Err(anyhow!("embed: expected {EMBED_DIM} dims, got {}", vec.len()));
+        return Err(anyhow!(
+            "embed: expected {EMBED_DIM} dims, got {}",
+            vec.len()
+        ));
     }
     Ok(vec)
 }
@@ -422,8 +458,14 @@ pub async fn acquire_lock(id: &str, wait: Duration) -> TurnLock {
     };
 
     match tokio::time::timeout(wait, m.lock_owned()).await {
-        Ok(guard) => TurnLock { _guard: Some(guard), timed_out: false },
-        Err(_) => TurnLock { _guard: None, timed_out: true },
+        Ok(guard) => TurnLock {
+            _guard: Some(guard),
+            timed_out: false,
+        },
+        Err(_) => TurnLock {
+            _guard: None,
+            timed_out: true,
+        },
     }
 }
 
@@ -570,13 +612,20 @@ pub fn forget_archive(conversation_id: &str) {
 /// Rows newer than `since_id`. NOT filtered on `embedding IS NOT NULL`: the
 /// count has to be comparable with the COUNT(*) below, so rows without a vector
 /// are skipped here instead of in SQL.
-async fn fetch_archive_rows(db: &Db, conversation_id: &str, since_id: i64) -> Result<Vec<(i64, Vec<u8>)>> {
+async fn fetch_archive_rows(
+    db: &Db,
+    conversation_id: &str,
+    since_id: i64,
+) -> Result<Vec<(i64, Vec<u8>)>> {
     let rows = db
         .query_values(
             "SELECT id, embedding FROM archive
              WHERE conversation_id = ? AND id > ?
              ORDER BY id ASC",
-            vec![TValue::Text(conversation_id.into()), TValue::Integer(since_id)],
+            vec![
+                TValue::Text(conversation_id.into()),
+                TValue::Integer(since_id),
+            ],
         )
         .await?;
     Ok(rows
@@ -598,7 +647,9 @@ async fn fetch_archive_rows(db: &Db, conversation_id: &str, since_id: i64) -> Re
 fn absorb_rows(e: &mut CacheEntry, rows: Vec<(i64, Vec<u8>)>) {
     e.vecs.reserve(rows.len() * EMBED_DIM);
     for (id, blob) in rows {
-        let Some(mut vec) = codec::decode(&blob) else { continue };
+        let Some(mut vec) = codec::decode(&blob) else {
+            continue;
+        };
         if vec.len() != EMBED_DIM || !normalize_in_place(&mut vec) {
             continue; // no usable vector -> the row is not retrievable
         }
@@ -724,7 +775,11 @@ where
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(if role == "user" { "User" } else { assistant_name });
+        out.push_str(if role == "user" {
+            "User"
+        } else {
+            assistant_name
+        });
         out.push_str(": ");
         out.push_str(content);
     }
@@ -771,7 +826,11 @@ fn summarize_prompt(prior_summary: &str, rendered: &str, target_chars: usize) ->
          {rendered}\n\
          \n\
          === UPDATED SUMMARY ===",
-        prior = if prior_summary.is_empty() { "(none yet)" } else { prior_summary },
+        prior = if prior_summary.is_empty() {
+            "(none yet)"
+        } else {
+            prior_summary
+        },
     )
 }
 
@@ -849,7 +908,10 @@ pub async fn build_context(
         .rev()
         .find(|m| m.role == "user" && is_valid_msg(m))
         .cloned();
-    let query_text = latest_user.as_ref().map(|m| m.content.as_str()).unwrap_or("");
+    let query_text = latest_user
+        .as_ref()
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
 
     // Sequential, not concurrent: all three legs share ONE database connection,
     // so running them together would buy no parallelism and would put two
@@ -864,13 +926,14 @@ pub async fn build_context(
     } else {
         // Retrieval is an enhancement. A dead embedder must cost recall, not
         // the whole turn.
-        retrieve(db, conversation_id, query_text).await.unwrap_or_default()
+        retrieve(db, conversation_id, query_text)
+            .await
+            .unwrap_or_default()
     };
     let retrieve_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    let mut messages: Vec<Message> = Vec::with_capacity(
-        leading_systems.len() + verbatim.len() + trailing_systems.len() + 3,
-    );
+    let mut messages: Vec<Message> =
+        Vec::with_capacity(leading_systems.len() + verbatim.len() + trailing_systems.len() + 3);
     // Counted while building rather than re-walked afterwards.
     let mut persona_chars = 0usize;
     let mut stable_prefix_chars = 0usize;
@@ -899,7 +962,9 @@ pub async fn build_context(
             retrieved_chars += r.content.chars().count();
         }
         let body = render_turns(
-            retrieved.iter().map(|r| (r.role.as_str(), r.content.as_str())),
+            retrieved
+                .iter()
+                .map(|r| (r.role.as_str(), r.content.as_str())),
             "Character",
         );
         messages.push(Message::new(
@@ -937,7 +1002,12 @@ pub async fn build_context(
         retrieve_ms: (retrieve_ms * 10.0).round() / 10.0,
     };
 
-    Ok(BuiltContext { messages, retrieved, latest_user, stats })
+    Ok(BuiltContext {
+        messages,
+        retrieved,
+        latest_user,
+        stats,
+    })
 }
 
 fn already_last(verbatim: &[Turn], msg: &Message) -> bool {
@@ -956,11 +1026,13 @@ pub async fn get_last_assistant_turn(db: &Db, conversation_id: &str) -> Result<O
             vec![TValue::Text(conversation_id.into())],
         )
         .await?;
-    Ok(row.filter(|r| text(r, "role") == "assistant").map(|r| Turn {
-        id: int(&r, "id"),
-        role: "assistant".into(),
-        content: text(&r, "content"),
-    }))
+    Ok(row
+        .filter(|r| text(r, "role") == "assistant")
+        .map(|r| Turn {
+            id: int(&r, "id"),
+            role: "assistant".into(),
+            content: text(&r, "content"),
+        }))
 }
 
 /// Back-fill the variant a turn should already have, seeded from its OWN text.
@@ -1020,7 +1092,11 @@ pub async fn append_variant(db: &Db, turn_id: i64, content: &str) -> Result<i64>
     let variant_id = db
         .insert(
             "INSERT INTO variants (turn_id, content, is_active, created_at) VALUES (?, ?, 1, ?)",
-            vec![TValue::Integer(turn_id), TValue::Text(content.into()), TValue::Text(now_iso())],
+            vec![
+                TValue::Integer(turn_id),
+                TValue::Text(content.into()),
+                TValue::Text(now_iso()),
+            ],
         )
         .await?;
     db.execute(
@@ -1078,7 +1154,11 @@ pub async fn set_active_variant(
         vec![TValue::Text(content.clone()), TValue::Integer(turn_id)],
     )
     .await?;
-    Ok(ActiveVariant { turn_id, variant_id, content })
+    Ok(ActiveVariant {
+        turn_id,
+        variant_id,
+        content,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1112,7 +1192,10 @@ pub async fn get_variants(db: &Db, turn_id: i64) -> Result<Variants> {
         })
         .collect();
     let active_index = variants.iter().position(|v| v.active).unwrap_or(0);
-    Ok(Variants { variants, active_index })
+    Ok(Variants {
+        variants,
+        active_index,
+    })
 }
 
 // ---- Post-turn bookkeeping ------------------------------------------------
@@ -1124,7 +1207,10 @@ async fn embed_all(turns: &[Turn]) -> Vec<Option<Vec<u8>>> {
     let lanes = config().embed_concurrency.clamp(1, turns.len().max(1));
     // Each future owns its text rather than borrowing the turn: a borrow here
     // would have to outlive a spawned task, and the fold runs on one.
-    let texts: Vec<String> = turns.iter().map(|t| format!("{}: {}", t.role, t.content)).collect();
+    let texts: Vec<String> = turns
+        .iter()
+        .map(|t| format!("{}: {}", t.role, t.content))
+        .collect();
     futures_util::stream::iter(texts.into_iter().map(|text| async move {
         match embed(&text).await {
             Ok(v) => Some(codec::encode(&v)),
@@ -1235,7 +1321,10 @@ pub async fn record_turn(
     }
 
     schedule_maintenance(conversation_id, assistant_name);
-    Ok(TurnResult { maintenance_scheduled: true, ..Default::default() })
+    Ok(TurnResult {
+        maintenance_scheduled: true,
+        ..Default::default()
+    })
 }
 
 async fn turn_count(db: &Db, conversation_id: &str) -> Result<usize> {
@@ -1381,7 +1470,11 @@ async fn run_maintenance(
     // down to the target - otherwise a capped fold would stop at the threshold
     // and leave the window permanently larger than the design.
     let draining = state.draining.load(Ordering::SeqCst);
-    let floor = if draining { cfg.verbatim_turns } else { cfg.summarize_threshold };
+    let floor = if draining {
+        cfg.verbatim_turns
+    } else {
+        cfg.summarize_threshold
+    };
     if count <= floor {
         state.draining.store(false, Ordering::SeqCst);
         return Ok(TurnResult::default());
@@ -1400,12 +1493,19 @@ async fn run_maintenance(
     let rows = db
         .query(
             "SELECT id, role, content FROM turns WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
-            vec![TValue::Text(conversation_id.into()), TValue::Integer(to_archive as i64)],
+            vec![
+                TValue::Text(conversation_id.into()),
+                TValue::Integer(to_archive as i64),
+            ],
         )
         .await?;
     let oldest: Vec<Turn> = rows
         .iter()
-        .map(|r| Turn { id: int(r, "id"), role: text(r, "role"), content: text(r, "content") })
+        .map(|r| Turn {
+            id: int(r, "id"),
+            role: text(r, "role"),
+            content: text(r, "content"),
+        })
         .collect();
 
     let prior_summary = get_summary(db, conversation_id).await?;
@@ -1433,7 +1533,10 @@ async fn run_maintenance(
             // Summarizer down: keep the turns verbatim rather than lose them.
             // The embeds computed alongside are discarded and recomputed next
             // attempt.
-            return Ok(TurnResult { error: Some(e.to_string()), ..Default::default() });
+            return Ok(TurnResult {
+                error: Some(e.to_string()),
+                ..Default::default()
+            });
         }
         None => None,
     };
@@ -1443,7 +1546,10 @@ async fn run_maintenance(
     // exists would resurrect a deleted story. Everything below is await-free
     // apart from its own writes, so checking here is enough.
     if state.cancelled.load(Ordering::SeqCst) {
-        return Ok(TurnResult { cancelled: true, ..Default::default() });
+        return Ok(TurnResult {
+            cancelled: true,
+            ..Default::default()
+        });
     }
     let alive = db
         .query_one(
@@ -1452,7 +1558,10 @@ async fn run_maintenance(
         )
         .await?;
     if alive.is_none() {
-        return Ok(TurnResult { cancelled: true, ..Default::default() });
+        return Ok(TurnResult {
+            cancelled: true,
+            ..Default::default()
+        });
     }
 
     if let Some(text) = updated {
@@ -1484,8 +1593,10 @@ async fn run_maintenance(
     // `embed_all` preserves order, so a turn and its vector share an index.
     // Zipping them keeps that alignment explicit through the chunking.
     let ts = now_iso();
-    let rows: Vec<(&Turn, Option<&Vec<u8>>)> =
-        oldest.iter().zip(embeddings.iter().map(Option::as_ref)).collect();
+    let rows: Vec<(&Turn, Option<&Vec<u8>>)> = oldest
+        .iter()
+        .zip(embeddings.iter().map(Option::as_ref))
+        .collect();
     for part in rows.chunks(ARCHIVE_INSERT_CHUNK) {
         let values = vec!["(?, ?, ?, ?, ?)"; part.len()].join(", ");
         let mut params: Vec<TValue> = Vec::with_capacity(part.len() * 5);
@@ -1521,7 +1632,11 @@ async fn run_maintenance(
         .await?;
     }
 
-    Ok(TurnResult { archived: oldest.len(), summarized: true, ..Default::default() })
+    Ok(TurnResult {
+        archived: oldest.len(),
+        summarized: true,
+        ..Default::default()
+    })
 }
 
 /// Keep the LAST `max` characters. The front is what gets cut, because it is the
@@ -1697,7 +1812,11 @@ fn summary_is_usable(cleaned: &str, prior: &str) -> bool {
 
 /// Record ONLY a user turn (no assistant reply). Used when a stream is stopped
 /// before any reply text arrives, so the user's message still survives a reload.
-pub async fn record_user_turn(db: &Db, conversation_id: &str, user_message: &Message) -> Result<bool> {
+pub async fn record_user_turn(
+    db: &Db,
+    conversation_id: &str,
+    user_message: &Message,
+) -> Result<bool> {
     if user_message.content.trim().is_empty() {
         return Ok(false);
     }
@@ -1853,7 +1972,10 @@ pub async fn get_conversation(db: &Db, id: &str) -> Result<Option<ConversationDe
         return Ok(None);
     }
     let Some(row) = db
-        .query_one("SELECT * FROM conversations WHERE id = ?", vec![TValue::Text(id.into())])
+        .query_one(
+            "SELECT * FROM conversations WHERE id = ?",
+            vec![TValue::Text(id.into())],
+        )
         .await?
     else {
         return Ok(None);
@@ -1950,7 +2072,10 @@ pub async fn delete_conversation(db: &Db, id: &str) -> Result<bool> {
     // before its first write.
     cancel_maintenance(id);
     let n = db
-        .execute("DELETE FROM conversations WHERE id = ?", vec![TValue::Text(id.into())])
+        .execute(
+            "DELETE FROM conversations WHERE id = ?",
+            vec![TValue::Text(id.into())],
+        )
         .await?;
     forget_archive(id); // cached vectors would outlive the rows they describe
     crate::metrics::forget_conversation(id);
@@ -1964,7 +2089,9 @@ mod tests {
 
     async fn scratch() -> (tempfile::TempDir, Db) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = db::open_scratch(&dir.path().join("scenario.db")).await.expect("scratch db");
+        let db = db::open_scratch(&dir.path().join("scenario.db"))
+            .await
+            .expect("scratch db");
         (dir, db)
     }
 
@@ -1999,7 +2126,9 @@ mod tests {
     fn unit(seed: f32) -> Vec<f32> {
         // A deterministic, non-degenerate vector: every component differs, so two
         // different seeds never collide after normalization.
-        (0..EMBED_DIM).map(|i| ((i as f32 * 0.37) + seed).sin()).collect()
+        (0..EMBED_DIM)
+            .map(|i| ((i as f32 * 0.37) + seed).sin())
+            .collect()
     }
 
     // ---- pure functions --------------------------------------------------
@@ -2017,7 +2146,9 @@ mod tests {
     fn an_empty_prior_summary_is_named_rather_than_left_blank() {
         // A blank line there reads to the model as "the summary is the next
         // heading", and it starts summarizing the headings.
-        assert!(summarize_prompt("", "User: hi", 100).contains("=== CURRENT SUMMARY ===\n(none yet)"));
+        assert!(
+            summarize_prompt("", "User: hi", 100).contains("=== CURRENT SUMMARY ===\n(none yet)")
+        );
     }
 
     #[test]
@@ -2081,7 +2212,11 @@ mod tests {
         }
 
         let top = top_k(&q, &ids, &vecs, 4, 0.9);
-        assert_eq!(top.len(), 1, "only the real match clears the floor: {top:?}");
+        assert_eq!(
+            top.len(),
+            1,
+            "only the real match clears the floor: {top:?}"
+        );
         assert_eq!(top[0].0, 2);
     }
 
@@ -2125,7 +2260,10 @@ mod tests {
         let mut v = unit(9.0);
         normalize_in_place(&mut v);
         assert!(top_k(&q, &[1], &v, 4, 0.999).is_empty());
-        assert!(top_k(&q, &[1], &v, 0, -1.0).is_empty(), "k=0 disables retrieval");
+        assert!(
+            top_k(&q, &[1], &v, 0, -1.0).is_empty(),
+            "k=0 disables retrieval"
+        );
     }
 
     #[test]
@@ -2199,8 +2337,14 @@ mod tests {
         // recall unchanged (p=0.30) while cutting accuracy-when-committed from
         // 61.8% to 44.3% (p=0.009) and costing 836 minutes of CPU.
         for (val, want) in [
-            ("", false), ("0", false), ("false", false), ("off", false), ("no", false),
-            ("1", true), ("true", true), ("on", true),
+            ("", false),
+            ("0", false),
+            ("false", false),
+            ("off", false),
+            ("no", false),
+            ("1", true),
+            ("true", true),
+            ("on", true),
         ] {
             let got = !matches!(
                 val.trim().to_ascii_lowercase().as_str(),
@@ -2254,7 +2398,9 @@ mod tests {
     async fn a_conversation_is_created_once_and_read_back() {
         let (_d, db) = scratch().await;
         seed_character(&db, "char1").await;
-        let c = ensure_conversation(&db, "conv1", Some("char1")).await.unwrap();
+        let c = ensure_conversation(&db, "conv1", Some("char1"))
+            .await
+            .unwrap();
         assert_eq!(c.character_id.as_deref(), Some("char1"));
         // Second call must not overwrite or duplicate.
         db.execute(
@@ -2271,7 +2417,9 @@ mod tests {
     async fn an_unknown_character_binding_is_dropped_not_thrown() {
         // The alternative is a foreign-key error mid-chat, which loses the turn.
         let (_d, db) = scratch().await;
-        let c = ensure_conversation(&db, "conv1", Some("ghost")).await.unwrap();
+        let c = ensure_conversation(&db, "conv1", Some("ghost"))
+            .await
+            .unwrap();
         assert_eq!(c.character_id, None);
     }
 
@@ -2280,12 +2428,21 @@ mod tests {
         let (_d, db) = scratch().await;
         ensure_conversation(&db, "conv1", None).await.unwrap();
         for i in 0..20 {
-            add_turn(&db, "conv1", if i % 2 == 0 { "user" } else { "assistant" }, &format!("m{i}"))
-                .await;
+            add_turn(
+                &db,
+                "conv1",
+                if i % 2 == 0 { "user" } else { "assistant" },
+                &format!("m{i}"),
+            )
+            .await;
         }
         let v = get_verbatim_limit(&db, "conv1", 5).await.unwrap();
         assert_eq!(v.len(), 5);
-        assert_eq!(v.first().unwrap().content, "m15", "oldest of the kept window");
+        assert_eq!(
+            v.first().unwrap().content,
+            "m15",
+            "oldest of the kept window"
+        );
         assert_eq!(v.last().unwrap().content, "m19", "and chronological order");
     }
 
@@ -2294,13 +2451,18 @@ mod tests {
         let (_d, db) = scratch().await;
         ensure_conversation(&db, "conv1", None).await.unwrap();
         let user = Message::new("user", "hello");
-        let res = record_turn(&db, "conv1", Some(&user), "hi there", "Aria").await.unwrap();
+        let res = record_turn(&db, "conv1", Some(&user), "hi there", "Aria")
+            .await
+            .unwrap();
         assert_eq!(res, TurnResult::default(), "well under the fold threshold");
 
         let v = get_verbatim(&db, "conv1").await.unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(v[1].content, "hi there");
-        let last = get_last_assistant_turn(&db, "conv1").await.unwrap().unwrap();
+        let last = get_last_assistant_turn(&db, "conv1")
+            .await
+            .unwrap()
+            .unwrap();
         let variants = get_variants(&db, last.id).await.unwrap();
         assert_eq!(variants.variants.len(), 1);
         assert!(variants.variants[0].active);
@@ -2315,7 +2477,9 @@ mod tests {
         let user = Message::new("user", "hello");
         assert!(record_user_turn(&db, "conv1", &user).await.unwrap());
         assert!(!record_user_turn(&db, "conv1", &user).await.unwrap());
-        assert!(!record_user_turn(&db, "conv1", &Message::new("user", "  ")).await.unwrap());
+        assert!(!record_user_turn(&db, "conv1", &Message::new("user", "  "))
+            .await
+            .unwrap());
         assert_eq!(get_verbatim(&db, "conv1").await.unwrap().len(), 1);
     }
 
@@ -2323,21 +2487,44 @@ mod tests {
     async fn a_regenerated_reply_becomes_a_variant_and_replaces_the_turn_text() {
         let (_d, db) = scratch().await;
         ensure_conversation(&db, "conv1", None).await.unwrap();
-        record_turn(&db, "conv1", Some(&Message::new("user", "hi")), "first", "Aria")
+        record_turn(
+            &db,
+            "conv1",
+            Some(&Message::new("user", "hi")),
+            "first",
+            "Aria",
+        )
+        .await
+        .unwrap();
+        let out = record_regeneration(&db, "conv1", "second")
             .await
+            .unwrap()
             .unwrap();
-        let out = record_regeneration(&db, "conv1", "second").await.unwrap().unwrap();
         let v = get_variants(&db, out.turn_id).await.unwrap();
         assert_eq!(v.variants.len(), 2);
         assert_eq!(v.active_index, 1);
         let verbatim = get_verbatim(&db, "conv1").await.unwrap();
-        assert_eq!(verbatim.last().unwrap().content, "second", "the turn mirrors the active variant");
+        assert_eq!(
+            verbatim.last().unwrap().content,
+            "second",
+            "the turn mirrors the active variant"
+        );
 
         // And swiping back rewrites it again.
         let first_id = v.variants[0].id;
-        let back = set_active_variant(&db, "conv1", out.turn_id, first_id).await.unwrap();
+        let back = set_active_variant(&db, "conv1", out.turn_id, first_id)
+            .await
+            .unwrap();
         assert_eq!(back.content, "first");
-        assert_eq!(get_verbatim(&db, "conv1").await.unwrap().last().unwrap().content, "first");
+        assert_eq!(
+            get_verbatim(&db, "conv1")
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .content,
+            "first"
+        );
     }
 
     #[tokio::test]
@@ -2345,19 +2532,32 @@ mod tests {
         let (_d, db) = scratch().await;
         ensure_conversation(&db, "conv1", None).await.unwrap();
         ensure_conversation(&db, "conv2", None).await.unwrap();
-        record_turn(&db, "conv1", None, "reply", "Aria").await.unwrap();
-        let last = get_last_assistant_turn(&db, "conv1").await.unwrap().unwrap();
+        record_turn(&db, "conv1", None, "reply", "Aria")
+            .await
+            .unwrap();
+        let last = get_last_assistant_turn(&db, "conv1")
+            .await
+            .unwrap()
+            .unwrap();
         let v = get_variants(&db, last.id).await.unwrap();
         let err = set_active_variant(&db, "conv2", last.id, v.variants[0].id).await;
-        assert!(err.is_err(), "conv2 must not be able to rewrite conv1's turn");
+        assert!(
+            err.is_err(),
+            "conv2 must not be able to rewrite conv1's turn"
+        );
     }
 
     #[tokio::test]
     async fn regeneration_needs_an_assistant_turn_to_regenerate() {
         let (_d, db) = scratch().await;
         ensure_conversation(&db, "conv1", None).await.unwrap();
-        record_user_turn(&db, "conv1", &Message::new("user", "hi")).await.unwrap();
-        assert!(record_regeneration(&db, "conv1", "x").await.unwrap().is_none());
+        record_user_turn(&db, "conv1", &Message::new("user", "hi"))
+            .await
+            .unwrap();
+        assert!(record_regeneration(&db, "conv1", "x")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2366,7 +2566,10 @@ mod tests {
         ensure_conversation(&db, "conv1", None).await.unwrap();
         db.execute(
             "UPDATE conversations SET summary = ? WHERE id = ?",
-            vec![TValue::Text("what happened before".into()), TValue::Text("conv1".into())],
+            vec![
+                TValue::Text("what happened before".into()),
+                TValue::Text("conv1".into()),
+            ],
         )
         .await
         .unwrap();
@@ -2376,12 +2579,20 @@ mod tests {
         let persona = vec![Message::new("system", "You are Aria.")];
         let director = vec![Message::new("system", "[Keep it short.]")];
         let incoming = vec![Message::new("user", "and now?")];
-        let built = build_context(&db, "conv1", &incoming, &persona, &director).await.unwrap();
+        let built = build_context(&db, "conv1", &incoming, &persona, &director)
+            .await
+            .unwrap();
 
         let roles: Vec<&str> = built.messages.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, ["system", "system", "user", "assistant", "system", "user"]);
+        assert_eq!(
+            roles,
+            ["system", "system", "user", "assistant", "system", "user"]
+        );
         assert!(built.messages[1].content.starts_with(SUMMARY_HEADER));
-        assert_eq!(built.messages[4].content, "[Keep it short.]", "the director note is volatile, so it sits last");
+        assert_eq!(
+            built.messages[4].content, "[Keep it short.]",
+            "the director note is volatile, so it sits last"
+        );
         assert_eq!(built.messages[5].content, "and now?");
         assert_eq!(built.stats.verbatim_count, 2);
         assert_eq!(built.stats.persona_chars, "You are Aria.".len());
@@ -2409,9 +2620,15 @@ mod tests {
         let (_d, db) = scratch().await;
         ensure_conversation(&db, "conv1", None).await.unwrap();
         add_turn(&db, "conv1", "user", "only message").await;
-        let built = build_context(&db, "conv1", &[Message::new("user", "only message")], &[], &[])
-            .await
-            .unwrap();
+        let built = build_context(
+            &db,
+            "conv1",
+            &[Message::new("user", "only message")],
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(built.messages.len(), 1);
         assert_eq!(built.stats.new_user_chars, 0);
     }
@@ -2421,7 +2638,9 @@ mod tests {
         let (_d, db) = scratch().await;
         ensure_conversation(&db, "conv1", None).await.unwrap();
         let incoming = vec![Message::new("user", "   "), Message::new("tool", "x")];
-        let built = build_context(&db, "conv1", &incoming, &[], &[]).await.unwrap();
+        let built = build_context(&db, "conv1", &incoming, &[], &[])
+            .await
+            .unwrap();
         assert!(built.latest_user.is_none());
         assert!(built.messages.is_empty());
     }
@@ -2430,7 +2649,9 @@ mod tests {
     async fn the_sidebar_query_reports_counts_without_reading_the_summary() {
         let (_d, db) = scratch().await;
         seed_character(&db, "char1").await;
-        ensure_conversation(&db, "conv1", Some("char1")).await.unwrap();
+        ensure_conversation(&db, "conv1", Some("char1"))
+            .await
+            .unwrap();
         ensure_conversation(&db, "conv2", None).await.unwrap();
         add_turn(&db, "conv1", "user", "hello world").await;
         db.execute(
@@ -2460,13 +2681,20 @@ mod tests {
     async fn the_inspector_view_attaches_variants_only_to_the_latest_reply() {
         let (_d, db) = scratch().await;
         ensure_conversation(&db, "conv1", None).await.unwrap();
-        record_turn(&db, "conv1", Some(&Message::new("user", "a")), "b", "Aria").await.unwrap();
-        record_turn(&db, "conv1", Some(&Message::new("user", "c")), "d", "Aria").await.unwrap();
+        record_turn(&db, "conv1", Some(&Message::new("user", "a")), "b", "Aria")
+            .await
+            .unwrap();
+        record_turn(&db, "conv1", Some(&Message::new("user", "c")), "d", "Aria")
+            .await
+            .unwrap();
         record_regeneration(&db, "conv1", "d2").await.unwrap();
 
         let detail = get_conversation(&db, "conv1").await.unwrap().unwrap();
         assert_eq!(detail.verbatim.len(), 4);
-        assert!(detail.verbatim[1].variants.is_none(), "the older reply is not swipeable");
+        assert!(
+            detail.verbatim[1].variants.is_none(),
+            "the older reply is not swipeable"
+        );
         assert_eq!(detail.verbatim[3].variants.as_ref().unwrap().len(), 2);
         assert_eq!(detail.verbatim[3].active_index, Some(1));
     }
@@ -2585,7 +2813,11 @@ mod tests {
         .await
         .unwrap();
         load_archive_vectors(&db, "conv1", &mut e).await.unwrap();
-        assert_eq!(e.ids.len(), 3, "the cache rebuilt rather than kept a dead vector");
+        assert_eq!(
+            e.ids.len(),
+            3,
+            "the cache rebuilt rather than kept a dead vector"
+        );
         assert_eq!(e.vecs.len(), 3 * EMBED_DIM);
     }
 
@@ -2603,7 +2835,10 @@ mod tests {
         .unwrap();
         load_archive_vectors(&db, "conv1", &mut e).await.unwrap();
         assert!(e.ids.is_empty(), "not retrievable");
-        assert_eq!(e.rows_seen, 1, "but counted, or the next pass rebuilds forever");
+        assert_eq!(
+            e.rows_seen, 1,
+            "but counted, or the next pass rebuilds forever"
+        );
     }
 
     #[tokio::test]
@@ -2636,7 +2871,10 @@ mod tests {
         assert!(!held.timed_out);
         // A second acquire cannot proceed while the first is held.
         let blocked = acquire_lock("lock-conv", Duration::from_millis(50)).await;
-        assert!(blocked.timed_out, "waiting past the deadline proceeds unlocked");
+        assert!(
+            blocked.timed_out,
+            "waiting past the deadline proceeds unlocked"
+        );
         drop(held);
         drop(blocked);
         let after = acquire_lock("lock-conv", Duration::from_millis(200)).await;
@@ -2670,7 +2908,11 @@ mod tests {
         state.rerun.store(false, Ordering::SeqCst);
         let res = run_maintenance(&db, "conv1", "Aria", &state).await;
         assert!(res.is_err() || res.unwrap().archived == 0);
-        assert_eq!(turn_count(&db, "conv1").await.unwrap(), before, "no rows moved");
+        assert_eq!(
+            turn_count(&db, "conv1").await.unwrap(),
+            before,
+            "no rows moved"
+        );
     }
 
     #[tokio::test]

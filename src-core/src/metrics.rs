@@ -198,7 +198,10 @@ fn prefix_reuse(st: &mut Store, conversation_id: &str, messages: Vec<Message>) -
     if total == 0 {
         return None;
     }
-    Some(round_to(shared_prefix_chars(&prev, cur) as f64 / total as f64, 3))
+    Some(round_to(
+        shared_prefix_chars(&prev, cur) as f64 / total as f64,
+        3,
+    ))
 }
 
 pub fn forget_conversation(conversation_id: &str) {
@@ -273,7 +276,11 @@ fn pct(sorted: &[f64], p: f64) -> Option<f64> {
 }
 
 fn sorted_by<F: Fn(&Record) -> Option<f64>>(recs: &[&Record], f: F) -> Vec<f64> {
-    let mut v: Vec<f64> = recs.iter().filter_map(|r| f(r)).filter(|x| x.is_finite()).collect();
+    let mut v: Vec<f64> = recs
+        .iter()
+        .filter_map(|r| f(r))
+        .filter(|x| x.is_finite())
+        .collect();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     v
 }
@@ -366,7 +373,11 @@ mod tests {
         assert_eq!(ms_of(Some(123_456)), 0.1);
         assert_eq!(ms_of(None), 0.0);
         assert_eq!(tps(40, Some(1_000_000_000)), Some(40.0));
-        assert_eq!(tps(40, Some(0)), None, "a missing duration is not zero tok/s");
+        assert_eq!(
+            tps(40, Some(0)),
+            None,
+            "a missing duration is not zero tok/s"
+        );
     }
 
     #[test]
@@ -450,7 +461,10 @@ mod tests {
         let s = summarize(&recs.iter().collect::<Vec<_>>());
         assert_eq!(s["samples"], 3);
         assert_eq!(s["promptTokens"]["max"], 300.0);
-        assert_eq!(s["reloads"], 1, "only the record that reloaded weights counts");
+        assert_eq!(
+            s["reloads"], 1,
+            "only the record that reloaded weights counts"
+        );
         assert!(s["cacheReuse"].is_null(), "no backend reported KV reuse");
     }
 }

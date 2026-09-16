@@ -69,7 +69,10 @@ pub struct Message {
 
 impl Message {
     pub fn new(role: &str, content: impl Into<String>) -> Self {
-        Self { role: role.to_string(), content: content.into() }
+        Self {
+            role: role.to_string(),
+            content: content.into(),
+        }
     }
 }
 
@@ -160,7 +163,11 @@ pub trait Engine {
     fn honours_model(&self) -> bool;
     fn describe(&self) -> Json;
 
-    async fn chat_stream(&self, messages: Vec<Message>, options: &Map<String, Json>) -> Result<ChatStart>;
+    async fn chat_stream(
+        &self,
+        messages: Vec<Message>,
+        options: &Map<String, Json>,
+    ) -> Result<ChatStart>;
     async fn generate(&self, model: &str, prompt: &str, opts: GenOpts) -> Result<String>;
     async fn embed(&self, model: &str, text: &str, opts: EmbedOpts) -> Result<Vec<f32>>;
 }
@@ -215,7 +222,11 @@ impl Engine for Backend {
     fn describe(&self) -> Json {
         dispatch!(self, describe())
     }
-    async fn chat_stream(&self, messages: Vec<Message>, options: &Map<String, Json>) -> Result<ChatStart> {
+    async fn chat_stream(
+        &self,
+        messages: Vec<Message>,
+        options: &Map<String, Json>,
+    ) -> Result<ChatStart> {
         dispatch!(async self, chat_stream(messages, options))
     }
     async fn generate(&self, model: &str, prompt: &str, opts: GenOpts) -> Result<String> {
@@ -331,7 +342,9 @@ pub async fn probe_context() -> Option<u32> {
         // finished loading rather than echoing the config back.
         return b.probe_ctx().await;
     }
-    let Backend::LlamaServer(_) = chat else { return None };
+    let Backend::LlamaServer(_) = chat else {
+        return None;
+    };
     let res = util::client()
         .get(format!("{}/props", chat.host()))
         .timeout(std::time::Duration::from_millis(1500))
@@ -391,9 +404,19 @@ mod tests {
     #[test]
     fn an_unset_or_blank_backend_takes_the_fallback() {
         std::env::set_var("VESSEL_TEST_BACKEND2", "   ");
-        assert_eq!(pick("VESSEL_TEST_BACKEND2", "ollama").map(|b| b.name()).unwrap_or("err"), "ollama");
+        assert_eq!(
+            pick("VESSEL_TEST_BACKEND2", "ollama")
+                .map(|b| b.name())
+                .unwrap_or("err"),
+            "ollama"
+        );
         std::env::remove_var("VESSEL_TEST_BACKEND2");
-        assert_eq!(pick("VESSEL_TEST_BACKEND2", "llama-server").map(|b| b.name()).unwrap_or("err"), "llama-server");
+        assert_eq!(
+            pick("VESSEL_TEST_BACKEND2", "llama-server")
+                .map(|b| b.name())
+                .unwrap_or("err"),
+            "llama-server"
+        );
     }
 
     #[test]

@@ -59,7 +59,10 @@ pub fn db_encryption_key_override() -> String {
 
 /// Seconds between background push+pull. 0 disables the heartbeat.
 pub fn sync_interval_secs() -> u64 {
-    match env::var("TURSO_SYNC_INTERVAL").ok().and_then(|v| v.parse::<i64>().ok()) {
+    match env::var("TURSO_SYNC_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+    {
         Some(v) if v >= 0 => v as u64,
         _ => 60,
     }

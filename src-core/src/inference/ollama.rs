@@ -62,7 +62,11 @@ impl Engine for Ollama {
         })
     }
 
-    async fn chat_stream(&self, messages: Vec<Message>, options: &Map<String, Json>) -> Result<ChatStart> {
+    async fn chat_stream(
+        &self,
+        messages: Vec<Message>,
+        options: &Map<String, Json>,
+    ) -> Result<ChatStart> {
         let res = client()
             .post(self.chat_url())
             .json(&json!({
@@ -95,14 +99,21 @@ impl Engine for Ollama {
         if let Some(n) = opts.num_gpu {
             options.insert("num_gpu".into(), json!(n));
         }
-        let req = client().post(format!("{}/api/generate", self.host)).json(&json!({
-            "model": model,
-            "prompt": prompt,
-            "stream": false,
-            "options": options,
-        }));
+        let req = client()
+            .post(format!("{}/api/generate", self.host))
+            .json(&json!({
+                "model": model,
+                "prompt": prompt,
+                "stream": false,
+                "options": options,
+            }));
         let data: Json = fetch_retry(req, 3).await?.json().await?;
-        Ok(data.get("response").and_then(Json::as_str).unwrap_or("").trim().to_string())
+        Ok(data
+            .get("response")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string())
     }
 
     async fn embed(&self, model: &str, text: &str, opts: EmbedOpts) -> Result<Vec<f32>> {
@@ -110,7 +121,9 @@ impl Engine for Ollama {
         if let Some(n) = opts.num_gpu {
             body["options"] = json!({ "num_gpu": n });
         }
-        let req = client().post(format!("{}/api/embeddings", self.host)).json(&body);
+        let req = client()
+            .post(format!("{}/api/embeddings", self.host))
+            .json(&body);
         let data: Json = fetch_retry(req, 3).await?.json().await?;
         let vec: Vec<f32> = match data.get("embedding") {
             Some(Json::Array(a)) if !a.is_empty() => {
@@ -160,16 +173,25 @@ fn parse_line(line: &str) -> Option<StreamEvent> {
     }
     // Forward, do not interpret: an unparseable line is still the wire.
     let Ok(obj) = serde_json::from_str::<Json>(line) else {
-        return Some(StreamEvent::Chunk { raw: line.to_string(), delta: String::new() });
+        return Some(StreamEvent::Chunk {
+            raw: line.to_string(),
+            delta: String::new(),
+        });
     };
     if let Some(e) = obj.get("error") {
         return Some(StreamEvent::Error {
-            message: e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string()),
+            message: e
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| e.to_string()),
         });
     }
     if obj.get("done") == Some(&Json::Bool(true)) {
         let stats: DoneStats = serde_json::from_value(obj).unwrap_or_default();
-        return Some(StreamEvent::Done { raw: line.to_string(), stats: Box::new(stats) });
+        return Some(StreamEvent::Done {
+            raw: line.to_string(),
+            stats: Box::new(stats),
+        });
     }
     let delta = obj
         .get("message")
@@ -177,7 +199,10 @@ fn parse_line(line: &str) -> Option<StreamEvent> {
         .and_then(Json::as_str)
         .unwrap_or("")
         .to_string();
-    Some(StreamEvent::Chunk { raw: line.to_string(), delta })
+    Some(StreamEvent::Chunk {
+        raw: line.to_string(),
+        delta,
+    })
 }
 
 #[cfg(test)]
@@ -186,7 +211,8 @@ mod tests {
 
     #[test]
     fn a_content_chunk_yields_its_delta_and_the_untouched_line() {
-        let line = r#"{"model":"vessel","message":{"role":"assistant","content":"Hi"},"done":false}"#;
+        let line =
+            r#"{"model":"vessel","message":{"role":"assistant","content":"Hi"},"done":false}"#;
         match parse_line(line).unwrap() {
             StreamEvent::Chunk { raw, delta } => {
                 assert_eq!(delta, "Hi");

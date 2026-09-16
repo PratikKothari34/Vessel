@@ -93,7 +93,8 @@ impl LlamaServer {
             // GGUF. The selector keeps the embedder on Ollama by default so the
             // chat swap can be tested on its own.
             embed_host: trim_slash(
-                &std::env::var("LLAMA_EMBED_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".into()),
+                &std::env::var("LLAMA_EMBED_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:8081".into()),
             ),
             model: std::env::var("LLAMA_CHAT_MODEL")
                 .or_else(|_| std::env::var("OLLAMA_MODEL"))
@@ -151,7 +152,11 @@ fn translate_sampling(options: &Map<String, Json>, out: &mut Map<String, Json>) 
 /// summed here - otherwise "promptTokens p95 vs num_ctx", the number that
 /// decides the window size, would silently shrink by whatever the cache
 /// absorbed.
-fn done_stats(timings: Option<&Json>, usage: Option<&Json>, finish_reason: Option<&str>) -> DoneStats {
+fn done_stats(
+    timings: Option<&Json>,
+    usage: Option<&Json>,
+    finish_reason: Option<&str>,
+) -> DoneStats {
     let num = |o: Option<&Json>, k: &str| o.and_then(|t| t.get(k)).and_then(Json::as_f64);
     let int = |o: Option<&Json>, k: &str| o.and_then(|t| t.get(k)).and_then(Json::as_u64);
 
@@ -213,7 +218,11 @@ impl Engine for LlamaServer {
         })
     }
 
-    async fn chat_stream(&self, messages: Vec<Message>, options: &Map<String, Json>) -> Result<ChatStart> {
+    async fn chat_stream(
+        &self,
+        messages: Vec<Message>,
+        options: &Map<String, Json>,
+    ) -> Result<ChatStart> {
         let mut sampling = Map::new();
         // Modelfile first, request second: a character own sampling still wins,
         // exactly as it does on Ollama.
@@ -246,7 +255,10 @@ impl Engine for LlamaServer {
             return Ok(ChatStart::Refused { status, detail });
         }
 
-        Ok(ChatStart::Streaming(Box::pin(iterate(res, self.model.clone()))))
+        Ok(ChatStart::Streaming(Box::pin(iterate(
+            res,
+            self.model.clone(),
+        ))))
     }
 
     /// Deliberately the chat endpoint and not `/completion`: Ollama's
@@ -258,7 +270,9 @@ impl Engine for LlamaServer {
         if let Some(n) = opts.num_ctx.filter(|n| *n > 0) {
             warn_once(
                 "gen_num_ctx",
-                &format!("llama-server: summarizer num_ctx={n} ignored - one process, one window (-c)."),
+                &format!(
+                    "llama-server: summarizer num_ctx={n} ignored - one process, one window (-c)."
+                ),
             );
         }
         let req = client()
@@ -295,7 +309,9 @@ impl Engine for LlamaServer {
     async fn embed(&self, model: &str, text: &str, _opts: EmbedOpts) -> Result<Vec<f32>> {
         let req = client()
             .post(format!("{}/v1/embeddings", self.embed_host))
-            .json(&json!({ "model": if model.is_empty() { "embed" } else { model }, "input": text }));
+            .json(
+                &json!({ "model": if model.is_empty() { "embed" } else { model }, "input": text }),
+            );
         let data: Json = fetch_retry(req, 3).await?.json().await?;
         let row = data.get("data").and_then(|d| d.get(0));
         let mut vec = row.and_then(|r| r.get("embedding"));
@@ -336,7 +352,10 @@ struct Tail {
     saw_done: bool,
 }
 
-fn iterate(res: reqwest::Response, model: String) -> impl futures_util::Stream<Item = StreamEvent> + Send {
+fn iterate(
+    res: reqwest::Response,
+    model: String,
+) -> impl futures_util::Stream<Item = StreamEvent> + Send {
     stream! {
         let mut body = res.bytes_stream();
         let mut buffer = Vec::<u8>::new();
@@ -424,14 +443,20 @@ fn frame(payload: &str, tail: &mut Tail, chunk: &LlamaServerChunk) -> Vec<Stream
         return Vec::new();
     }
     // Keepalive or partial: not an error, just nothing to report.
-    let Ok(obj) = serde_json::from_str::<Json>(payload) else { return Vec::new() };
+    let Ok(obj) = serde_json::from_str::<Json>(payload) else {
+        return Vec::new();
+    };
 
     if let Some(e) = obj.get("error") {
         let message = e
             .get("message")
             .and_then(Json::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string()));
+            .unwrap_or_else(|| {
+                e.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| e.to_string())
+            });
         return vec![StreamEvent::Error { message }];
     }
     if let Some(t) = obj.get("timings") {
@@ -442,13 +467,22 @@ fn frame(payload: &str, tail: &mut Tail, chunk: &LlamaServerChunk) -> Vec<Stream
             tail.usage = Some(u.clone());
         }
     }
-    let Some(choice) = obj.get("choices").and_then(|c| c.get(0)) else { return Vec::new() };
+    let Some(choice) = obj.get("choices").and_then(|c| c.get(0)) else {
+        return Vec::new();
+    };
     if let Some(r) = choice.get("finish_reason").and_then(Json::as_str) {
         tail.finish_reason = Some(r.to_string());
     }
-    match choice.get("delta").and_then(|d| d.get("content")).and_then(Json::as_str) {
+    match choice
+        .get("delta")
+        .and_then(|d| d.get("content"))
+        .and_then(Json::as_str)
+    {
         Some(text) if !text.is_empty() => {
-            vec![StreamEvent::Chunk { raw: chunk.content(text), delta: text.to_string() }]
+            vec![StreamEvent::Chunk {
+                raw: chunk.content(text),
+                delta: text.to_string(),
+            }]
         }
         _ => Vec::new(),
     }
@@ -459,7 +493,10 @@ mod tests {
     use super::*;
 
     fn map(pairs: &[(&str, Json)]) -> Map<String, Json> {
-        pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
     }
 
     #[test]
@@ -483,7 +520,10 @@ mod tests {
     fn the_context_window_and_unknown_keys_are_dropped_not_forwarded() {
         // Forwarding either one gets a 400 from llama.cpp mid-conversation.
         let mut out = Map::new();
-        translate_sampling(&map(&[("num_ctx", json!(32768)), ("nonsense", json!(1))]), &mut out);
+        translate_sampling(
+            &map(&[("num_ctx", json!(32768)), ("nonsense", json!(1))]),
+            &mut out,
+        );
         assert!(out.is_empty(), "{out:?}");
     }
 
@@ -535,7 +575,12 @@ mod tests {
     fn absent_telemetry_is_absent_rather_than_null() {
         let s = done_stats(None, None, None);
         let raw: Json = serde_json::from_str(&ollama_done("vessel", &s)).unwrap();
-        for key in ["prompt_eval_count", "eval_count", "cached_tokens", "prompt_eval_duration"] {
+        for key in [
+            "prompt_eval_count",
+            "eval_count",
+            "cached_tokens",
+            "prompt_eval_duration",
+        ] {
             assert!(raw.get(key).is_none(), "{key} should be absent, got {raw}");
         }
     }
@@ -556,7 +601,9 @@ mod tests {
     #[test]
     fn a_delta_becomes_an_ollama_shaped_chunk() {
         let mut tail = Tail::default();
-        let c = LlamaServerChunk { model: "vessel".into() };
+        let c = LlamaServerChunk {
+            model: "vessel".into(),
+        };
         let evts = frame(
             r#"{"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#,
             &mut tail,
@@ -576,7 +623,9 @@ mod tests {
     #[test]
     fn the_terminator_is_recorded_but_emits_nothing() {
         let mut tail = Tail::default();
-        let c = LlamaServerChunk { model: "vessel".into() };
+        let c = LlamaServerChunk {
+            model: "vessel".into(),
+        };
         assert!(frame("[DONE]", &mut tail, &c).is_empty());
         assert!(tail.saw_done);
     }

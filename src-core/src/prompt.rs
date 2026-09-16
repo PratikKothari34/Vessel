@@ -30,7 +30,14 @@ use crate::inference::Message;
 /// The Modelfile's `SYSTEM`, read once.
 pub fn global_behavior() -> &'static str {
     static GB: OnceLock<String> = OnceLock::new();
-    GB.get_or_init(|| modelfile::load().system.as_deref().unwrap_or_default().trim().to_string())
+    GB.get_or_init(|| {
+        modelfile::load()
+            .system
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    })
 }
 
 /// Appended to EVERY persona message, whatever the response style.
@@ -131,11 +138,14 @@ mod tests {
     #[test]
     fn the_persona_names_the_character_in_the_boundary_rule() {
         // The abstract rule alone does not hold; the name is what makes it stick.
-        let m = persona_message(Some(&character("Aria", "A lighthouse keeper.", "balanced"))).unwrap();
+        let m =
+            persona_message(Some(&character("Aria", "A lighthouse keeper.", "balanced"))).unwrap();
         assert_eq!(m.role, "system");
         assert!(m.content.contains("roleplaying as the character \"Aria\""));
         assert!(m.content.contains("Control ONLY Aria."));
-        assert!(m.content.contains("Character details:\nA lighthouse keeper."));
+        assert!(m
+            .content
+            .contains("Character details:\nA lighthouse keeper."));
     }
 
     #[test]
@@ -150,7 +160,9 @@ mod tests {
     fn the_format_rule_is_last_because_the_tail_is_what_the_model_obeys() {
         let m = persona_message(Some(&character("Aria", "x", "dialogue"))).unwrap();
         assert!(m.content.trim_end().ends_with("then stop and wait."));
-        assert!(m.content.contains("ALWAYS give the character spoken dialogue"));
+        assert!(m
+            .content
+            .contains("ALWAYS give the character spoken dialogue"));
         let style_at = m.content.find("Response style:").unwrap();
         let format_at = m.content.find("Formatting (REQUIRED)").unwrap();
         assert!(style_at < format_at);

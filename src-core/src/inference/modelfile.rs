@@ -141,7 +141,9 @@ pub fn parse(text: &str) -> Modelfile {
         }
         if let Some(v) = strip_keyword(l, "PARAMETER") {
             let mut it = v.splitn(2, char::is_whitespace);
-            let (Some(key), Some(val)) = (it.next(), it.next()) else { continue };
+            let (Some(key), Some(val)) = (it.next(), it.next()) else {
+                continue;
+            };
             let key = key.to_ascii_lowercase();
             let val = coerce(val.trim());
             // `stop` is the one key Ollama allows more than once; it accumulates
@@ -187,7 +189,11 @@ pub fn load() -> &'static Modelfile {
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_path());
         match std::fs::read_to_string(&p) {
-            Ok(text) => Modelfile { path: p, found: true, ..parse(&text) },
+            Ok(text) => Modelfile {
+                path: p,
+                found: true,
+                ..parse(&text)
+            },
             Err(e) => Modelfile {
                 path: p,
                 found: false,
@@ -246,10 +252,18 @@ mod tests {
         // Guards the actual file, because dropping these silently changes what
         // the model is on the llama-server backend.
         let m = load();
-        assert!(m.found, "Modelfile not found at {:?}: {:?}", m.path, m.error);
+        assert!(
+            m.found,
+            "Modelfile not found at {:?}: {:?}",
+            m.path, m.error
+        );
         for key in ["num_ctx", "temperature", "top_p", "min_p", "repeat_penalty"] {
             assert!(m.params.contains_key(key), "missing PARAMETER {key}");
         }
-        assert!(m.system.as_deref().unwrap_or("").contains("ONLY your own character"));
+        assert!(m
+            .system
+            .as_deref()
+            .unwrap_or("")
+            .contains("ONLY your own character"));
     }
 }

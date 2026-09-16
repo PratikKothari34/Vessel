@@ -29,14 +29,27 @@ async fn a_turn_streams_then_records_in_that_order() {
     let id = out.expect("the turn should succeed");
 
     let kinds = sink.kinds();
-    assert_eq!(kinds.first(), Some(&"meta"), "meta must arrive before any token");
+    assert_eq!(
+        kinds.first(),
+        Some(&"meta"),
+        "meta must arrive before any token"
+    );
     assert_eq!(kinds.last(), Some(&"done"), "done must be the terminator");
-    assert!(kinds.iter().filter(|k| **k == "meta").count() == 1, "exactly one meta");
-    assert!(kinds.iter().filter(|k| **k == "done").count() == 1, "exactly one done");
+    assert!(
+        kinds.iter().filter(|k| **k == "meta").count() == 1,
+        "exactly one meta"
+    );
+    assert!(
+        kinds.iter().filter(|k| **k == "done").count() == 1,
+        "exactly one done"
+    );
     assert_eq!(sink.text(), "Hello there friend.");
 
     // Recorded only after the stream closed, which is why it is readable now.
-    let conv = memory::get_conversation(&db, &id).await.unwrap().expect("conversation");
+    let conv = memory::get_conversation(&db, &id)
+        .await
+        .unwrap()
+        .expect("conversation");
     let roles: Vec<&str> = conv.verbatim.iter().map(|t| t.role.as_str()).collect();
     assert_eq!(roles, ["user", "assistant"], "one exchange, in order");
     assert_eq!(conv.verbatim[0].content, "Hello?");
@@ -52,7 +65,10 @@ async fn the_generation_is_measured_even_though_nothing_was_logged() {
     let snap = metrics::snapshot(10, Some(&id));
     let recent = snap["recent"].as_array().expect("recent");
     assert_eq!(recent.len(), 1);
-    assert_eq!(recent[0]["promptTokens"], 120, "the done chunk's numbers are kept");
+    assert_eq!(
+        recent[0]["promptTokens"], 120,
+        "the done chunk's numbers are kept"
+    );
     assert_eq!(recent[0]["evalTokens"], 8);
     assert_eq!(recent[0]["backend"], "ollama");
     assert_eq!(recent[0]["aborted"], false);
@@ -74,7 +90,10 @@ async fn an_engine_that_refuses_leaves_no_conversation_behind() {
 
     let err = out.expect_err("a 404 from the engine is not a successful turn");
     assert_eq!(err.kind, ErrorKind::NotFound);
-    assert!(sink.kinds().is_empty(), "nothing may be streamed before the engine answers");
+    assert!(
+        sink.kinds().is_empty(),
+        "nothing may be streamed before the engine answers"
+    );
     assert!(
         memory::get_conversation(&db, &id).await.unwrap().is_none(),
         "the row this request created must be swept away"
@@ -100,25 +119,42 @@ async fn a_stopped_generation_keeps_what_was_written() {
             break;
         }
     }
-    assert!(!sink.text().is_empty(), "the mock should have sent a chunk by now");
-    assert_eq!(chat::cancel(&id), 1, "the stream must be registered under its conversation");
+    assert!(
+        !sink.text().is_empty(),
+        "the mock should have sent a chunk by now"
+    );
+    assert_eq!(
+        chat::cancel(&id),
+        1,
+        "the stream must be registered under its conversation"
+    );
 
     let out = tokio::time::timeout(Duration::from_secs(10), task)
         .await
         .expect("a cancelled turn must not wait out the generation")
         .expect("task");
     assert_eq!(out.expect("a stop is not a failure"), id);
-    assert_eq!(sink.kinds().last(), Some(&"done"), "a stopped stream still terminates");
+    assert_eq!(
+        sink.kinds().last(),
+        Some(&"done"),
+        "a stopped stream still terminates"
+    );
 
     // Nothing on screen may silently vanish on reload: the partial reply is
     // recorded, not discarded.
-    let conv = memory::get_conversation(&db, &id).await.unwrap().expect("conversation");
+    let conv = memory::get_conversation(&db, &id)
+        .await
+        .unwrap()
+        .expect("conversation");
     assert_eq!(conv.verbatim.len(), 2);
     assert_eq!(conv.verbatim[1].role, "assistant");
     assert!(!conv.verbatim[1].content.is_empty());
 
     let snap = metrics::snapshot(10, Some(&id));
-    assert_eq!(snap["recent"][0]["aborted"], true, "an aborted turn is recorded as one");
+    assert_eq!(
+        snap["recent"][0]["aborted"], true,
+        "an aborted turn is recorded as one"
+    );
 }
 
 #[tokio::test]
@@ -136,11 +172,25 @@ async fn a_regenerated_reply_becomes_a_second_variant_of_the_same_turn() {
     assert_eq!(out.expect("regenerate"), id);
     assert_eq!(sink.text(), "Hello there friend.");
 
-    let conv = memory::get_conversation(&db, &id).await.unwrap().expect("conversation");
-    assert_eq!(conv.verbatim.len(), 2, "a re-roll replaces the reply, it does not append one");
-    let variants = conv.verbatim[1].variants.as_ref().expect("the latest reply carries variants");
+    let conv = memory::get_conversation(&db, &id)
+        .await
+        .unwrap()
+        .expect("conversation");
+    assert_eq!(
+        conv.verbatim.len(),
+        2,
+        "a re-roll replaces the reply, it does not append one"
+    );
+    let variants = conv.verbatim[1]
+        .variants
+        .as_ref()
+        .expect("the latest reply carries variants");
     assert_eq!(variants.len(), 2, "the original and the re-roll");
-    assert_eq!(conv.verbatim[1].active_index, Some(1), "the newest is the active one");
+    assert_eq!(
+        conv.verbatim[1].active_index,
+        Some(1),
+        "the newest is the active one"
+    );
 }
 
 #[tokio::test]
@@ -171,11 +221,17 @@ async fn a_director_note_steers_without_becoming_a_turn() {
     let (out, _) = run(req).await;
     assert_eq!(out.expect("director-only turn"), id);
 
-    let conv = memory::get_conversation(&db, &id).await.unwrap().expect("conversation");
+    let conv = memory::get_conversation(&db, &id)
+        .await
+        .unwrap()
+        .expect("conversation");
     let roles: Vec<&str> = conv.verbatim.iter().map(|t| t.role.as_str()).collect();
     // The note itself is never stored; the reply it produced is.
     assert_eq!(roles, ["user", "assistant", "assistant"]);
-    assert!(!conv.verbatim.iter().any(|t| t.content.contains("be colder")));
+    assert!(!conv
+        .verbatim
+        .iter()
+        .any(|t| t.content.contains("be colder")));
 }
 
 #[tokio::test]
@@ -211,7 +267,10 @@ async fn a_character_that_no_longer_exists_reports_itself_instead_of_a_foreign_k
 
     let err = out.expect_err("a deleted character cannot be chatted with");
     assert_eq!(err.kind, ErrorKind::NotFound);
-    assert!(err.character_id.is_some(), "the UI needs to know WHICH character is gone");
+    assert!(
+        err.character_id.is_some(),
+        "the UI needs to know WHICH character is gone"
+    );
     assert!(memory::get_conversation(&db, &id).await.unwrap().is_none());
 }
 
@@ -229,12 +288,27 @@ async fn an_error_after_the_first_token_is_reported_and_nothing_is_recorded() {
     };
     let (out, sink) = run(req).await;
 
-    assert_eq!(out.expect("the stream opened, so the call itself succeeded"), sink.conv_id());
-    assert_eq!(sink.text(), "Partial", "what arrived before the failure is still shown");
+    assert_eq!(
+        out.expect("the stream opened, so the call itself succeeded"),
+        sink.conv_id()
+    );
+    assert_eq!(
+        sink.text(),
+        "Partial",
+        "what arrived before the failure is still shown"
+    );
     let errors = sink.errors();
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("an error was encountered"), "got {:?}", errors[0]);
-    assert_eq!(sink.kinds().last(), Some(&"done"), "the stream still terminates");
+    assert!(
+        errors[0].contains("an error was encountered"),
+        "got {:?}",
+        errors[0]
+    );
+    assert_eq!(
+        sink.kinds().last(),
+        Some(&"done"),
+        "the stream still terminates"
+    );
 
     assert!(
         memory::get_conversation(&db, &id).await.unwrap().is_none(),
@@ -267,16 +341,27 @@ async fn folding_runs_in_the_background_and_the_summary_lands() {
     }
     memory::await_all_maintenance().await;
 
-    let conv = memory::get_conversation(&db, &id).await.unwrap().expect("conversation");
-    assert!(!conv.summary.is_empty(), "the fold should have written a summary");
-    assert!(!conv.archive.is_empty(), "and moved the oldest turns to the archive");
+    let conv = memory::get_conversation(&db, &id)
+        .await
+        .unwrap()
+        .expect("conversation");
+    assert!(
+        !conv.summary.is_empty(),
+        "the fold should have written a summary"
+    );
+    assert!(
+        !conv.archive.is_empty(),
+        "and moved the oldest turns to the archive"
+    );
     assert!(
         conv.archive.iter().all(|t| t.has_embedding),
         "every archived turn needs a vector, or it can never be recalled"
     );
-    assert!(conv.verbatim.len() <= 4, "the verbatim window stays bounded");
+    assert!(
+        conv.verbatim.len() <= 4,
+        "the verbatim window stays bounded"
+    );
 }
-
 
 // ---- Variants on a turn that has none -------------------------------------
 
@@ -284,9 +369,12 @@ async fn folding_runs_in_the_background_and_the_summary_lands() {
 /// or one pulled from an older synced database -- arrives in. Migrations add
 /// columns; they never back-fill rows.
 async fn strip_variants(db: &db::Db, turn_id: i64) {
-    db.execute("DELETE FROM variants WHERE turn_id = ?", vec![TValue::Integer(turn_id)])
-        .await
-        .expect("strip variants");
+    db.execute(
+        "DELETE FROM variants WHERE turn_id = ?",
+        vec![TValue::Integer(turn_id)],
+    )
+    .await
+    .expect("strip variants");
 }
 
 #[tokio::test]
@@ -298,19 +386,39 @@ async fn regenerating_a_turn_with_no_variant_rows_preserves_the_original_reply()
     // one it destroyed, and the swipe led nowhere.
     let db = open().await;
     let id = memory::new_id();
-    memory::ensure_conversation(&db, &id, None).await.expect("conversation");
-    memory::record_turn(&db, &id, None, "the reply that predates variants", "Character")
+    memory::ensure_conversation(&db, &id, None)
         .await
-        .expect("record");
+        .expect("conversation");
+    memory::record_turn(
+        &db,
+        &id,
+        None,
+        "the reply that predates variants",
+        "Character",
+    )
+    .await
+    .expect("record");
 
-    let last = memory::get_last_assistant_turn(&db, &id).await.unwrap().expect("a reply");
+    let last = memory::get_last_assistant_turn(&db, &id)
+        .await
+        .unwrap()
+        .expect("a reply");
     strip_variants(&db, last.id).await;
 
-    memory::record_regeneration(&db, &id, "the second roll").await.expect("regenerate");
+    memory::record_regeneration(&db, &id, "the second roll")
+        .await
+        .expect("regenerate");
 
     let v = memory::get_variants(&db, last.id).await.expect("variants");
-    assert_eq!(v.variants.len(), 2, "the base was back-filled, not overwritten");
-    assert_eq!(v.variants[0].content, "the reply that predates variants", "the original survived");
+    assert_eq!(
+        v.variants.len(),
+        2,
+        "the base was back-filled, not overwritten"
+    );
+    assert_eq!(
+        v.variants[0].content, "the reply that predates variants",
+        "the original survived"
+    );
     assert_eq!(v.variants[1].content, "the second roll");
     assert_eq!(v.active_index, 1, "the newest roll is the active one");
 }
@@ -321,13 +429,26 @@ async fn a_back_filled_original_can_still_be_swiped_back_to() {
     // user can return to the reply the regeneration replaced.
     let db = open().await;
     let id = memory::new_id();
-    memory::ensure_conversation(&db, &id, None).await.expect("conversation");
-    memory::record_turn(&db, &id, None, "the reply that predates variants", "Character")
+    memory::ensure_conversation(&db, &id, None)
         .await
-        .expect("record");
-    let last = memory::get_last_assistant_turn(&db, &id).await.unwrap().expect("a reply");
+        .expect("conversation");
+    memory::record_turn(
+        &db,
+        &id,
+        None,
+        "the reply that predates variants",
+        "Character",
+    )
+    .await
+    .expect("record");
+    let last = memory::get_last_assistant_turn(&db, &id)
+        .await
+        .unwrap()
+        .expect("a reply");
     strip_variants(&db, last.id).await;
-    memory::record_regeneration(&db, &id, "the second roll").await.expect("regenerate");
+    memory::record_regeneration(&db, &id, "the second roll")
+        .await
+        .expect("regenerate");
 
     let v = memory::get_variants(&db, last.id).await.expect("variants");
     let back = memory::set_active_variant(&db, &id, last.id, v.variants[0].id)
@@ -335,27 +456,46 @@ async fn a_back_filled_original_can_still_be_swiped_back_to() {
         .expect("swipe back");
 
     assert_eq!(back.content, "the reply that predates variants");
-    let now = memory::get_last_assistant_turn(&db, &id).await.unwrap().expect("a reply");
-    assert_eq!(now.content, "the reply that predates variants", "turns.content follows the swipe");
+    let now = memory::get_last_assistant_turn(&db, &id)
+        .await
+        .unwrap()
+        .expect("a reply");
+    assert_eq!(
+        now.content, "the reply that predates variants",
+        "turns.content follows the swipe"
+    );
 }
 
 #[tokio::test]
 async fn exactly_one_variant_is_active_after_any_number_of_rolls() {
     let db = open().await;
     let id = memory::new_id();
-    memory::ensure_conversation(&db, &id, None).await.expect("conversation");
-    memory::record_turn(&db, &id, None, "roll one", "Character").await.expect("record");
-    let last = memory::get_last_assistant_turn(&db, &id).await.unwrap().expect("a reply");
+    memory::ensure_conversation(&db, &id, None)
+        .await
+        .expect("conversation");
+    memory::record_turn(&db, &id, None, "roll one", "Character")
+        .await
+        .expect("record");
+    let last = memory::get_last_assistant_turn(&db, &id)
+        .await
+        .unwrap()
+        .expect("a reply");
 
     for text in ["roll two", "roll three", "roll four"] {
-        memory::record_regeneration(&db, &id, text).await.expect("regenerate");
+        memory::record_regeneration(&db, &id, text)
+            .await
+            .expect("regenerate");
         let v = memory::get_variants(&db, last.id).await.expect("variants");
         assert_eq!(
             v.variants.iter().filter(|x| x.active).count(),
             1,
             "after {text}"
         );
-        assert_eq!(v.active_index, v.variants.len() - 1, "the newest roll is active");
+        assert_eq!(
+            v.active_index,
+            v.variants.len() - 1,
+            "the newest roll is active"
+        );
     }
 
     let v = memory::get_variants(&db, last.id).await.expect("variants");

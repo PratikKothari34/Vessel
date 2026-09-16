@@ -66,14 +66,20 @@ pub struct Steer(Option<MutexGuard<'static, ()>>);
 pub fn steer(reply: &str) -> Steer {
     let guard = steer_lock().lock().unwrap_or_else(|p| p.into_inner());
     *override_reply().lock().unwrap_or_else(|p| p.into_inner()) = Some(reply.to_string());
-    last_chat().lock().unwrap_or_else(|p| p.into_inner()).clear();
+    last_chat()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
     Steer(Some(guard))
 }
 
 impl Steer {
     /// The prompt the engine was handed, verbatim JSON.
     pub fn last_prompt(&self) -> String {
-        last_chat().lock().unwrap_or_else(|p| p.into_inner()).clone()
+        last_chat()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 
@@ -150,7 +156,11 @@ fn handle(mut sock: TcpStream) {
     }
     let len: usize = head
         .lines()
-        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().ok()))
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse().ok())
+        })
         .flatten()
         .unwrap_or(0);
     let mut body = vec![0u8; len];
@@ -161,13 +171,22 @@ fn handle(mut sock: TcpStream) {
 
     match path.as_str() {
         "/api/embeddings" => write_json(&mut sock, "200 OK", &fake_embedding(&body)),
-        "/api/generate" => {
-            write_json(&mut sock, "200 OK", "{\"response\":\"They talked. Then they stopped.\"}")
-        }
+        "/api/generate" => write_json(
+            &mut sock,
+            "200 OK",
+            "{\"response\":\"They talked. Then they stopped.\"}",
+        ),
         "/api/chat" => {
-            last_chat().lock().unwrap_or_else(|p| p.into_inner()).clone_from(&body);
+            last_chat()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone_from(&body);
             if body.contains("FAIL404") {
-                write_json(&mut sock, "404 Not Found", "{\"error\":\"model not found\"}");
+                write_json(
+                    &mut sock,
+                    "404 Not Found",
+                    "{\"error\":\"model not found\"}",
+                );
                 return;
             }
             let slow = body.contains("SLOW");
@@ -233,8 +252,8 @@ fn handle(mut sock: TcpStream) {
 pub fn temp_root() -> &'static std::path::PathBuf {
     static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let dir = std::env::temp_dir()
-            .join(format!("vessel-it-{}-{}", std::process::id(), binary_tag()));
+        let dir =
+            std::env::temp_dir().join(format!("vessel-it-{}-{}", std::process::id(), binary_tag()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
     })
@@ -339,7 +358,9 @@ impl Collector {
             .expect("collector")
             .iter()
             .find_map(|e| match e {
-                ChatEvent::Meta { conversation_id, .. } => Some(conversation_id.clone()),
+                ChatEvent::Meta {
+                    conversation_id, ..
+                } => Some(conversation_id.clone()),
                 _ => None,
             })
             .expect("meta")
@@ -363,7 +384,10 @@ impl Collector {
 }
 
 pub fn user(text: &str) -> ChatRequest {
-    ChatRequest { messages: vec![Message::new("user", text)], ..Default::default() }
+    ChatRequest {
+        messages: vec![Message::new("user", text)],
+        ..Default::default()
+    }
 }
 
 pub async fn run(req: ChatRequest) -> (Result<String, chat::ChatError>, Arc<Collector>) {

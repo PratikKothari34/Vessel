@@ -69,7 +69,11 @@ mod tests {
 
     #[test]
     fn sorts_as_a_string_in_time_order() {
-        let mut v = [format_iso(1_709_164_800, 0), format_iso(0, 0), format_iso(1_000_000_000, 0)];
+        let mut v = [
+            format_iso(1_709_164_800, 0),
+            format_iso(0, 0),
+            format_iso(1_000_000_000, 0),
+        ];
         v.sort();
         assert_eq!(v[0], "1970-01-01T00:00:00.000Z");
         assert_eq!(v[2], "2024-02-29T00:00:00.000Z");
