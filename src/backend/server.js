@@ -109,6 +109,28 @@ function buildDirectorMessage(director) {
 // ---- Middleware ----------------------------------------------------------
 app.disable('x-powered-by');
 
+// Three headers, on every response including the 403s below, each earning its
+// place on a loopback JSON API:
+//
+//   nosniff  -- the error paths are the ones that matter. A body the browser is
+//               allowed to sniff can be re-interpreted as HTML, which turns a
+//               reflected detail string into a script execution context.
+//   CORP     -- cors() governs what a page may READ; this governs what it may
+//               LOAD. Without it a drive-by page can still pull these responses
+//               in no-cors mode as an <img> or <script> and learn from the
+//               timing and the load/error result whether a conversation exists.
+//   no-store -- these bodies are the user's story. Nothing here is cacheable
+//               anyway, so the only thing a cache would do is leave private
+//               prose sitting in a browser's on-disk cache after the app closed.
+app.use((_req, res, next) => {
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+    'Cache-Control': 'no-store',
+  });
+  next();
+});
+
 // DNS-rebinding guard: a malicious website can point its own DNS at 127.0.0.1
 // and then read this API same-origin from the victim's browser. Such requests
 // carry the attacker's hostname in Host; only loopback names are legitimate
@@ -564,7 +586,9 @@ app.post('/chat', async (req, res) => {
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
+    // no-store, not no-cache: this stream IS the reply text, and no-cache still
+    // permits a cache to hold it as long as it revalidates.
+    'Cache-Control': 'no-store, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
@@ -675,10 +699,8 @@ app.put('/conversations/:id/active-variant', async (req, res) => {
 // SIGTERM flush below never runs. The shell instead POSTs here so the final
 // cloud sync happens before the process exits. Loopback-only, same local trust
 // model as the rest of the API; a no-op flush when sync is disabled.
-// The bespoke x-vessel-shutdown header this used to demand is gone: the CSRF
-// guard now requires the same kind of header on every write route, so a
-// drive-by page cannot reach this one either, and there is one rule to know
-// instead of two.
+// No per-route header check: this is a POST, so the CSRF guard above already
+// requires the app header, same as every other write.
 app.post('/shutdown', async (_req, res) => {
   try { await db.syncNow(); } catch { /* best effort */ }
   res.json({ ok: true });

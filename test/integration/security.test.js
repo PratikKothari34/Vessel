@@ -338,6 +338,40 @@ test('the server does not advertise its stack', async () => {
   assert.equal(res.headers.get('x-powered-by'), null);
 });
 
+test('every response carries the three hardening headers', async () => {
+  // Including the refusals: a 403 body is still a body the browser can be
+  // talked into sniffing, and a 404 is still a signal a cross-origin page can
+  // read from a no-cors load if CORP does not stop the load happening.
+  const cases = [
+    () => app.get('/health'),
+    () => app.get('/characters'),
+    () => app.get('/nope'),
+    () => app.post('/characters', { name: 'x' }, { headers: { 'x-vessel-app': null } }),
+    () => app.get(`/conversations/${'does-not-exist'}`),
+  ];
+  for (const call of cases) {
+    const res = await call();
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff', res.status);
+    assert.equal(res.headers.get('cross-origin-resource-policy'), 'same-origin', res.status);
+    assert.match(res.headers.get('cache-control') || '', /no-store/, String(res.status));
+  }
+});
+
+test('the reply stream is never stored, not merely revalidated', async () => {
+  // The SSE response sets its own headers, which is exactly where a global
+  // default gets quietly dropped -- and this stream is the story text itself.
+  const res = await fetch(`${app.url}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-vessel-app': '1' },
+    body: JSON.stringify({ characterId: hero.id, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const cache = res.headers.get('cache-control') || '';
+  assert.match(cache, /no-store/);
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff', 'survives writeHead');
+  assert.equal(res.headers.get('cross-origin-resource-policy'), 'same-origin', 'survives writeHead');
+  await res.body.cancel();
+});
+
 // ---- Error handling ------------------------------------------------------
 
 test('an unknown route is a JSON 404, not Express default HTML', async () => {

@@ -3,9 +3,9 @@
 //! Every route the Express backend exposed is a `#[tauri::command]` here that
 //! calls into [`vessel_core`], and `/chat`'s SSE stream is a Tauri channel. What
 //! that deletes is the entire loopback perimeter - the DNS-rebinding Host guard,
-//! the CORS allowlist, the body-size limit, the port-reclaim retry loop, the
-//! `x-vessel-shutdown` header - because there is no socket for anything to
-//! reach. The IPC boundary is the process boundary.
+//! the CORS allowlist, the CSRF app header, the body-size limit, the
+//! port-reclaim retry loop - because there is no socket for anything to reach.
+//! The IPC boundary is the process boundary.
 //!
 //! Errors keep the shape the renderer already parses: `{ error, detail? }`. The
 //! HTTP status is gone, so anything that carried meaning in a status carries it
@@ -371,7 +371,7 @@ fn relaunch(app: AppHandle) {
 
 /// Everything the Node build printed once at listen time. Assembled as one write
 /// rather than six, so an async warning cannot land in the middle of it.
-async fn banner(db: &db::Db) {
+fn banner(db: &db::Db) {
     let m = memory::config();
     let mf = inference::modelfile::load();
     let gb = prompt::global_behavior();
@@ -489,7 +489,7 @@ pub fn run() {
             // sees an empty frame while the schema opens and the first sync runs.
             tauri::async_runtime::spawn(async move {
                 match db::get().await {
-                    Ok(db) => banner(&db).await,
+                    Ok(db) => banner(&db),
                     // Not fatal at this point: the window still opens and every
                     // command reports the same failure with its own message,
                     // which is far more useful than a dead process.
