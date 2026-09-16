@@ -30,6 +30,12 @@ const backend = require(path.resolve(__dirname, '..', 'helpers', 'backend.js'));
 const { fakeEmbedding } = require(path.resolve(__dirname, '..', 'helpers', 'fake-inference.js'));
 
 const FOLD_ENV = {
+  // The rolling summary ships OFF (see SUMMARY_ENABLED in memory.js -- a
+  // 2,000-exchange A/B found it changed how the model failed, not how much it
+  // remembered, for 836 minutes of CPU). Every test in this file is about the
+  // summariser itself, so it is turned back on here rather than in the shared
+  // helper, which would leave the shipped default with no coverage at all.
+  SUMMARY_ENABLED: '1',
   VERBATIM_TURNS: '2',
   SUMMARIZE_THRESHOLD: '4',
   MAX_FOLD_TURNS: '2',   // forces a capped fold, so the drain needs two passes

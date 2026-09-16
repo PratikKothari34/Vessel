@@ -159,8 +159,10 @@ app.get('/health', (_req, res) => {
     memory: {
       summarizer: memory._config.SUMMARIZER_MODEL,
       embedder: memory._config.EMBED_MODEL,
+      summaryEnabled: memory._config.SUMMARY_ENABLED,
       verbatimTurns: memory._config.VERBATIM_TURNS,
       summarizeThreshold: memory._config.SUMMARIZE_THRESHOLD,
+      fold: memory.foldStats(),
     },
   });
 });

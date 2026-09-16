@@ -95,6 +95,14 @@ async function start(opts = {}) {
     LOCAL_DB_PATH: dbPath,
     TURSO_DATABASE_URL: '',
     TURSO_AUTH_TOKEN: '',
+    // A fresh key per start, so the keystore never touches the real OS keychain
+    // and one test can never read another's database.
+    //
+    // This is also a trap for any harness that RESTARTS the backend against a
+    // database it wrote earlier: the second start mints a different key and
+    // every read fails with "Decryption failed for page=1". Long-running or
+    // resumable harnesses must pin their own key through `opts.env`, which
+    // spreads below and therefore wins.
     DB_ENCRYPTION_KEY: crypto.randomBytes(32).toString('hex'),
     // --- the model ----------------------------------------------------------
     OLLAMA_HOST: model.url,

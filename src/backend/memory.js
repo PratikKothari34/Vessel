@@ -63,6 +63,38 @@ const SUMMARIZER_NUM_CTX = intEnv(
   SUMMARIZER_MODEL === CHAT_MODEL ? CHAT_NUM_CTX : 8192,
   { min: 512 },
 );
+// Whether the rolling summary is maintained at all.
+//
+// Off, folding still happens: old turns are still embedded, still moved to the
+// archive, and still reachable through retrieve(). What goes away is the
+// condensed narrative of everything that fell out of the window -- so the model
+// keeps whatever the vector search surfaces for THIS message, and nothing else.
+//
+// It exists because the summariser is the single most expensive thing in the
+// pipeline and the only one whose value is a judgement call. Turning it off is
+// how that judgement gets measured rather than assumed.
+//
+// DEFAULT IS OFF, and that is a measurement, not a guess. A 2,000-exchange A/B
+// with everything else identical -- same character, same script, same models,
+// folding and retrieval left on in both arms:
+//
+//   recall        33.8% on vs 39.4% off   (p=0.30 -- no difference)
+//   accuracy      44.3% on vs 61.8% off   (p=0.009, when it committed)
+//   wrong-fact    41 on vs 7 off          (p<0.0001)
+//   summariser    836 min on vs 0 off     (98.4% CPU duty, 667 min of stall)
+//
+// The summary did not change how much got remembered. It changed how the model
+// failed: holding forty facts co-resident in lossy prose let it answer with a
+// DIFFERENT established fact, confidently, six times as often. Retrieval alone
+// carried the same recall at 2,394 prompt tokens against 4,023.
+//
+// The defects that run exposed are fixed below (clampSummary, stripTranscript,
+// and the prompt). Those fixes are UNMEASURED -- shipping them on by default
+// would repeat the mistake the experiment was run to catch. Set
+// SUMMARY_ENABLED=1 to re-run the A/B against the fixed summariser.
+const SUMMARY_ENABLED = !/^(0|false|off|no)$/i.test(
+  String(process.env.SUMMARY_ENABLED ?? '0').trim(),
+);
 const VERBATIM_TURNS = intEnv('VERBATIM_TURNS', 8);
 let SUMMARIZE_THRESHOLD = intEnv('SUMMARIZE_THRESHOLD', 12);
 if (SUMMARIZE_THRESHOLD <= VERBATIM_TURNS) SUMMARIZE_THRESHOLD = VERBATIM_TURNS + 4;
@@ -450,6 +482,123 @@ function renderTurns(turns, assistantName = 'Character') {
     .join('\n');
 }
 
+// How far into a truncated summary we will look for a clean break.
+//
+// Front-truncation cuts at a character offset, so the survivor starts mid-word
+// by construction -- the 2,000-exchange run ended with a summary whose first
+// characters were "hreads". That fragment is not just ugly: it becomes the next
+// fold's CURRENT SUMMARY, so every later fold inherits and re-compresses a
+// broken opening, and the damage compounds for the life of the conversation.
+//
+// The lookahead is capped rather than unbounded. Prose that carries no sentence
+// break in its first fifth is not prose, and discarding more than that to find
+// one would cost more than the fragment does.
+const SUMMARY_CUT_LOOKAHEAD = 0.2;
+
+/**
+ * Trim a summary to `max` characters from the FRONT, landing on a boundary.
+ *
+ * Front rather than back because the oldest material is the part already
+ * condensed several times over and no longer present in the verbatim window --
+ * the only part that cannot be recovered from anywhere else. Preference order
+ * is paragraph break, then sentence end, then word break, then the raw cut:
+ * each step down is a worse opening, and the raw cut is what we had before.
+ */
+function clampSummary(text, max = MAX_SUMMARY_CHARS) {
+  const s = String(text ?? '');
+  if (s.length <= max) return s;
+  const cut = s.slice(s.length - max);
+  const window = Math.floor(max * SUMMARY_CUT_LOOKAHEAD);
+  // The cut may already have landed between words. Advancing to the next
+  // boundary would then discard a whole word to fix nothing -- the defect is
+  // starting mid-WORD, and this start is not.
+  const startsClean = /\s/.test(s.charAt(s.length - max - 1) || ' ');
+
+  // A blank line is the only boundary guaranteed not to be mid-thought.
+  const para = cut.indexOf('\n\n');
+  if (para >= 0 && para < window) {
+    const out = cut.slice(para + 2).trimStart();
+    if (out) return out;
+  }
+
+  // Sentence end, including one closing quote or bracket after the stop.
+  const m = /[.!?]["')\]]?\s+/.exec(cut.slice(0, window + 4));
+  if (m) {
+    const out = cut.slice(m.index + m[0].length);
+    if (out) return out;
+  }
+
+  if (startsClean) return cut;
+
+  // Backstop: at least do not start mid-word.
+  const word = cut.search(/\s/);
+  if (word >= 0 && word < window) {
+    const out = cut.slice(word + 1).trimStart();
+    if (out) return out;
+  }
+  return cut;
+}
+
+// A speaker label at the head of a line: `User:` or the character's own name.
+//
+// Deliberately NOT a general `^\w+:` — real summary prose opens lines with
+// "Note:", "Kestrel Station: a wreck", and any other colon it likes. Only the
+// two labels renderTurns actually emits are stripped, so the rule can only ever
+// remove text the summariser copied out of its own input.
+function transcriptLineRe(assistantName) {
+  const esc = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const who = ['User', assistantName && String(assistantName).trim()]
+    .filter(Boolean).map(esc).join('|');
+  return new RegExp(`^\\s*(?:${who})\\s*:`, 'i');
+}
+
+/**
+ * Drop transcript lines the summariser copied instead of summarising.
+ *
+ * Measured failure: across 226 folds the summariser degenerated from narrative
+ * into concatenation, and the final 6,000-char summary ended in raw dialogue --
+ * "User: Do you dream about the Petrel?" / "Dr. Ilse Varga-Mbeki: ...". A
+ * transcript inside the summary is strictly worse than no summary: it burns the
+ * character budget at full length, and it re-teaches the model the label format
+ * the persona spends a paragraph forbidding.
+ *
+ * Returns the cleaned text and how many lines went, so the caller can tell a
+ * light touch-up from a summary that was nothing but transcript.
+ */
+function stripTranscript(text, assistantName) {
+  const s = String(text ?? '');
+  if (!s) return { text: s, stripped: 0 };
+  const re = transcriptLineRe(assistantName);
+  const lines = s.split('\n');
+  const kept = [];
+  let stripped = 0;
+  for (const line of lines) {
+    if (re.test(line)) { stripped += 1; continue; }
+    kept.push(line);
+  }
+  if (!stripped) return { text: s, stripped: 0 };
+  // Collapse the blank runs the removed lines leave behind.
+  const out = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return { text: out, stripped };
+}
+
+// Least a cleaned summary may be, relative to the one it would replace, before
+// we keep the old one instead.
+//
+// If stripping took most of the reply, the summariser did not write a summary
+// with some transcript in it -- it wrote a transcript. Overwriting a good prior
+// summary with the handful of prose lines that survived loses more than the
+// fold gains, and the same non-destructive reasoning already governs the
+// SUMMARY_ENABLED=0 path: never replace something real with a stub.
+const SUMMARY_MIN_KEEP_RATIO = 0.35;
+
+function summaryIsUsable(cleaned, priorSummary) {
+  if (!cleaned) return false;
+  const prior = String(priorSummary || '');
+  if (prior.length < 400) return true; // nothing worth protecting yet
+  return cleaned.length >= prior.length * SUMMARY_MIN_KEEP_RATIO;
+}
+
 async function summarize(priorSummary, turns, assistantName) {
   const prompt = [
     'You are a story archivist. Maintain a running summary of an ongoing',
@@ -458,6 +607,22 @@ async function summarize(priorSummary, turns, assistantName) {
     'locations, plot events, decisions, and unresolved threads. Be faithful and',
     'concise. Do not add disclaimers, opinions, or content not present in the',
     'text. Output ONLY the updated summary prose.',
+    '',
+    // Measured over 226 folds: the summariser drifts out of narrative into
+    // copying the exchanges back verbatim, labels and all, which spends the
+    // whole character budget on dialogue it was asked to compress.
+    'Write third-person narrative prose in continuous paragraphs. Do NOT write',
+    'a transcript: never begin a line with a speaker label such as "User:" or',
+    'the character name followed by a colon, and do not reproduce dialogue word',
+    'for word. Report what was said and decided, do not replay it.',
+    '',
+    // The same run invented a name for the user out of nothing, wrote it into
+    // the summary, and thereafter fed it back on every single turn -- the model
+    // had no way to tell an invented name from an established one.
+    'Use ONLY names the story has actually established. Never invent a name for',
+    'anyone, and never promote a person who was merely mentioned into a',
+    'participant in the scene. If the user has not named their character, call',
+    'them "the user" and nothing else.',
     `Keep the updated summary under ${SUMMARY_TARGET_CHARS} characters. If it `
       + 'would run longer, compress the OLDEST material hardest and keep the '
       + 'newest exchanges intact.',
@@ -794,6 +959,25 @@ async function recordTurn(conversationId, userMessage, assistantReply, assistant
 // racing over the same oldest rows.
 const _maintenance = new Map(); // conversationId -> { promise, rerun, cancelled }
 
+// What folding actually costs.
+//
+// It runs OFF the turn lock, so none of it appears in a request timing: from
+// the outside a conversation that summarises and one that does not look
+// identical until the machine runs out of CPU. Six counters is the whole price
+// of being able to see it.
+const _foldCost = {
+  folds: 0, summaries: 0, archived: 0,
+  summarizeMs: 0, embedMs: 0, waitMs: 0,
+  // Summary hygiene, so the two known degeneration modes are visible in
+  // /health rather than only in a post-hoc read of the stored summary:
+  // transcript lines the summariser copied instead of compressing, and folds
+  // where so little prose survived that the prior summary was kept instead.
+  transcriptLines: 0, summariesRejected: 0,
+};
+// `pending` is how many conversations are folding right now, which is the
+// only way a caller can tell a quiet queue from one that has not started.
+function foldStats() { return { ..._foldCost, pending: _maintenance.size }; }
+
 function scheduleMaintenance(conversationId, assistantName) {
   const existing = _maintenance.get(conversationId);
   if (existing) {
@@ -885,13 +1069,24 @@ async function runMaintenance(conversationId, assistantName, state) {
   // Running both legs at once hides the ENTIRE embedding phase underneath the
   // summarize call. Nothing waits on this any more, but the window of stale
   // reads is still worth shortening, and the embedder is on CPU too.
+  const legStarted = Date.now();
+  let summarizeMs = 0;
+  let embedMs = 0;
   const [summaryResult, embeddings] = await Promise.all([
-    summarize(priorSummary, oldest, assistantName).then(
-      (text) => ({ ok: true, text }),
-      (err) => ({ ok: false, error: err.message }),
-    ),
-    embedAll(oldest),
+    SUMMARY_ENABLED
+      ? summarize(priorSummary, oldest, assistantName).then(
+        (text) => { summarizeMs = Date.now() - legStarted; return { ok: true, text }; },
+        (err) => { summarizeMs = Date.now() - legStarted; return { ok: false, error: err.message }; },
+      )
+      // Not an empty summary -- no summary write at all. An empty one would
+      // overwrite whatever a previous, enabled run had already built.
+      : Promise.resolve({ ok: true, skipped: true }),
+    embedAll(oldest).then((out) => { embedMs = Date.now() - legStarted; return out; }),
   ]);
+  // Both legs run together, so waitMs is what the pair cost, not their sum.
+  _foldCost.summarizeMs += summarizeMs;
+  _foldCost.embedMs += embedMs;
+  _foldCost.waitMs += Date.now() - legStarted;
 
   if (!summaryResult.ok) {
     // Summarizer down: keep turns verbatim rather than lose them. The embeds we
@@ -909,13 +1104,26 @@ async function runMaintenance(conversationId, assistantName, state) {
   });
   if (!alive.rows.length) return { archived: 0, summarized: false, cancelled: true };
 
-  let updated = summaryResult.text;
-  if (updated.length > MAX_SUMMARY_CHARS) updated = updated.slice(updated.length - MAX_SUMMARY_CHARS);
-
-  await db.execute({
-    sql: 'UPDATE conversations SET summary = ?, updated_at = ? WHERE id = ?',
-    args: [updated, nowIso(), conversationId],
-  });
+  let wroteSummary = false;
+  if (!summaryResult.skipped) {
+    // Clean BEFORE clamping: stripping transcript can bring an over-long reply
+    // back under the cap on its own, and clamping first would spend the budget
+    // holding dialogue we are about to discard anyway.
+    const cleaned = stripTranscript(summaryResult.text, assistantName);
+    _foldCost.transcriptLines += cleaned.stripped;
+    if (summaryIsUsable(cleaned.text, priorSummary)) {
+      const updated = clampSummary(cleaned.text, MAX_SUMMARY_CHARS);
+      await db.execute({
+        sql: 'UPDATE conversations SET summary = ?, updated_at = ? WHERE id = ?',
+        args: [updated, nowIso(), conversationId],
+      });
+      wroteSummary = true;
+    } else {
+      // Keep the prior summary. The turns still fold -- they are embedded and
+      // archived below, so nothing is lost, it just is not narrated.
+      _foldCost.summariesRejected += 1;
+    }
+  }
 
   // Move folded turns from verbatim -> archive. Two batched statements instead
   // of 2N single-row ones. A multi-row INSERT is one statement and therefore
@@ -940,7 +1148,11 @@ async function runMaintenance(conversationId, assistantName, state) {
     });
   }
 
-  return { archived: oldest.length, summarized: true };
+  _foldCost.folds += 1;
+  _foldCost.archived += oldest.length;
+  if (wroteSummary) _foldCost.summaries += 1;
+
+  return { archived: oldest.length, summarized: wroteSummary };
 }
 
 // Record ONLY a user turn (no assistant reply). Used when a stream is stopped
@@ -1095,6 +1307,12 @@ module.exports = {
   recordTurn,
   awaitAllMaintenance,
   cancelMaintenance,
+  foldStats,
+  // Exported for tests: both are pure string transforms and the cases that
+  // matter (mid-word cut, transcript degeneration) are exactly the ones a
+  // 2,000-turn run took 14 hours to surface.
+  clampSummary,
+  stripTranscript,
   recordUserTurn,
   recordRegeneration,
   deleteConversationIfEmpty,
@@ -1113,7 +1331,7 @@ module.exports = {
   _config: {
     CHAT_MODEL, CHAT_NUM_CTX,
     SUMMARIZER_MODEL, SUMMARIZER_NUM_CTX, SUMMARIZER_NUM_GPU, EMBED_MODEL, EMBED_NUM_GPU,
-    MAX_SUMMARY_CHARS, SUMMARY_TARGET_CHARS,
+    SUMMARY_ENABLED, MAX_SUMMARY_CHARS, SUMMARY_TARGET_CHARS,
     VERBATIM_TURNS, VERBATIM_CEILING, MAX_FOLD_TURNS, SUMMARIZE_THRESHOLD, RETRIEVE_K, RETRIEVE_MIN_SCORE,
     ARCHIVE_CACHE_CONVS, EMBED_CONCURRENCY,
   },

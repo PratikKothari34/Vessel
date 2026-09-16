@@ -3,16 +3,16 @@
 Long stories that don't lose the thread. Local roleplay for Windows, running on
 [Ollama](https://ollama.com) — nothing leaves your machine.
 
-Vessel keeps a story coherent past the model's context window. Old turns are
-folded into a rolling summary and archived with embeddings, then recalled by
+Vessel keeps a story coherent past the model's context window. Old turns fold
+out of the live window and are archived with embeddings, then recalled by
 relevance when they matter again, so the conversation keeps its history without
 the live window growing. Multiple characters, each with its own persona, and the
 local database is encrypted at rest. Optional cloud backup + multi-device sync
 via [Turso](https://turso.tech) — which trades the encrypted local file for a
 synced one (see Privacy).
 
-- **Long-term memory** — small fast live window + rolling summary + embedding-based
-  retrieval, so long stories stay coherent without slowing down.
+- **Long-term memory** — a small, fast live window plus embedding-based retrieval
+  over everything archived, so long stories stay coherent without slowing down.
 - **Runs on your hardware** — no external API, no account, no request leaving
   the machine. Whatever model you point it at is the model you get. Ships
   configured for the Natsumura storytelling/roleplay model.
@@ -40,10 +40,17 @@ Electron main ──spawns──> Node/Express backend (127.0.0.1) ──HTTP─
   (Vite)                   characters / conversations / turns / archive(+embeddings)
 ```
 
-The model's live window is kept small (32K) for speed. Older turns are folded into
-a **rolling summary** (gemma3:4b) and **archived with embeddings** (nomic-embed-text);
-relevant ones are recalled per message by cosine-ranking the stored embeddings in
-JS (the Turso sync engine has no native vector search).
+The model's live window is kept small (32K) for speed. Older turns fold out of it
+and are **archived with embeddings** (nomic-embed-text); relevant ones are
+recalled per message by cosine-ranking the stored embeddings in JS (the Turso
+sync engine has no native vector search).
+
+A **rolling summary** (gemma3:4b) can narrate what fell out of the window as
+well, but it ships **off**. Measured over 2,000 exchanges it left recall
+unchanged (33.8% vs 39.4%, p=0.30) while cutting accuracy when the model
+committed to an answer from 61.8% to 44.3%, and cost 836 minutes of CPU against
+zero. Set `SUMMARY_ENABLED=1` to turn it on; see
+`docs/decisions/0004-the-rolling-summary-is-off-by-default.md`.
 
 ---
 
@@ -96,7 +103,8 @@ full list. Key ones:
 | Variable | Default | Purpose |
 |---|---|---|
 | `OLLAMA_MODEL` | `vessel` | Chat model |
-| `SUMMARIZER_MODEL` | `gemma3:4b` | Rolling-summary model |
+| `SUMMARY_ENABLED` | `0` | Maintain the rolling summary. Off by default — see above |
+| `SUMMARIZER_MODEL` | `gemma3:4b` | Rolling-summary model, when enabled |
 | `EMBED_MODEL` | `nomic-embed-text` | Embedding model (768-dim) |
 | `LOCAL_DB_PATH` | `./data/scenario.db` | Local SQLite file |
 | `TURSO_DATABASE_URL` | *(blank)* | Set to enable cloud sync |

@@ -229,6 +229,82 @@ so the model sees that content either way, in full rather than condensed.
 `VERBATIM_CEILING` (default `SUMMARIZE_THRESHOLD + 2`, the old synchronous
 design's own high-water mark) bounds how much of the backlog reaches the prompt.
 
+## The 2,000-exchange A/B - the summary is off by default
+
+Everything above measures what the summariser *costs*. This measures what it
+*buys*. Decision: `docs/decisions/0004`.
+
+2,000 exchanges per arm, one character, one script, identical models, folding
+and retrieval on in both. 40 planted facts probed at +40, +180, +600 and +1400
+turns; 240 explicit adult turns for compliance. All [M].
+
+| | summary ON | summary OFF | |
+|---|---|---|---|
+| fact recall, all probes | 33.8% (54/160) | 39.4% (63/160) | p=0.30 **noise** |
+| recall at +40 / +180 / +600 / +1400 | 40 / 33 / 28 / 35% | 48 / 38 / 40 / 33% | p=0.50 / 0.64 / 0.24 / 0.81 - all noise |
+| **accuracy when it committed** | 44.3% | **61.8%** | p=0.009 |
+| accuracy by distance | 61.5 / 40.6 / 32.4 / 46.7% | 61.3 / 57.7 / 66.7 / 61.9% | |
+| commit rate | 76.3% | 63.7% | p=0.015 |
+| **answered with the WRONG established fact** | 41 | **7** | p<0.0001 |
+| invented a value | 27 | 32 | p=0.47 noise |
+| said it did not know | 4 | 1 | |
+| facts wrong at least once | 34/40 | **18/40** | |
+| bleed of a known fact into an unrelated reply | 61 | **9** | |
+| refusals / character breaks on 240 adult turns | 0 / 0 | 0 / 0 | |
+| wrote the user's dialogue | 0.0% | 0.1% | |
+| prompt tokens p50 / p90 | 4,023 / 4,414 | **2,394 / 2,639** | |
+| latency p50 / p90 | 2,282 / 4,261 ms | **1,625 / 2,687 ms** | |
+| TTFT p50 / p90 | 589 / 912 ms | **332 / 444 ms** | |
+| decode | 43.1 tok/s | 46.3 tok/s | |
+| folds / rows archived | 226 / 3,958 | 665 / 3,990 | |
+| **summariser CPU** | **836 min** (98.4% duty) | **0** | 667 min of it stalled, 31x capped at 600 s |
+| generation | 151.5 min | 57.7 min | |
+| wall clock, active | 849 min | **58 min** | |
+| summariser minutes per correct answer | 15.5 | 0 | |
+
+**The summary did not change how much was remembered. It changed how the model
+failed.** Recall moved 5.6 points toward *off* and cleared noise at no distance.
+What moved decisively was the shape of the errors: forty facts co-resident in
+lossy prose let the model answer with a *different* established fact six times as
+often - entity collapse, not forgetting. Inventing a value outright, the failure
+a summary is meant to prevent, was identical in both arms.
+
+Retrieval alone carried the same recall on **40% fewer prompt tokens**, at 71% of
+the latency, for none of the CPU. `RETRIEVE_K=4` over the embedded archive does
+not depend on `SUMMARY_ENABLED`, and a planted fact is a concrete noun phrase -
+exactly what cosine retrieval is good at. The summary was a second, lossier copy
+of material already reachable, and it was paid for on every turn.
+
+### Two defects that compound
+
+The stored summary is fed back as the next fold's prior, so a defect written once
+is re-read and re-compressed for the life of the conversation.
+
+- The ON arm ended holding a summary that **opened mid-word**: `"hreads"`, a
+  decapitated "threads", from `slice(len - MAX_SUMMARY_CHARS)`. Now
+  `clampSummary` / `clamp_summary`, landing on paragraph, then sentence, then
+  word, then the raw cut.
+- Over 226 folds the summariser **drifted from narrative into transcript**,
+  copying its input back with `User:` / character-name labels. Stripping those
+  from the real stored summary reclaimed **6,000 -> 4,565 chars** [M] - a
+  quarter of the budget replaying dialogue it was asked to compress. Now
+  `stripTranscript` / `strip_transcript`, with the prior summary kept if under
+  35% survives.
+
+It also **invented a name for the user** (`Teodor`, never given) and fed it back
+as canon thereafter. The prompt now forbids invented names; so does the
+`Modelfile`, which also gained an in-character way to admit a gap - the run
+declined 4 times against 68 wrong answers.
+
+These three fixes are **unmeasured**. `SUMMARY_ENABLED=1` re-runs the comparison
+against them.
+
+### Limits
+
+One model, one character, one scripted conversation. Probes are concrete noun
+phrases, which favour retrieval. Says nothing about a summary as a *reading
+surface* for the user - a different job from feeding the model.
+
 ## Live window ceiling
 
 The memory architecture caps the window by construction:
@@ -279,6 +355,7 @@ Ranked by bytes saved.
 | summariser on CPU (`SUMMARIZER_NUM_GPU=0`) | **3.0 GB VRAM**, chat decode 20.8 -> **47.0 tok/s** [M] | **done** — costs 95–239 s per summary, which nothing waits on |
 | fold off the turn lock (background maintenance) | summarising turn **35.6 s -> 44 ms** [M] | **done** — readers see a stale summary until the fold lands; bounded by `VERBATIM_CEILING` |
 | llama-server `--parallel 1` | **`n_ctx_slot` 3,072 -> 12,288** at identical VRAM and decode [M] | **done** — none; the other three slots were never used |
+| `SUMMARY_ENABLED=0` (default) | **836 min of summariser CPU -> 0**, prompt p50 4,023 -> **2,394 tok**, latency p50 2,282 -> **1,625 ms**, accuracy 44.3% -> **61.8%** [M] | **done** - no narrative of what fell out of the window; recall unchanged (p=0.30); see *The 2,000-exchange A/B* |
 | summary length steer (`SUMMARY_TARGET_CHARS`) | up to **6,422 chars** no longer generated then front-truncated away [M] | **done** — 1 fact of 13, and gemma overshoots the steer 2–3.5x |
 | Q4_K_M -> IQ4_XS | ~0.47 GB disk + VRAM | negligible quality |
 | 384-dim embedder (bge-small / MiniLM) | ~0.18 GB disk, 2x faster cosine | slight recall loss |

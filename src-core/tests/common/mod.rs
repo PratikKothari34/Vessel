@@ -275,6 +275,12 @@ pub fn setup() {
         // Small enough that a handful of turns crosses the fold threshold.
         std::env::set_var("VERBATIM_TURNS", "2");
         std::env::set_var("SUMMARIZE_THRESHOLD", "4");
+        // The summary ships OFF by default (see Config::summary_enabled). These
+        // tests exercise the summariser path itself, so they turn it back on
+        // explicitly -- config() is a one-shot read, so it cannot be toggled
+        // per-test inside one binary. The default's own parsing is covered by
+        // the_summary_is_off_unless_asked_for in memory.rs.
+        std::env::set_var("SUMMARY_ENABLED", "1");
     });
 }
 

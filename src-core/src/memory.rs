@@ -80,6 +80,19 @@ pub struct Config {
     pub retrieve_min_score: f32,
     pub max_summary_chars: usize,
     pub summary_target_chars: usize,
+    /// Whether the rolling summary is maintained at all. Folding, embedding and
+    /// retrieval are unaffected: turns still archive, still embed, and are still
+    /// reachable through `retrieve`. What goes away is the narrative of what
+    /// fell out of the window.
+    ///
+    /// Default OFF, measured rather than assumed. A 2,000-exchange A/B with
+    /// everything else identical: recall 33.8% on vs 39.4% off (p=0.30, no
+    /// difference), accuracy-when-committed 44.3% vs 61.8% (p=0.009), answers
+    /// naming the WRONG established fact 41 vs 7 (p<0.0001), and 836 minutes of
+    /// summariser CPU against zero. The summary did not change how much was
+    /// remembered, only how the model failed. Set SUMMARY_ENABLED=1 to re-run
+    /// that comparison against the fixes below.
+    pub summary_enabled: bool,
     pub archive_cache_convs: usize,
     pub embed_concurrency: usize,
     pub lock_wait: Duration,
@@ -126,6 +139,10 @@ impl Config {
         ) as usize;
 
         let max_summary_chars = int_env("MAX_SUMMARY_CHARS", 6000, 500) as usize;
+        let summary_enabled = !matches!(
+            std::env::var("SUMMARY_ENABLED").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no",
+        );
         // Deliberately well under the cap: models treat a character count as a
         // loose hint and overshoot roughly twofold. Truncation stays as the
         // backstop for when they ignore it entirely.
@@ -160,6 +177,7 @@ impl Config {
             retrieve_min_score: float_env("RETRIEVE_MIN_SCORE", 0.45, -1.0, 1.0),
             max_summary_chars,
             summary_target_chars,
+            summary_enabled,
             // 768 floats x 4 B = 3 KB per archived turn, so a 1,000-turn story
             // costs about 3 MB resident.
             archive_cache_convs: int_env("ARCHIVE_CACHE_CONVS", 8, 1) as usize,
@@ -730,6 +748,18 @@ fn summarize_prompt(prior_summary: &str, rendered: &str, target_chars: usize) ->
          locations, plot events, decisions, and unresolved threads. Be faithful and\n\
          concise. Do not add disclaimers, opinions, or content not present in the\n\
          text. Output ONLY the updated summary prose.\n\
+         \n\
+         Write third-person narrative prose in continuous paragraphs. Do NOT \
+         write a transcript: never begin a line with a speaker label such as \
+         \"User:\" or the character name followed by a colon, and do not \
+         reproduce dialogue word for word. Report what was said and decided, do \
+         not replay it.\n\
+         \n\
+         Use ONLY names the story has actually established. Never invent a name \
+         for anyone, and never promote a person who was merely mentioned into a \
+         participant in the scene. If the user has not named their character, \
+         call them \"the user\" and nothing else.\n\
+         \n\
          Keep the updated summary under {target_chars} characters. If it would run \
          longer, compress the OLDEST material hardest and keep the newest exchanges \
          intact.\n\
@@ -1367,19 +1397,29 @@ async fn run_maintenance(
     // The summarizer call is by far the most expensive thing in this phase and
     // the embeds do not depend on it, so both legs run at once and the entire
     // embedding phase hides underneath the summarize call.
+    // When the summary is disabled this resolves to None immediately, so the
+    // fold costs exactly the embed leg. Not an empty summary - an empty one
+    // would overwrite whatever a previous, enabled run had already built.
     let (summary_result, embeddings) = tokio::join!(
-        summarize(&prior_summary, &oldest, assistant_name),
+        async {
+            if cfg.summary_enabled {
+                Some(summarize(&prior_summary, &oldest, assistant_name).await)
+            } else {
+                None
+            }
+        },
         embed_all(&oldest),
     );
 
     let updated = match summary_result {
-        Ok(text) => text,
-        Err(e) => {
+        Some(Ok(text)) => Some(text),
+        Some(Err(e)) => {
             // Summarizer down: keep the turns verbatim rather than lose them.
             // The embeds computed alongside are discarded and recomputed next
             // attempt.
             return Ok(TurnResult { error: Some(e.to_string()), ..Default::default() });
         }
+        None => None,
     };
 
     // Those two awaits are the long ones - minutes, on CPU. The conversation can
@@ -1399,16 +1439,27 @@ async fn run_maintenance(
         return Ok(TurnResult { cancelled: true, ..Default::default() });
     }
 
-    let updated = tail_chars(&updated, cfg.max_summary_chars);
-    db.execute(
-        "UPDATE conversations SET summary = ?, updated_at = ? WHERE id = ?",
-        vec![
-            TValue::Text(updated),
-            TValue::Text(now_iso()),
-            TValue::Text(conversation_id.into()),
-        ],
-    )
-    .await?;
+    if let Some(text) = updated {
+        // Clean BEFORE clamping: stripping transcript can bring an over-long
+        // reply back under the cap on its own, and clamping first would spend
+        // the budget holding dialogue about to be discarded anyway.
+        let (cleaned, _stripped) = strip_transcript(&text, assistant_name);
+        if summary_is_usable(&cleaned, &prior_summary) {
+            let updated = clamp_summary(&cleaned, cfg.max_summary_chars);
+            db.execute(
+                "UPDATE conversations SET summary = ?, updated_at = ? WHERE id = ?",
+                vec![
+                    TValue::Text(updated),
+                    TValue::Text(now_iso()),
+                    TValue::Text(conversation_id.into()),
+                ],
+            )
+            .await?;
+        }
+        // Otherwise keep the prior summary. The turns still fold - they are
+        // embedded and archived below, so nothing is lost, it just is not
+        // narrated.
+    }
 
     // Move folded turns from verbatim to archive. Two batched statements instead
     // of 2N single-row ones. A multi-row INSERT is one statement and therefore
@@ -1459,12 +1510,173 @@ async fn run_maintenance(
 
 /// Keep the LAST `max` characters. The front is what gets cut, because it is the
 /// material already condensed several times over.
-fn tail_chars(s: &str, max: usize) -> String {
+/// How far into a truncated summary we look for a clean break.
+///
+/// Front-truncation cuts at a character offset, so the survivor starts mid-word
+/// by construction - a 2,000-exchange run ended holding a summary whose first
+/// characters were "hreads". That fragment is not merely ugly: it becomes the
+/// next fold's CURRENT SUMMARY, so every later fold inherits and recompresses a
+/// broken opening and the damage compounds for the life of the conversation.
+///
+/// Capped rather than unbounded: prose carrying no sentence break in its first
+/// fifth is not prose, and discarding more than that to find one would cost
+/// more than the fragment does.
+const SUMMARY_CUT_LOOKAHEAD: f64 = 0.2;
+
+/// Least a cleaned summary may be, relative to the one it would replace, before
+/// the old one is kept instead. If stripping took most of the reply, the
+/// summariser wrote a transcript rather than a summary with transcript in it.
+const SUMMARY_MIN_KEEP_RATIO: f64 = 0.35;
+
+/// Trim a summary to `max` CHARACTERS from the front, landing on a boundary.
+///
+/// Front rather than back because the oldest material is the part already
+/// condensed several times over and no longer in the verbatim window - the only
+/// part unrecoverable from anywhere else. Preference order is paragraph break,
+/// then sentence end, then word break, then the raw cut; each step down is a
+/// worse opening, and the raw cut is what this replaced.
+fn clamp_summary(s: &str, max: usize) -> String {
     let n = s.chars().count();
     if n <= max {
         return s.to_string();
     }
-    s.chars().skip(n - max).collect()
+    let cut: String = s.chars().skip(n - max).collect();
+    let window = ((max as f64) * SUMMARY_CUT_LOOKAHEAD) as usize;
+    // The cut may already have landed between words. Advancing to the next
+    // boundary would then discard a whole word to fix nothing - the defect is
+    // starting mid-WORD, and this start is not.
+    let starts_clean = s.chars().nth(n - max - 1).is_none_or(char::is_whitespace);
+
+    // A blank line is the only boundary guaranteed not to be mid-thought.
+    if let Some(i) = cut.find("\n\n") {
+        if cut[..i].chars().count() < window {
+            let out = cut[i + 2..].trim_start();
+            if !out.is_empty() {
+                return out.to_string();
+            }
+        }
+    }
+
+    // Sentence end, allowing one closing quote or bracket after the stop.
+    let chars: Vec<char> = cut.chars().collect();
+    let limit = window.min(chars.len());
+    for i in 0..limit {
+        if !matches!(chars[i], '.' | '!' | '?') {
+            continue;
+        }
+        let mut j = i + 1;
+        if j < chars.len() && matches!(chars[j], '"' | '\'' | ')' | ']') {
+            j += 1;
+        }
+        if j >= chars.len() || !chars[j].is_whitespace() {
+            continue;
+        }
+        while j < chars.len() && chars[j].is_whitespace() {
+            j += 1;
+        }
+        if j < chars.len() {
+            return chars[j..].iter().collect();
+        }
+    }
+
+    if starts_clean {
+        return cut;
+    }
+
+    // Backstop: at least do not start mid-word.
+    for (i, c) in chars.iter().enumerate().take(limit) {
+        if c.is_whitespace() {
+            let out: String = chars[i + 1..].iter().collect();
+            let out = out.trim_start();
+            if !out.is_empty() {
+                return out.to_string();
+            }
+            break;
+        }
+    }
+    cut
+}
+
+/// Does this line open with a speaker label `render_turns` would have emitted?
+///
+/// Deliberately NOT a general `^\w+:` - real summary prose opens lines with
+/// "Note:" and any other colon it likes. Only the two labels the renderer
+/// actually writes are matched, so the rule can only ever remove text the
+/// summariser copied out of its own input.
+fn is_transcript_line(line: &str, assistant_name: &str) -> bool {
+    let t = line.trim_start();
+    for who in ["User", assistant_name.trim()] {
+        if who.is_empty() || t.len() < who.len() {
+            continue;
+        }
+        if !t.is_char_boundary(who.len()) {
+            continue;
+        }
+        let (head, rest) = t.split_at(who.len());
+        if head.eq_ignore_ascii_case(who) && rest.trim_start().starts_with(':') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Drop transcript lines the summariser copied instead of summarising.
+///
+/// Measured failure: across 226 folds the summariser degenerated from narrative
+/// into concatenation, and the final summary ended in raw dialogue. A
+/// transcript inside the summary is strictly worse than no summary - it burns
+/// the character budget at full length and re-teaches the model the very label
+/// format the persona spends a paragraph forbidding.
+///
+/// Returns the cleaned text and how many lines went, so a light touch-up can be
+/// told from a summary that was nothing but transcript.
+fn strip_transcript(s: &str, assistant_name: &str) -> (String, usize) {
+    if s.is_empty() {
+        return (String::new(), 0);
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut stripped = 0usize;
+    for line in s.split('\n') {
+        if is_transcript_line(line, assistant_name) {
+            stripped += 1;
+        } else {
+            kept.push(line);
+        }
+    }
+    if stripped == 0 {
+        return (s.to_string(), 0);
+    }
+    // Collapse the blank runs the removed lines leave behind.
+    let mut out = String::with_capacity(s.len());
+    let mut blanks = 0usize;
+    for line in kept {
+        if line.trim().is_empty() {
+            blanks += 1;
+            if blanks > 1 {
+                continue;
+            }
+        } else {
+            blanks = 0;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    (out.trim().to_string(), stripped)
+}
+
+/// Is the cleaned summary substantial enough to replace `prior`?
+///
+/// Overwriting a good prior summary with the few prose lines that survived a
+/// transcript strip loses more than the fold gains. Same non-destructive rule
+/// that governs the disabled path: never replace something real with a stub.
+fn summary_is_usable(cleaned: &str, prior: &str) -> bool {
+    if cleaned.trim().is_empty() {
+        return false;
+    }
+    if prior.chars().count() < 400 {
+        return true; // nothing worth protecting yet
+    }
+    (cleaned.chars().count() as f64) >= (prior.chars().count() as f64) * SUMMARY_MIN_KEEP_RATIO
 }
 
 /// Record ONLY a user turn (no assistant reply). Used when a stream is stopped
@@ -1904,10 +2116,82 @@ mod tests {
     fn a_summary_is_truncated_from_the_front() {
         // The tail is the newest material. Cutting the end would throw away what
         // the model just learned and keep what it already condensed twice.
-        assert_eq!(tail_chars("abcdef", 3), "def");
-        assert_eq!(tail_chars("abc", 10), "abc");
+        assert_eq!(clamp_summary("abcdef", 3), "def");
+        assert_eq!(clamp_summary("abc", 10), "abc");
         // Characters, not bytes: slicing bytes here would panic mid-codepoint.
-        assert_eq!(tail_chars("\u{e9}\u{e9}\u{e9}", 2), "\u{e9}\u{e9}");
+        assert_eq!(clamp_summary("\u{e9}\u{e9}\u{e9}", 2), "\u{e9}\u{e9}");
+    }
+
+    #[test]
+    fn truncation_lands_on_a_boundary_not_mid_word() {
+        // The failure this exists to stop: a 2,000-exchange run ended holding a
+        // summary that opened "hreads include..." - a decapitated "threads" -
+        // which then fed the next fold as its prior and compounded.
+        let text = "She kept the manifest hidden. He never asked about it again.";
+        let cut = clamp_summary(text, 30);
+        assert!(cut.starts_with("He never asked"), "got {cut:?}");
+
+        // A blank line wins over a sentence end: it cannot be mid-thought.
+        let para = "first para trailing words\n\nSecond para opens here.";
+        assert_eq!(clamp_summary(para, 30), "Second para opens here.");
+
+        // No boundary within the lookahead: still bounded, still non-empty.
+        let solid = "x".repeat(200);
+        assert_eq!(clamp_summary(&solid, 50).chars().count(), 50);
+    }
+
+    #[test]
+    fn transcript_lines_are_stripped_from_a_summary() {
+        // Measured degeneration: the summariser stops compressing and starts
+        // copying its own input back, labels and all.
+        let text = "She agreed to the salvage.\n\
+                    User: Do you dream about the Petrel?\n\
+                    Ilse Varga: Long breath in - \"I never did.\"\n\
+                    The manifest stayed hidden.";
+        let (out, n) = strip_transcript(text, "Ilse Varga");
+        assert_eq!(n, 2);
+        assert!(out.contains("She agreed"));
+        assert!(out.contains("The manifest"));
+        assert!(!out.contains("User:"));
+        assert!(!out.contains("Ilse Varga:"));
+
+        // Prose that merely contains a colon is NOT a transcript line. A general
+        // ^\w+: rule would eat these, which is why the match is restricted to
+        // the two labels render_turns actually emits.
+        let prose = "Note: she kept it.\nKestrel Station: a wreck she inherited.";
+        let (kept, none) = strip_transcript(prose, "Ilse Varga");
+        assert_eq!(none, 0);
+        assert_eq!(kept, prose);
+    }
+
+    #[test]
+    fn a_stub_never_overwrites_a_real_summary() {
+        // If stripping took most of the reply, the summariser wrote a transcript
+        // rather than a summary containing one. Keeping the prior beats
+        // replacing it with the scraps.
+        let prior = "p".repeat(2000);
+        assert!(!summary_is_usable("one surviving line", &prior));
+        assert!(summary_is_usable(&"c".repeat(1200), &prior));
+        assert!(!summary_is_usable("   ", &prior));
+        // Early on there is nothing worth protecting, so anything real passes.
+        assert!(summary_is_usable("first summary", ""));
+    }
+
+    #[test]
+    fn the_summary_is_off_unless_asked_for() {
+        // Default off is a measurement: over 2,000 exchanges the summary left
+        // recall unchanged (p=0.30) while cutting accuracy-when-committed from
+        // 61.8% to 44.3% (p=0.009) and costing 836 minutes of CPU.
+        for (val, want) in [
+            ("", false), ("0", false), ("false", false), ("off", false), ("no", false),
+            ("1", true), ("true", true), ("on", true),
+        ] {
+            let got = !matches!(
+                val.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no",
+            );
+            assert_eq!(got, want, "SUMMARY_ENABLED={val:?}");
+        }
     }
 
     #[test]
