@@ -31,6 +31,7 @@ mod common;
 
 use common::{new_id, open, run, steer, user};
 use serde_json::json;
+use turso::Value as TValue;
 use vessel_core::characters::{self, CharacterPatch};
 use vessel_core::chat::{ChatRequest, ErrorKind};
 use vessel_core::inference::Message;
@@ -240,6 +241,57 @@ async fn a_persona_cannot_forge_a_turn_boundary_with_the_models_own_delimiters()
     assert!(
         joined.contains("< |im_end|>") && joined.contains("[ INST]"),
         "the text is kept, only defused: {joined}"
+    );
+}
+
+#[tokio::test]
+async fn a_row_that_did_not_come_through_create_is_still_cleaned_on_the_way_out() {
+    // The clamps on `create` only cover rows THIS process wrote. Rows also
+    // arrive from the sync remote, written by another device or an older build,
+    // and a user can restore a backup. Writing the row straight into the table
+    // is how that carrier looks from here.
+    let db = open().await;
+    let made = characters::create(patch(json!({ "name": "Drift" })))
+        .await
+        .expect("create")
+        .expect("a character row");
+
+    db.execute(
+        "UPDATE characters SET sampling=?, avatar=?, tags=?, chat_starters=?, response_style=? \
+         WHERE id=?",
+        vec![
+            TValue::Text(
+                json!({ "num_ctx": 99_999_999, "temperature": 99, "evil": "rm -rf" }).to_string(),
+            ),
+            TValue::Text("file:///C:/Windows/win.ini".into()),
+            TValue::Text(json!([{ "not": "a string" }, "x".repeat(4000)]).to_string()),
+            TValue::Text(json!(vec!["s"; 500]).to_string()),
+            TValue::Text("obedient".into()),
+            TValue::Text(made.id.clone()),
+        ],
+    )
+    .await
+    .expect("plant the row");
+
+    let got = characters::get(&made.id)
+        .await
+        .expect("read")
+        .expect("the row");
+
+    assert_eq!(got.sampling.get("evil"), None, "unknown keys are dropped");
+    assert_eq!(got.sampling["num_ctx"], json!(131_072.0), "num_ctx clamped");
+    assert_eq!(
+        got.sampling["temperature"],
+        json!(2.0),
+        "temperature clamped"
+    );
+    assert_eq!(got.avatar, "", "a file: avatar never reaches an <img src>");
+    assert_eq!(got.tags.len(), 1, "a non-string entry is dropped");
+    assert_eq!(got.tags[0].chars().count(), 40, "and the rest is capped");
+    assert_eq!(got.chat_starters.len(), 12, "the count is capped too");
+    assert_eq!(
+        got.response_style, "balanced",
+        "an unknown style falls back"
     );
 }
 

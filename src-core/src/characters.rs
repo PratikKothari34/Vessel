@@ -131,12 +131,16 @@ pub fn clean_list(a: Option<&Json>, max: usize, max_len: usize) -> Vec<String> {
         .collect()
 }
 
-fn parse_list(json: Option<&Json>) -> Vec<String> {
+/// Read a stored JSON string array back, applying the same caps the write path
+/// applies. See [`row_to_character`] for why the read path re-cleans at all.
+fn parse_list(json: Option<&Json>, max: usize, max_len: usize) -> Vec<String> {
     let raw = json.and_then(Json::as_str).unwrap_or("[]");
     match serde_json::from_str::<Json>(raw) {
         Ok(Json::Array(a)) => a
             .iter()
-            .filter_map(|x| x.as_str().map(str::to_string))
+            .map(|x| cap(x.as_str().unwrap_or("").trim(), max_len))
+            .filter(|s| !s.is_empty())
+            .take(max)
             .collect(),
         _ => Vec::new(),
     }
@@ -167,25 +171,43 @@ fn s(row: &Map<String, Json>, key: &str) -> String {
         .to_string()
 }
 
+/// A stored row, cleaned again on the way out.
+///
+/// The clamps above run on the way IN, which only covers rows this process
+/// wrote. A row can also arrive from the sync remote, written by another device
+/// or an older build, or be restored from a backup - none of those went through
+/// `create`. So the three fields that carry real power are re-cleaned here as
+/// well, which is what `response_style` has always done:
+///
+/// - `sampling` spreads straight into the engine's options, so an unclamped
+///   `num_ctx` is an OOM and an unknown key is a smuggled option.
+/// - `avatar` lands in an `<img src>`, so a `file:` URL makes a client fetch a
+///   local path.
+/// - the lists are rendered, and parsing alone caps neither their length nor
+///   their count - `parse_list` now applies the write path's caps.
+///
+/// The prose fields are left as stored: they are inert text, already capped on
+/// write and bounded by the body limit, and truncating them here would quietly
+/// shorten a persona that is merely long.
 fn row_to_character(row: &Map<String, Json>) -> Character {
     let sampling = match row
         .get("sampling")
         .and_then(Json::as_str)
         .map(serde_json::from_str::<Json>)
     {
-        Some(Ok(Json::Object(m))) => m,
+        Some(Ok(v @ Json::Object(_))) => clean_sampling(Some(&v)),
         _ => Map::new(),
     };
     Character {
         id: s(row, "id"),
         name: s(row, "name"),
-        avatar: s(row, "avatar"),
+        avatar: clean_avatar(&s(row, "avatar")),
         tagline: s(row, "tagline"),
         about: s(row, "about"),
         persona: s(row, "persona"),
         greeting: s(row, "greeting"),
-        chat_starters: parse_list(row.get("chat_starters")),
-        tags: parse_list(row.get("tags")),
+        chat_starters: parse_list(row.get("chat_starters"), 12, 200),
+        tags: parse_list(row.get("tags"), 12, 40),
         sampling,
         response_style: clean_style(row.get("response_style").and_then(Json::as_str)),
         created_at: s(row, "created_at"),

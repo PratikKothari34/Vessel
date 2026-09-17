@@ -80,33 +80,58 @@ function cleanAvatar(v) {
   return '';
 }
 
-// Normalize a string array (chat starters / tags): trim, drop empties, cap size.
+// Normalize a string array (chat starters / tags): drop anything that is not a
+// string, trim, drop empties, cap size.
+//
+// Dropping rather than stringifying: String({}) is "[object Object]", which is
+// content the user never typed being rendered as a tag. A non-string entry is
+// a malformed list, not a list with an odd entry in it, and the Rust track has
+// always read it that way.
 function cleanList(a, { max = 12, maxLen = 200 } = {}) {
   if (!Array.isArray(a)) return [];
-  return a.map((x) => String(x == null ? '' : x).trim().slice(0, maxLen))
+  return a.filter((x) => typeof x === 'string')
+    .map((x) => x.trim().slice(0, maxLen))
     .filter(Boolean)
     .slice(0, max);
 }
 
-function parseList(json) {
-  try { const v = JSON.parse(json || '[]'); return Array.isArray(v) ? v : []; }
+// Read a stored JSON string array back, applying the same caps the write path
+// applies. See rowToCharacter for why the read path re-cleans at all.
+function parseList(json, opts) {
+  try { const v = JSON.parse(json || '[]'); return cleanList(Array.isArray(v) ? v : [], opts); }
   catch { return []; }
 }
 
+// The clamps above run on the way IN, which only covers rows this process
+// wrote. A row can also arrive from the sync remote, written by another device
+// or an older build, or be restored from a backup - none of those went through
+// createCharacter. So the three fields that carry real power are re-cleaned on
+// the way OUT as well, which is what response_style has always done:
+//
+//   sampling  spreads straight into the engine's options, so an unclamped
+//             num_ctx is an OOM and an unknown key is a smuggled option
+//   avatar    lands in an <img src>, so a file: URL makes a client fetch a
+//             local path
+//   the lists are rendered, and JSON.parse alone lets objects through where the
+//             UI expects strings
+//
+// The prose fields are left as stored: they are inert text, already capped on
+// write and bounded by the body limit, and truncating them here would quietly
+// shorten a persona that is merely long.
 function rowToCharacter(row) {
   let sampling = {};
   try { sampling = JSON.parse(row.sampling || '{}'); } catch { /* default {} */ }
   return {
     id: row.id,
     name: row.name,
-    avatar: row.avatar || '',
+    avatar: cleanAvatar(row.avatar),
     tagline: row.tagline || '',
     about: row.about || '',
     persona: row.persona || '',
     greeting: row.greeting || '',
     chatStarters: parseList(row.chat_starters),
-    tags: parseList(row.tags),
-    sampling,
+    tags: parseList(row.tags, { maxLen: 40 }),
+    sampling: cleanSampling(sampling),
     responseStyle: cleanStyle(row.response_style),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -193,4 +218,7 @@ module.exports = {
   createCharacter,
   updateCharacter,
   deleteCharacter,
+  // Exposed for the tests that plant a row the write path never saw, which is
+  // what a synced or restored row looks like from here. Not part of the API.
+  _internals: { rowToCharacter },
 };
