@@ -224,7 +224,11 @@ app.get('/health', (_req, res) => {
 // and the live-window ceiling from arithmetic in docs/MASTER.md into numbers.
 // Local-only, no secrets, no message text — counts and durations only.
 app.get('/metrics', (req, res) => {
-  const limit = Math.min(200, Math.max(0, parseInt(req.query.limit, 10) || 50));
+  // Clamped to the ring, not to a literal. A hard 200 made METRICS_RING
+  // unreadable above 200: the caller configured a larger ring, asked for it,
+  // and was silently handed the newest 200 with nothing in the response to say
+  // so. The ring is the real ceiling, so it is the one that belongs here.
+  const limit = Math.min(metrics.ringSize(), Math.max(0, parseInt(req.query.limit, 10) || 50));
   const conversationId = memory.isValidId(req.query.conversationId) ? req.query.conversationId : null;
   res.json(metrics.snapshot({ limit, conversationId }));
 });

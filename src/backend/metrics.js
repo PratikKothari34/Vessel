@@ -26,7 +26,12 @@ function intEnv(name, def, min, max) {
   return Number.isFinite(v) && v >= min && v <= max ? v : def;
 }
 
-const RING = intEnv('METRICS_RING', 200, 20, 5000);
+// Default 200 is what an interactive session needs. The ceiling is high enough
+// to hold a long unattended run end to end -- a 20,000-turn simulation was
+// silently losing three quarters of its records at the old 5,000 cap -- and a
+// record is ~400 bytes, so even the ceiling is ~20 MB and only reachable by
+// setting it deliberately.
+const RING = intEnv('METRICS_RING', 200, 20, 50000);
 const _ring = [];
 // conversationId -> the previous turn's outbound messages, by reference. Not a
 // concatenated copy: the prefix walk below compares message by message, so the
@@ -174,13 +179,19 @@ function summarize(recs) {
 
 function snapshot({ limit = 50, conversationId = null } = {}) {
   const recs = conversationId ? _ring.filter((r) => r.conversationId === conversationId) : _ring;
+  const recent = recs.slice(-limit);
   return {
-    config: { ring: RING },
+    // `matched` vs `recent.length` is how a caller tells a short answer from a
+    // truncated one. Without it, asking for more records than the ring can
+    // return is indistinguishable from there being no more records.
+    config: { ring: RING, matched: recs.length, returned: recent.length },
     summary: summarize(recs),
-    recent: recs.slice(-limit),
+    recent,
   };
 }
 
+function ringSize() { return RING; }
+
 function reset() { _ring.length = 0; _prevPrompt.clear(); }
 
-module.exports = { record, snapshot, reset, forgetConversation };
+module.exports = { record, snapshot, reset, forgetConversation, ringSize };

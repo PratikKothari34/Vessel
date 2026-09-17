@@ -104,7 +104,10 @@ async fn health() -> Cmd<Json> {
 /// no message text - counts and durations only.
 #[tauri::command]
 fn metrics_snapshot(limit: Option<usize>, conversation_id: Option<String>) -> Json {
-    let limit = limit.unwrap_or(50).min(200);
+    // Clamped to the ring, not to a literal. A hard 200 made METRICS_RING
+    // unreadable above 200: the caller configured a larger ring, asked for it,
+    // and was handed the newest 200 with nothing to say so.
+    let limit = limit.unwrap_or(50).min(metrics::ring_size());
     let conv = conversation_id.filter(|id| memory::is_valid_id(id));
     metrics::snapshot(limit, conv.as_deref())
 }

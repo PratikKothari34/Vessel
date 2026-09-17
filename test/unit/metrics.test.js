@@ -182,3 +182,35 @@ test('a record with no conversation id is stored but skips the reuse estimate', 
   assert.equal(rec.prefillReuse, null);
   assert.equal(metrics.snapshot({}).summary.samples, 1);
 });
+
+test('a truncated answer is distinguishable from a short one', () => {
+  // The reason `matched` exists. A caller that asks for 500 records and gets 50
+  // cannot otherwise tell "that is all there is" from "the ring gave you what
+  // it felt like". Both answers used to look identical on the wire.
+  for (let i = 0; i < 40; i++) metrics.record({ conversationId: 'c1', done: done() });
+
+  const all = metrics.snapshot({ limit: 500 });
+  assert.equal(all.config.matched, 40);
+  assert.equal(all.config.returned, 40);
+  assert.equal(all.recent.length, 40);
+
+  const cut = metrics.snapshot({ limit: 10 });
+  assert.equal(cut.config.matched, 40, 'matched counts what the ring holds, not what it returned');
+  assert.equal(cut.config.returned, 10);
+  assert.equal(cut.recent.length, 10);
+});
+
+test('matched counts the filtered conversation, not the whole ring', () => {
+  for (let i = 0; i < 7; i++) metrics.record({ conversationId: 'c1', done: done() });
+  for (let i = 0; i < 3; i++) metrics.record({ conversationId: 'c2', done: done() });
+  assert.equal(metrics.snapshot({ limit: 100, conversationId: 'c2' }).config.matched, 3);
+  assert.equal(metrics.snapshot({ limit: 100 }).config.matched, 10);
+});
+
+test('ringSize reports the configured ring, which is what the route clamps to', () => {
+  // /metrics used to clamp `limit` to a literal 200, so a larger METRICS_RING
+  // was unreadable past its newest 200 records however it was configured.
+  // The route now clamps to this, so the two can never drift apart again.
+  assert.equal(metrics.ringSize(), metrics.snapshot({}).config.ring);
+  assert.ok(metrics.ringSize() >= 20, 'the ring floor is 20');
+});

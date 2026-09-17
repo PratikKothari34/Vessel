@@ -37,8 +37,13 @@ fn int_env(name: &str, def: usize, min: usize, max: usize) -> usize {
         .unwrap_or(def)
 }
 
-fn ring_size() -> usize {
-    int_env("METRICS_RING", 200, 20, 5000)
+/// Default 200 is what an interactive session needs. The ceiling is high enough
+/// to hold a long unattended run end to end - a 20,000-turn simulation was
+/// silently losing three quarters of its records at the old 5,000 cap - and a
+/// record is a few hundred bytes, so even the ceiling is only reachable by
+/// setting it deliberately.
+pub fn ring_size() -> usize {
+    int_env("METRICS_RING", 200, 20, 50000)
 }
 fn prev_max() -> usize {
     int_env("METRICS_PREV_MAX", 32, 1, 512)
@@ -344,10 +349,18 @@ pub fn snapshot(limit: usize, conversation_id: Option<&str>) -> serde_json::Valu
         None => st.ring.iter().collect(),
     };
     let start = recs.len().saturating_sub(limit);
+    let recent = &recs[start..];
     json!({
-        "config": { "ring": ring_size() },
+        // `matched` against `returned` is how a caller tells a short answer from
+        // a truncated one. Without it, asking for more records than the ring can
+        // return is indistinguishable from there being no more records.
+        "config": {
+            "ring": ring_size(),
+            "matched": recs.len(),
+            "returned": recent.len(),
+        },
         "summary": summarize(&recs),
-        "recent": recs[start..],
+        "recent": recent,
     })
 }
 
@@ -466,5 +479,53 @@ mod tests {
             "only the record that reloaded weights counts"
         );
         assert!(s["cacheReuse"].is_null(), "no backend reported KV reuse");
+    }
+
+    /// The only test that touches the global ring, so it cannot race another.
+    /// Everything else here works on `summarize` directly for exactly that
+    /// reason; this one has to go through the store because `matched` is a
+    /// property of the store, not of a slice.
+    #[test]
+    fn a_truncated_snapshot_is_distinguishable_from_a_short_one() {
+        reset();
+        for _ in 0..40 {
+            record(Sample {
+                conversation_id: Some("c1"),
+                character_id: None,
+                model: None,
+                backend: "ollama",
+                done: None,
+                window: None,
+                prompt_messages: None,
+                aborted: false,
+            });
+        }
+
+        let all = snapshot(500, Some("c1"));
+        assert_eq!(all["config"]["matched"], 40);
+        assert_eq!(all["config"]["returned"], 40);
+
+        let cut = snapshot(10, Some("c1"));
+        assert_eq!(
+            cut["config"]["matched"], 40,
+            "matched counts what the ring holds, not what it returned"
+        );
+        assert_eq!(cut["config"]["returned"], 10);
+        assert_eq!(cut["recent"].as_array().unwrap().len(), 10);
+
+        assert_eq!(
+            snapshot(10, Some("nobody"))["config"]["matched"],
+            0,
+            "matched is scoped to the filtered conversation"
+        );
+        reset();
+    }
+
+    #[test]
+    fn the_ring_ceiling_is_high_enough_for_an_unattended_run() {
+        // The route clamps `limit` to this, so a caller can always read back the
+        // ring it configured. A 20,000-turn run does not fit under the old cap.
+        assert_eq!(ring_size(), 200, "unset METRICS_RING means the default");
+        assert_eq!(int_env("METRICS_RING", 200, 20, 50_000), 200);
     }
 }
