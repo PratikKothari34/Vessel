@@ -689,6 +689,62 @@ function decodeEmbedding(buf) {
   return new Float32Array(ab);
 }
 
+// Decode a stored blob straight into an int8 row of a caller-owned matrix,
+// WITHOUT dequantizing. Returns true if the row is usable.
+//
+// Cosine is invariant to positive scaling, so the per-vector scale in the blob
+// carries no direction and the retrieval scan never needs it: scoring the raw
+// int8 components against their own norm gives exactly the cosine that
+// dequantizing to f32 and re-normalizing would, because the dequantized vector
+// IS scale * q8 and its unit form is therefore q8 / |q8|. Skipping the scale
+// pass removes a multiply per component on every cold cache fill and lets the
+// cache hold the row at a quarter of the width.
+//
+// The rejections below are the whole reason this returns a boolean. An int8 row
+// cannot carry Infinity or NaN -- the type will not hold them -- so poison can
+// only arrive in a legacy f32 blob, and that is where the finiteness check
+// lives. A non-finite component would otherwise make the row's norm non-finite,
+// every score against it NaN, and NaN loses no comparison: the row would rank
+// above real matches and, as the k-th best, let every remaining row through.
+// Quantizing on the way in confines that failure to this one function.
+function decodeEmbeddingInt8(buf, out, offset) {
+  if (!buf) return false;
+  const b = Buffer.isBuffer(buf) ? buf
+    : buf instanceof Uint8Array ? Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength)
+    : Buffer.from(buf);
+
+  // int8 (current format): the components are already what the scan wants.
+  if (b.byteLength > EMBED_INT8_HEADER && b[0] === EMBED_BLOB_MAGIC && b[1] === EMBED_BLOB_INT8) {
+    if (b.byteLength - EMBED_INT8_HEADER !== EMBED_DIM) return false;
+    // The scale is unused for direction, but a non-finite one means the blob is
+    // corrupt somewhere, and a corrupt header is not a row to trust.
+    if (!Number.isFinite(b.readFloatLE(2))) return false;
+    out.set(new Int8Array(b.buffer, b.byteOffset + EMBED_INT8_HEADER, EMBED_DIM), offset);
+    return true;
+  }
+
+  // Legacy f32: quantize on the way in, so the cache holds one format only.
+  // Read component by component rather than through a Float32Array view -- a
+  // driver can hand back a BLOB as a slice of a pooled ArrayBuffer whose
+  // byteOffset is not 4-aligned, which makes the view constructor throw.
+  if (b.byteLength !== EMBED_DIM * 4) return false;
+  let maxAbs = 0;
+  for (let i = 0; i < EMBED_DIM; i++) {
+    const x = b.readFloatLE(i * 4);
+    if (!Number.isFinite(x)) return false;
+    const a = x < 0 ? -x : x;
+    if (a > maxAbs) maxAbs = a;
+  }
+  if (maxAbs === 0) return false; // no direction
+  const inv = 127 / maxAbs;
+  for (let i = 0; i < EMBED_DIM; i++) {
+    let q = Math.round(b.readFloatLE(i * 4) * inv);
+    if (q > 127) q = 127; else if (q < -127) q = -127;
+    out[offset + i] = q;
+  }
+  return true;
+}
+
 module.exports = {
   getDb,
   resolveSyncUrl,
@@ -698,6 +754,7 @@ module.exports = {
   unencryptedReason,
   encodeEmbedding,
   decodeEmbedding,
+  decodeEmbeddingInt8,
   EMBED_DIM,
   EMBED_QUANTIZE,
   // Only what a caller actually reads. The rest of the boot state has its own

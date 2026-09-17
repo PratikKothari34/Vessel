@@ -161,3 +161,70 @@ test('the codec is stable across encodes', () => {
   const v = unitVector(768, 424242);
   assert.deepEqual(db.encodeEmbedding(v), db.encodeEmbedding(v));
 });
+
+// ---- decodeEmbeddingInt8: the retrieval cache's decoder -------------------
+// It skips the dequantize pass entirely and writes int8 straight into a shared
+// matrix. That makes it the one decoder whose rejections matter for ranking:
+// anything it lets through is scored, and a non-finite component that got in
+// would make every score against that row NaN.
+
+test('the int8 decoder writes a row at its offset and leaves neighbours alone', () => {
+  const v = unitVector();
+  const blob = db.encodeEmbedding(v);
+  const mat = new Int8Array(3 * db.EMBED_DIM).fill(7);
+  assert.equal(db.decodeEmbeddingInt8(blob, mat, db.EMBED_DIM), true);
+
+  const body = new Int8Array(blob.buffer, blob.byteOffset + 6, db.EMBED_DIM);
+  for (let i = 0; i < db.EMBED_DIM; i++) {
+    assert.equal(mat[db.EMBED_DIM + i], body[i], `component ${i}`);
+  }
+  assert.equal(mat[0], 7, 'wrote before its slot');
+  assert.equal(mat[2 * db.EMBED_DIM], 7, 'wrote past its slot');
+});
+
+test('a legacy f32 row is quantized on the way in, keeping its direction', () => {
+  const v = unitVector(768, 777);
+  const blob = dbF32.encodeEmbedding(v);
+  const mat = new Int8Array(db.EMBED_DIM);
+  assert.equal(db.decodeEmbeddingInt8(blob, mat, 0), true);
+  assert.ok(cosine(Array.from(mat), v) > 0.999, 'direction lost in quantization');
+});
+
+test('the int8 decoder rejects a legacy row carrying a non-finite component', () => {
+  // The whole reason it returns a boolean. int8 cannot hold Infinity, so this is
+  // the only door poison can come through.
+  for (const bad of [Infinity, -Infinity, NaN]) {
+    const v = unitVector();
+    v[13] = bad;
+    const mat = new Int8Array(db.EMBED_DIM);
+    assert.equal(db.decodeEmbeddingInt8(dbF32.encodeEmbedding(v), mat, 0), false, `${bad}`);
+  }
+});
+
+test('the int8 decoder rejects rows of the wrong width, both formats', () => {
+  const mat = new Int8Array(db.EMBED_DIM);
+  assert.equal(db.decodeEmbeddingInt8(db.encodeEmbedding(unitVector(64)), mat, 0), false, 'short int8');
+  assert.equal(db.decodeEmbeddingInt8(dbF32.encodeEmbedding(unitVector(64)), mat, 0), false, 'short f32');
+  assert.equal(db.decodeEmbeddingInt8(Buffer.alloc(0), mat, 0), false, 'empty');
+  assert.equal(db.decodeEmbeddingInt8(null, mat, 0), false, 'missing');
+});
+
+test('the int8 decoder rejects a blob whose scale header is corrupt', () => {
+  const blob = Buffer.from(db.encodeEmbedding(unitVector()));
+  blob.writeFloatLE(NaN, 2);
+  assert.equal(db.decodeEmbeddingInt8(blob, new Int8Array(db.EMBED_DIM), 0), false);
+});
+
+test('the int8 decoder survives an unaligned slice of a pooled buffer', () => {
+  // Same hazard the f32 decoder guards: a driver can hand back a BLOB whose
+  // byteOffset is not 4-aligned, which makes a Float32Array view throw.
+  const v = unitVector();
+  const blob = dbF32.encodeEmbedding(v);
+  const pool = Buffer.alloc(blob.byteLength + 3);
+  blob.copy(pool, 3);
+  const unaligned = pool.subarray(3);
+  assert.notEqual(unaligned.byteOffset % 4, 0, 'test did not actually misalign');
+  const mat = new Int8Array(db.EMBED_DIM);
+  assert.equal(db.decodeEmbeddingInt8(unaligned, mat, 0), true);
+  assert.ok(cosine(Array.from(mat), v) > 0.999);
+});

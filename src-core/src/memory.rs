@@ -497,11 +497,6 @@ fn normalize_in_place(v: &mut [f32]) -> bool {
     true
 }
 
-/// Cosine similarity of two ALREADY-NORMALIZED vectors.
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-}
-
 /// The k best rows, strongest first, by dot product against `query`.
 ///
 /// Bounded selection, not a sort. Scoring every row and sorting the survivors is
@@ -509,17 +504,32 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// grows with the story. Here each row costs one compare against the current
 /// k-th best, and only a winner pays an O(k) insert - k is 4, so that insert is
 /// free.
-fn top_k(query: &[f32], ids: &[i64], vecs: &[f32], k: usize, min_score: f32) -> Vec<(i64, f32)> {
+fn top_k(
+    query: &[f32],
+    ids: &[i64],
+    mat: &[i8],
+    norms: &[f32],
+    k: usize,
+    min_score: f32,
+) -> Vec<(i64, f32)> {
     let mut top: Vec<(i64, f32)> = Vec::with_capacity(k);
     if k == 0 {
         return top;
     }
     let mut cutoff = min_score;
     for (i, id) in ids.iter().enumerate() {
-        let score = dot(query, &vecs[i * EMBED_DIM..(i + 1) * EMBED_DIM]);
+        // Raw int8 against the unit query, then scaled by the row's own
+        // inverse norm: that product IS the cosine, because the row's
+        // dequantized form is a positive multiple of these components.
+        let row = &mat[i * EMBED_DIM..(i + 1) * EMBED_DIM];
+        let d: f32 = query.iter().zip(row).map(|(q, &v)| q * v as f32).sum();
+        let score = d * norms[i];
         // Negated rather than `score < cutoff`: NaN fails every comparison, so
-        // this form drops it where the direct one would let it through. Costs
-        // nothing - it is the same single compare. Clippy wants `partial_cmp`
+        // this form drops it where the direct one would let it through. Nothing
+        // reaching here can be NaN any more - an i8 row cannot hold one and the
+        // norm is finite and positive by construction - but the guard is free,
+        // and it is the last line of defence if a future format lets one back
+        // in. Clippy wants `partial_cmp`
         // for exactly the reason the negation is here, and spelling out a
         // three-way match on the hot scan would say less, not more.
         #[allow(clippy::neg_cmp_op_on_partial_ord)]
@@ -544,9 +554,17 @@ fn top_k(query: &[f32], ids: &[i64], vecs: &[f32], k: usize, min_score: f32) -> 
 // turn: 3 KB per row off disk, a decode per row, then two sqrt loops per row.
 // None of that changes between turns - the archive is append-only.
 //
-// So keep the decoded, normalized vectors resident per conversation and load
-// only rows newer than the high-water mark. Steady state is zero row reads and
-// zero decodes; a turn that archives adds a handful.
+// So keep the vectors resident per conversation and load only rows newer than
+// the high-water mark. Steady state is zero row reads and zero decodes; a turn
+// that archives adds a handful.
+//
+// They are held as ONE flat int8 matrix, exactly as they sit on disk, plus a
+// per-row inverse norm - not as decoded, normalized f32. Cosine is invariant to
+// positive scaling, so scoring raw int8 against its own norm gives the same
+// number dequantizing would (see `embed::decode_int8`), and the layout quarters
+// both the resident bytes and the bytes the scan walks. Measured on the JS twin
+// at 40,000 archived turns: cold fill 130 ms -> 43 ms, resident 123 MB -> 31 MB.
+// The scan itself is not the point - it was ~1% of a turn either way.
 //
 // Correctness against cloud sync: a pull can insert archive rows with ids BELOW
 // our high-water mark (another device's autoincrement is independent of ours),
@@ -557,9 +575,11 @@ fn top_k(query: &[f32], ids: &[i64], vecs: &[f32], k: usize, min_score: f32) -> 
 #[derive(Default)]
 struct CacheEntry {
     ids: Vec<i64>,
-    /// All vectors end to end, `EMBED_DIM` floats each. One allocation and one
-    /// contiguous walk for the whole scan.
-    vecs: Vec<f32>,
+    /// All vectors end to end, `EMBED_DIM` int8 components each. One allocation
+    /// and one contiguous walk for the whole scan.
+    mat: Vec<i8>,
+    /// `1 / |row|` for each row, precomputed from the int8 components.
+    norms: Vec<f32>,
     max_id: i64,
     rows_seen: usize,
 }
@@ -567,7 +587,8 @@ struct CacheEntry {
 impl CacheEntry {
     fn reset(&mut self) {
         self.ids.clear();
-        self.vecs.clear();
+        self.mat.clear();
+        self.norms.clear();
         self.max_id = 0;
         self.rows_seen = 0;
     }
@@ -645,16 +666,24 @@ async fn fetch_archive_rows(
 }
 
 fn absorb_rows(e: &mut CacheEntry, rows: Vec<(i64, Vec<u8>)>) {
-    e.vecs.reserve(rows.len() * EMBED_DIM);
+    e.mat.reserve(rows.len() * EMBED_DIM);
+    e.ids.reserve(rows.len());
+    e.norms.reserve(rows.len());
     for (id, blob) in rows {
-        let Some(mut vec) = codec::decode(&blob) else {
+        // Appends nothing on rejection, so a bad row leaves the matrix exactly
+        // as it found it and cannot shift the rows after it out of alignment.
+        if !codec::decode_int8(&blob, EMBED_DIM, &mut e.mat) {
             continue;
-        };
-        if vec.len() != EMBED_DIM || !normalize_in_place(&mut vec) {
-            continue; // no usable vector -> the row is not retrievable
         }
+        let row = &e.mat[e.mat.len() - EMBED_DIM..];
+        let sq: i32 = row.iter().map(|&x| x as i32 * x as i32).sum();
+        if sq == 0 {
+            // No direction: it matches nothing, and 1/0 is not a score.
+            e.mat.truncate(e.mat.len() - EMBED_DIM);
+            continue;
+        }
+        e.norms.push(1.0 / (sq as f32).sqrt());
         e.ids.push(id);
-        e.vecs.extend_from_slice(&vec);
     }
 }
 
@@ -706,8 +735,8 @@ async fn load_archive_vectors(db: &Db, conversation_id: &str, e: &mut CacheEntry
 /// above the score threshold, in chronological order.
 ///
 /// Three things keep the in-process ranking cheap:
-/// - vectors are cached decoded and normalized, so the scan is one multiply-add
-///   loop per row and nothing else;
+/// - vectors are cached as int8 with a precomputed inverse norm, so the scan is
+///   one multiply-add loop per row and nothing else;
 /// - the scan reads NO prose - only the winners' text is fetched, so a
 ///   2,000-turn archive costs four row reads per turn instead of 2,000;
 /// - the archive is checked BEFORE the embed, so a conversation that has not
@@ -730,7 +759,14 @@ pub async fn retrieve(db: &Db, conversation_id: &str, query_text: &str) -> Resul
         return Ok(Vec::new());
     }
 
-    let mut top = top_k(&q, &e.ids, &e.vecs, cfg.retrieve_k, cfg.retrieve_min_score);
+    let mut top = top_k(
+        &q,
+        &e.ids,
+        &e.mat,
+        &e.norms,
+        cfg.retrieve_k,
+        cfg.retrieve_min_score,
+    );
     drop(e);
     if top.is_empty() {
         return Ok(Vec::new());
@@ -2176,7 +2212,8 @@ mod tests {
         let mut a = vec![3.0f32, 4.0];
         normalize_in_place(&mut a);
         assert!((a[0] - 0.6).abs() < 1e-6 && (a[1] - 0.8).abs() < 1e-6);
-        assert!((dot(&a, &a) - 1.0).abs() < 1e-6);
+        let self_dot: f32 = a.iter().map(|x| x * x).sum();
+        assert!((self_dot - 1.0).abs() < 1e-6);
         // A zero vector has no direction; scaling it would be a divide by zero.
         let mut z = vec![0.0f32; 4];
         assert!(!normalize_in_place(&mut z));
@@ -2193,6 +2230,28 @@ mod tests {
         }
     }
 
+    /// Build the scan's layout from unit vectors: the flat int8 matrix and the
+    /// per-row inverse norms, exactly as `absorb_rows` would.
+    fn quantized(seeds: &[f32]) -> (Vec<i64>, Vec<i8>, Vec<f32>) {
+        let mut ids = Vec::new();
+        let mut mat = Vec::new();
+        let mut norms = Vec::new();
+        for (i, seed) in seeds.iter().enumerate() {
+            let mut v = unit(*seed);
+            normalize_in_place(&mut v);
+            assert!(codec::decode_int8(
+                &codec::encode_int8(&v),
+                EMBED_DIM,
+                &mut mat
+            ));
+            let row = &mat[mat.len() - EMBED_DIM..];
+            let sq: i32 = row.iter().map(|&x| x as i32 * x as i32).sum();
+            norms.push(1.0 / (sq as f32).sqrt());
+            ids.push(i as i64 + 1);
+        }
+        (ids, mat, norms)
+    }
+
     #[test]
     fn one_nan_row_cannot_outrank_the_real_matches_or_unblock_the_rest() {
         // The failure this guards: NaN loses no comparison, so a direct
@@ -2202,19 +2261,13 @@ mod tests {
         let mut q = unit(0.0);
         normalize_in_place(&mut q);
 
-        let mut vecs = Vec::new();
-        let mut ids = Vec::new();
-        // Row 1 scores NaN, row 2 is a real match, row 3 is far away.
-        vecs.extend(std::iter::repeat_n(f32::NAN, EMBED_DIM));
-        ids.push(1);
-        for (i, seed) in [0.0f32, 9.0].iter().enumerate() {
-            let mut v = unit(*seed);
-            normalize_in_place(&mut v);
-            vecs.extend_from_slice(&v);
-            ids.push(i as i64 + 2);
-        }
+        // Row 1 scores NaN, row 2 is a real match, row 3 is far away. An i8 row
+        // cannot itself hold a NaN, so the poison goes in through the only float
+        // left in the row - its inverse norm.
+        let (ids, mat, mut norms) = quantized(&[5.0, 0.0, 9.0]);
+        norms[0] = f32::NAN;
 
-        let top = top_k(&q, &ids, &vecs, 4, 0.9);
+        let top = top_k(&q, &ids, &mat, &norms, 4, 0.9);
         assert_eq!(
             top.len(),
             1,
@@ -2234,22 +2287,16 @@ mod tests {
         });
         absorb_rows(&mut e, vec![(1, poisoned), (2, good)]);
         assert_eq!(e.ids, vec![2], "the poisoned row was cached");
-        assert_eq!(e.vecs.len(), EMBED_DIM, "and its vector with it");
+        assert_eq!(e.mat.len(), EMBED_DIM, "and its vector with it");
+        assert_eq!(e.norms.len(), 1, "and its norm with it");
     }
 
     #[test]
     fn selection_returns_the_best_k_strongest_first() {
         let mut q = unit(0.0);
         normalize_in_place(&mut q);
-        let mut vecs = Vec::new();
-        let mut ids = Vec::new();
-        for (i, seed) in [0.0f32, 2.0, 0.05, 4.0].iter().enumerate() {
-            let mut v = unit(*seed);
-            normalize_in_place(&mut v);
-            vecs.extend_from_slice(&v);
-            ids.push(i as i64 + 1);
-        }
-        let top = top_k(&q, &ids, &vecs, 2, -1.0);
+        let (ids, mat, norms) = quantized(&[0.0, 2.0, 0.05, 4.0]);
+        let top = top_k(&q, &ids, &mat, &norms, 2, -1.0);
         assert_eq!(top.len(), 2);
         assert_eq!(top[0].0, 1, "the identical vector wins");
         assert_eq!(top[1].0, 3, "the near-identical one is second");
@@ -2260,11 +2307,10 @@ mod tests {
     fn the_score_floor_can_reject_everything() {
         let mut q = unit(0.0);
         normalize_in_place(&mut q);
-        let mut v = unit(9.0);
-        normalize_in_place(&mut v);
-        assert!(top_k(&q, &[1], &v, 4, 0.999).is_empty());
+        let (ids, mat, norms) = quantized(&[9.0]);
+        assert!(top_k(&q, &ids, &mat, &norms, 4, 0.999).is_empty());
         assert!(
-            top_k(&q, &[1], &v, 0, -1.0).is_empty(),
+            top_k(&q, &ids, &mat, &norms, 0, -1.0).is_empty(),
             "k=0 disables retrieval"
         );
     }
@@ -2775,7 +2821,8 @@ mod tests {
         }
         load_archive_vectors(&db, "conv1", &mut e).await.unwrap();
         assert_eq!(e.ids.len(), 3);
-        assert_eq!(e.vecs.len(), 3 * EMBED_DIM);
+        assert_eq!(e.mat.len(), 3 * EMBED_DIM);
+        assert_eq!(e.norms.len(), 3);
         let high = e.max_id;
 
         // A second pass with nothing new must not re-read a single row.
@@ -2821,7 +2868,8 @@ mod tests {
             3,
             "the cache rebuilt rather than kept a dead vector"
         );
-        assert_eq!(e.vecs.len(), 3 * EMBED_DIM);
+        assert_eq!(e.mat.len(), 3 * EMBED_DIM);
+        assert_eq!(e.norms.len(), 3);
     }
 
     #[tokio::test]

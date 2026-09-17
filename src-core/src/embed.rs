@@ -97,6 +97,70 @@ pub fn decode(blob: &[u8]) -> Option<Vec<f32>> {
     )
 }
 
+/// Decode a stored blob into `dim` int8 components appended to `out`, WITHOUT
+/// dequantizing. Returns false and appends nothing if the row is unusable.
+///
+/// Cosine is invariant to positive scaling, so the per-vector scale carries no
+/// direction and the retrieval scan never needs it: scoring the raw int8
+/// components against their own norm gives exactly the cosine that dequantizing
+/// to f32 and re-normalizing would, because the dequantized vector IS
+/// `scale * q8` and its unit form is therefore `q8 / |q8|`. Skipping the scale
+/// pass removes a multiply per component on every cold cache fill and lets the
+/// cache hold each row at a quarter of the width.
+///
+/// The rejections are the whole reason this returns a bool. An i8 cannot hold
+/// an infinity or a NaN, so poison can only arrive in a legacy f32 blob, and
+/// that is where the finiteness check lives. A non-finite component would
+/// otherwise make the row's norm non-finite and every score against it NaN -
+/// and NaN loses no comparison, so the row would rank above real matches and,
+/// as the k-th best, let every remaining row through. Quantizing on the way in
+/// confines that failure to this one function.
+pub fn decode_int8(blob: &[u8], dim: usize, out: &mut Vec<i8>) -> bool {
+    let start = out.len();
+
+    // Current format: the components are already what the scan wants.
+    if blob.len() > INT8_HEADER && blob[0] == MAGIC && blob[1] == FORMAT_INT8 {
+        let body = &blob[INT8_HEADER..];
+        if body.len() != dim {
+            return false;
+        }
+        // Unused for direction, but a non-finite scale means the blob is
+        // corrupt somewhere, and a corrupt header is not a row to trust.
+        if !f32::from_le_bytes([blob[2], blob[3], blob[4], blob[5]]).is_finite() {
+            return false;
+        }
+        out.extend(body.iter().map(|&b| b as i8));
+        return true;
+    }
+
+    // Legacy f32: quantize on the way in, so the cache holds one format only.
+    if blob.len() != dim * 4 {
+        return false;
+    }
+    let comps = blob.as_chunks::<4>().0;
+    let mut max_abs = 0f32;
+    for c in comps {
+        let x = f32::from_le_bytes(*c);
+        if !x.is_finite() {
+            return false;
+        }
+        max_abs = max_abs.max(x.abs());
+    }
+    if max_abs == 0.0 {
+        return false; // no direction
+    }
+    let inv = 127.0f32 / max_abs;
+    for c in comps {
+        // Round half UP, matching `encode_int8` and the JS codec.
+        let q = (f32::from_le_bytes(*c) * inv + 0.5)
+            .floor()
+            .clamp(-127.0, 127.0);
+        out.push(q as i8);
+    }
+    debug_assert_eq!(out.len() - start, dim);
+    true
+}
+
 /// Cosine similarity. Returns 0 for a zero-norm vector or a length mismatch,
 /// so a malformed row scores below any threshold instead of poisoning a scan.
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -185,5 +249,119 @@ mod tests {
     #[test]
     fn cosine_rejects_mismatched_lengths() {
         assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
+    }
+
+    // ---- decode_int8: the retrieval cache's decoder ----------------------
+    // It skips the dequantize pass and appends int8 straight to a shared
+    // matrix. That makes its rejections load-bearing for ranking: anything it
+    // lets through gets scored, and a non-finite component would make every
+    // score against that row NaN.
+
+    #[test]
+    fn the_int8_decoder_appends_a_row_and_leaves_the_matrix_before_it_alone() {
+        let v = unit_vector(768, 4242);
+        let blob = encode_int8(&v);
+        let mut mat: Vec<i8> = vec![7; 768];
+        assert!(decode_int8(&blob, 768, &mut mat));
+        assert_eq!(mat.len(), 1536);
+        assert!(
+            mat[..768].iter().all(|&x| x == 7),
+            "clobbered the row before"
+        );
+        for i in 0..768 {
+            assert_eq!(mat[768 + i], blob[INT8_HEADER + i] as i8, "component {i}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_f32_row_is_quantized_on_the_way_in_and_keeps_its_direction() {
+        let v = unit_vector(768, 777);
+        let mut mat: Vec<i8> = Vec::new();
+        assert!(decode_int8(&encode_f32(&v), 768, &mut mat));
+        let as_f32: Vec<f32> = mat.iter().map(|&x| x as f32).collect();
+        assert!(
+            cosine(&as_f32, &v) > 0.999,
+            "direction lost in quantization"
+        );
+    }
+
+    #[test]
+    fn the_int8_decoder_rejects_a_legacy_row_with_a_non_finite_component() {
+        // The whole reason it returns a bool. An i8 cannot hold an infinity, so
+        // this is the only door poison can come through.
+        for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let mut v = unit_vector(768, 1);
+            v[13] = bad;
+            let mut mat: Vec<i8> = Vec::new();
+            assert!(!decode_int8(&encode_f32(&v), 768, &mut mat), "{bad}");
+            assert!(mat.is_empty(), "{bad}: a rejected row left debris behind");
+        }
+    }
+
+    #[test]
+    fn a_rejected_row_appends_nothing_so_the_matrix_stays_aligned() {
+        // The rows are addressed by index times EMBED_DIM. A rejection that
+        // left a partial row behind would shift every row after it, and every
+        // id would then point at someone else's vector.
+        let mut mat: Vec<i8> = Vec::new();
+        assert!(decode_int8(
+            &encode_int8(&unit_vector(768, 3)),
+            768,
+            &mut mat
+        ));
+        for bad in [
+            encode_int8(&unit_vector(64, 3)),   // wrong width, int8
+            encode_f32(&unit_vector(64, 3)),    // wrong width, legacy
+            Vec::new(),                         // empty
+            vec![0xe0, 0x01, 0, 0, 0xc0, 0x7f], // int8 header, NaN scale
+        ] {
+            assert!(!decode_int8(&bad, 768, &mut mat));
+            assert_eq!(mat.len(), 768, "a rejected row changed the matrix");
+        }
+        assert!(decode_int8(
+            &encode_int8(&unit_vector(768, 5)),
+            768,
+            &mut mat
+        ));
+        assert_eq!(mat.len(), 1536, "the good row after the bad ones was lost");
+    }
+
+    #[test]
+    fn a_zero_vector_has_no_direction_to_quantize() {
+        let mut mat: Vec<i8> = Vec::new();
+        // Legacy: caught here, because 127/0 is not a scale.
+        assert!(!decode_int8(&encode_f32(&vec![0.0f32; 768]), 768, &mut mat));
+        // int8: it decodes as all zeros, and the caller drops it on the norm.
+        assert!(decode_int8(&encode_int8(&vec![0.0f32; 768]), 768, &mut mat));
+        assert!(mat.iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn scoring_raw_int8_against_its_own_norm_is_the_cosine() {
+        // The cache skips dequantizing because cosine ignores the per-vector
+        // scale. This pins the equivalence: the fast score must match the score
+        // computed the long way from the same components.
+        let mut q = unit_vector(768, 31);
+        let qn = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in &mut q {
+            *x /= qn;
+        }
+        for seed in [1u32, 99, 12345] {
+            let mut mat: Vec<i8> = Vec::new();
+            assert!(decode_int8(
+                &encode_int8(&unit_vector(768, seed)),
+                768,
+                &mut mat
+            ));
+            let sq: i32 = mat.iter().map(|&x| x as i32 * x as i32).sum();
+            let fast: f32 =
+                q.iter().zip(&mat).map(|(a, &b)| a * b as f32).sum::<f32>() / (sq as f32).sqrt();
+
+            // the long way, from the same components, through any positive scale
+            let deq: Vec<f32> = mat.iter().map(|&x| x as f32 * 0.0037).collect();
+            let slow = cosine(&q, &deq);
+
+            assert!((fast - slow).abs() < 1e-5, "seed {seed}: {fast} vs {slow}");
+        }
     }
 }
