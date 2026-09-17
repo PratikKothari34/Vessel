@@ -354,7 +354,12 @@ module.exports = {
     cachePrompt: CACHE_PROMPT,
     modelParams: MODEL_PARAMS,
   }),
-  // Exported for the verification rig; not used on the request path.
+  // Exported for test/unit/llama-server-translate.test.js; not used on the
+  // request path. Both transforms fail silently in production -- a renamed
+  // sampling key is dropped, an uncounted cached token shrinks the number the
+  // window size is chosen from -- so they are pinned rather than left to a rig.
+  // _modelParams is here to pin that num_ctx is stripped from the Modelfile
+  // defaults before they are ever translated.
   _translateSampling: translateSampling,
   _doneChunk: doneChunk,
   _modelParams: MODEL_PARAMS,
