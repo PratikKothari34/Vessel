@@ -78,5 +78,10 @@ local-llama = ["dep:llama-cpp-2"]
 # toolchain is required only when CUDA is wanted.
 local-llama-cuda = ["local-llama", "llama-cpp-2/cuda"]
 
+# Only buildable with the engine it measures; `cargo test` skips it otherwise.
+[[example]]
+name = "bench-local-llama"
+required-features = ["local-llama"]
+
 [dev-dependencies]
 tempfile = "3"

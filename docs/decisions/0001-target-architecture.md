@@ -41,8 +41,11 @@ from any HTTP-based design:
 
 - **Summarisation reuses the already-loaded chat weights** at zero marginal
   VRAM and zero marginal disk. Deletes `gemma3:4b` outright (~3.3 GB).
-- **Persistent per-conversation KV cache** (slot save/restore). Resuming a story
-  costs a file read instead of a full prefill.
+- **Per-conversation KV cache** (slot save/restore). Switching stories costs a
+  memcpy instead of a full prefill. Delivered in RAM, byte-budgeted by
+  `LLAMA_KV_CACHE_MB`; the disk half of "persistent" was considered and rejected
+  (see `docs/MASTER.md`, stage 4b), so a cache still does not outlive the
+  process.
 - **Pipelining** — prefill the stable prefix while the embed/retrieve runs,
   hiding the CPU embed entirely.
 - Direct token callbacks. No HTTP, no NDJSON parse, no SSE re-encode.
@@ -59,7 +62,7 @@ Each stage ships and measures independently. Every stage survives the next.
 | 2 | Prompt reorder + retrieval fixes | **done** — prefill reuse p50 0.408 -> 0.717; stable prefix 8% -> 88%. |
 | 3 | Ollama -> llama-server | **done, measured on the target GPU.** Adapter behind `INFERENCE_BACKEND`; both backends pass the same suite. Decode 39.4 -> 46.5 tok/s, prefill ~1,600 -> ~2,200 tok/s, 6.4 -> 6.03 GB resident, and the summariser's 19,365 ms reload becomes 0. KV reuse is now measured (`cache_n` p50 0.985), not estimated. Numbers in `docs/MASTER.md`. |
 | 4a | Rust core + Tauri shell | **done, not yet run against a live window.** Two crates: `vessel-core` (no GUI dependency) and the `vessel` shell in `src-tauri/`. The renderer is the same React build. The loopback socket, the CORS allowlist, the Host guard and the CSRF header all go away with the HTTP tier. Open risk below is closed. The IPC ACL has never faced a live renderer - that needs a desktop window, which no test here can open. |
-| 4b | In-process llama.cpp | **done, behind a feature.** `llama-cpp-2` in `src-core/src/inference/llama_local.rs`, built with `local-llama` (CPU) or `local-llama-cuda`; the default build still talks to llama-server. Chat and summarisation share one resident model, and `cached_tokens` becomes a measured prefix rather than an estimate. **Persistent per-conversation KV (slot save/restore) is still open** - the cache survives the turn, not the process. Not re-measured on the 4060. |
+| 4b | In-process llama.cpp | **done, behind a feature.** `llama-cpp-2` in `src-core/src/inference/llama_local.rs`, built with `local-llama` (CPU) or `local-llama-cuda`; the default build still talks to llama-server. Chat and summarisation share one resident model, and `cached_tokens` becomes a measured prefix rather than an estimate. Per-conversation KV is **done in RAM**: switching parks the outgoing cache and restores the incoming one, budgeted in bytes by `LLAMA_KV_CACHE_MB`; the disk tier was rejected on SSD wear, so a cache still does not outlive the process. **Measured on the 4060:** decode 45.1 tok/s and prefill 2,287 tok/s - parity with llama-server, because the HTTP hop was never on the token path - while re-entering a parked conversation costs 112 ms against 1,226 ms to re-prefill. The cache is the win, not the tokens per second. |
 
 Stage 1 also surfaced the cost Stage 3 and Stage 4 are meant to delete. Ollama
 keys a resident model on **(model, num_ctx)**, so the summariser evicts the chat

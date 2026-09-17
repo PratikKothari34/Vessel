@@ -523,19 +523,19 @@ the numbers this table carried before; the Electron rows are unaffected.
 
 | Area | Electron track | Rust track | |
 |---|---|---|---|
-| backend / core, production only | 4,298 | 7,498 | [M] |
-| of which `inference/` | 793 | 2,619 | [M] |
-| shell (main + preload / Tauri) | 239 | 561 | [M] |
-| tests | 3,461 | 3,971 | [M] |
-| test count | 202 | 165 | [M] |
+| backend / core, production only | 4,298 | 8,053 | [M] |
+| of which `inference/` | 793 | 2,970 | [M] |
+| shell (main + preload / Tauri) | 239 | 564 | [M] |
+| tests | 3,461 | 3,974 | [M] |
+| test count | 202 | 167 | [M] |
 | renderer JS/JSX | 1,536 | shared, unchanged | [M] |
 | renderer CSS | 752 | shared, unchanged | [M] |
 
 Rust is longer per unit of behaviour and that is the trade: explicit error
 types, no prototype chain to smuggle a key through, and a compiler that rejects
 the shape of bug the Node suite had to test for. The test counts are close
-because both suites cover the same behaviour; the Rust side folds 138 of its
-165 into the modules they test, so a failure names the function rather than an
+because both suites cover the same behaviour; the Rust side folds 139 of its
+167 into the modules they test, so a failure names the function rather than an
 endpoint. The Electron suite is the larger of the two because it also has to
 test a perimeter the Rust track does not have: 32 of its 202 are red-team tests
 against the HTTP surface.
@@ -551,6 +551,28 @@ The blocker on this stage was the toolchain, and it is gone: MSVC Build Tools
 with the C++ workload and the CUDA Toolkit went on 2026-09-15, and the plain
 `cargo test -p vessel-core` has been the correct invocation since.
 
+**The feature build needs its own invocation.** `C:\msys64\ucrt64\bin` is on
+this machine's PATH and shadows `cmake`, so a plain
+`cargo build --features local-llama` runs MSYS2's cmake, which hands MSVC the
+MinGW headers in `C:\msys64\ucrt64\include`. The compile dies inside llama.cpp's
+vendored cpp-httplib with `corecrt.h(170): C2061: syntax error: identifier
+'__UINTPTR_TYPE__'` and `winnt.h(144): C1189: No supported target architecture` -
+which reads like a llama.cpp bug and is not one. Nothing on the Rust side can fix
+it; the choice is made before rustc runs. `src-core/build-local-llama.ps1` is the
+fix: it drops MSYS2 and MinGW from PATH, imports vcvars64, and puts the CMake
+inside Build Tools first.
+
+    powershell -ExecutionPolicy Bypass -File src-core\build-local-llama.ps1 -Cuda -Release -Command build
+
+`-Command` also takes `check`, `clippy`, `test`, and `run` - the last with
+`-Example <name>`, which is how the benchmark below is driven. Drop `-Cuda` for
+the CPU feature and `-Release` for a debug build. The first CUDA build is about
+30 minutes; it is cached after that.
+
+A stale `CMakeCache.txt` survives that fix and prints "CMake project was already
+configured. Skipping configuration step." while reusing the bad paths, so the
+first run after hitting the trap needs `cargo clean -p llama-cpp-sys-2`.
+
 `src-core/src/inference/llama_local.rs` is the engine, behind a feature so a
 CUDA toolchain is only required when CUDA is wanted:
 
@@ -561,8 +583,8 @@ CUDA toolchain is only required when CUDA is wanted:
 | `local-llama-cuda` | in-process llama.cpp, CUDA | [M] |
 
 Selecting `INFERENCE_BACKEND=llama-local` in a build without the feature is a
-startup error that says so, not a silent fallback. The feature build adds 12
-tests (the sampler and the emitter), for 177.
+startup error that says so, not a silent fallback. The feature build adds 20
+tests (the sampler, the emitter, and the parked-cache policy), for 187.
 
 What it buys, and what it does not:
 
@@ -574,15 +596,73 @@ What it buys, and what it does not:
 - **`cached_tokens` is measured, not estimated.** The resident token vector is
   compared against the new prompt and the shared head is the reuse; everything
   past it is dropped from the sequence explicitly.
-- **KV reuse is per process, not per conversation.** The cache lives in
-  sequence 0 and survives from turn to turn; it does **not** survive a restart.
-  The slot save/restore that decision 0001 lists under "persistent
-  per-conversation KV cache" is still open.
+- **KV reuse is per conversation, within the process.** One conversation is
+  resident in sequence 0 at a time. Switching parks the outgoing cache -
+  `state_seq_get` serializes it to host RAM - and restores the incoming one with
+  `state_seq_set`, so a switch is a memcpy rather than a prefill. Host RAM, not
+  VRAM: `LlamaStateSeqFlags::ON_DEVICE` would keep the copy on an 8 GB card the
+  weights already own 6 GB of.
+
+  The budget is **bytes, not entries**, because the sizes are not comparable: an
+  8B model at f16 parks about 131 KB per token, so a two-turn conversation is a
+  few MB and one that filled a 12,288-token window is ~1.6 GB. A count cap would
+  either swap the machine or evict four cheap caches to make room for nothing.
+  `LLAMA_KV_CACHE_MB` sets it, default 2048; eviction is oldest-first; 0 turns
+  parking off and restores the single-sequence behaviour. The startup probe
+  reports `parkedConversations` and `parkedBytes`.
+
+  A **disk tier** was considered and rejected: `state_seq_save_file` exists, but
+  hundreds of MB per conversation switch is SSD wear for a pattern - alternating
+  between a handful of conversations - that the RAM tier already covers, and it
+  adds a cleanup lifecycle and half-written-file failure modes for it.
+
+  It still does **not survive a restart**. Decision 0001's "persistent
+  per-conversation KV cache" is therefore half-closed: per-conversation, yes;
+  persistent across runs, no.
+- **Deleting a conversation reaches the cache.** The parked bytes are the prompt
+  in another form - persona, story, every turn in the window - so
+  `memory::delete_conversation` calls `inference::forget_conversation`, the same
+  way it already dropped the archive vectors and the metrics record. Without it
+  the rows would be gone from an encrypted database while the plaintext sat in
+  RAM until something else happened to evict it.
+- **The conversation id is never the character's to set.** `build_options`
+  removes `conversation_id` unconditionally and puts it back only for a backend
+  that answers `keys_kv_by_conversation()`. Both halves are real: a character row
+  carrying that key would otherwise aim a turn at another conversation's cache,
+  and on the other two backends it is a junk field forwarded to the wire - which
+  is how `SUMMARIZER_MODEL` disappeared once already.
 - **It does not embed.** `EMBED_BACKEND` stays on ollama or llama-server.
 - `reqwest` does not go away yet - the default build still uses it, and so does
   the embedder on either path.
 
-**Not measured on the 4060.** The decode/prefill numbers in this document are
-llama-server's (stage 3). Nothing here re-measures them for the in-process
-engine; the two run the same llama.cpp, but that is an expectation, not a
-figure.
+**Measured on the 4060** [M], by `src-core/examples/bench-local-llama.rs`:
+release + CUDA, all 33 layers offloaded, `num_ctx` 12288, KV f16, the same
+8B Q4_K_M the app runs. A 2,804-token prompt, a 128-token reply, greedy.
+
+| phase | prefill | decode |
+|---|---|---|
+| cold (nothing resident) | 2,804 tok / 1,226 ms — **2,287 tok/s** | **45.1 tok/s** |
+| warm (same conversation, prefix reused) | **7 ms** | 44.9 tok/s |
+| another conversation takes the context | 1,140 ms | 43.5 tok/s |
+| restored from the parked cache | **112 ms** | 44.9 tok/s |
+
+Read it in two parts.
+
+**Against llama-server, it is parity, not a speed-up.** 45.1 vs 46.4 tok/s
+decode and 2,287 vs ~2,200–2,360 tok/s prefill are the same numbers inside the
+run-to-run spread — which is the honest result, because the HTTP hop was never
+on the token path. Stage 4b buys the things the hop made impossible, not tokens
+per second: one process to ship, no second binary to find at runtime, and a KV
+cache this process owns.
+
+**The cache is where the number moves.** Re-entering a conversation costs 7 ms
+instead of 1,226 ms when it never left, and 112 ms — about **11x cheaper than
+re-prefilling** — when another conversation took the context and gave it back.
+That second figure is what `LLAMA_KV_CACHE_MB` buys, and it is only reachable
+in-process: an HTTP backend would have re-sent the prompt. Parking that
+conversation cost 366 MiB of host RAM for 2,804 tokens, or **133 KB/token**,
+against the 131 KB/token the 8B f16 geometry predicts.
+
+An early run of the same bench measured decode at 43.4 tok/s over an 18-token
+reply and is not quoted above: at that length the first tokens' warm-up is most
+of the sample. The bench now asks for 128.

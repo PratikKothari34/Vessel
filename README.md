@@ -211,7 +211,7 @@ Two suites, no test dependencies in either.
 
 ```bash
 npm test                      # 202 tests — the Node backend, unit + integration
-cargo test -p vessel-core     # 165 tests — the Rust core
+cargo test -p vessel-core     # 167 tests — the Rust core
 ```
 
 `npm test` spawns its own backend on a scratch database with a fake inference
