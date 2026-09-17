@@ -21,19 +21,22 @@ const MEMORY_PATH = path.resolve(__dirname, '..', '..', 'src', 'backend', 'memor
 // memory.js destructures its db imports at require time, so the stub has to be
 // in place BEFORE it is loaded. Nothing here ever opens a real database.
 let planted = [];
+let summary = null;
 const db = require(DB_PATH);
 db.getDb = async () => ({
   async execute({ sql }) {
     if (/FROM turns/.test(sql)) return { rows: [...planted].reverse() }; // query is ORDER BY id DESC
-    return { rows: [] }; // no summary, no archive
+    if (/SELECT summary/.test(sql)) return { rows: summary === null ? [] : [{ summary }] };
+    return { rows: [] }; // no archive
   },
 });
 const memory = require(MEMORY_PATH);
 
 const turn = (role, content) => ({ role, content });
 
-async function prompt(rows) {
+async function prompt(rows, stored = null) {
   planted = rows;
+  summary = stored;
   const { messages } = await memory.buildContext(
     'conv-1',
     [{ role: 'user', content: 'still there?' }],
@@ -78,4 +81,24 @@ test('the persona still leads the prompt and the live message still trails it', 
   assert.equal(messages[0].role, 'system');
   assert.equal(messages[0].content, 'You are Ward.');
   assert.equal(messages[messages.length - 1].content, 'still there?');
+});
+
+test('an over-long stored summary is clamped before it reaches the prompt', async () => {
+  // MAX_SUMMARY_CHARS is per-device, so a row synced from a device with a
+  // larger cap arrives longer than this process budgets its context against.
+  const { MAX_SUMMARY_CHARS } = memory._config;
+  const huge = `${'a'.repeat(MAX_SUMMARY_CHARS * 2)}. tail sentence.`;
+  const messages = await prompt([turn('user', 'hello')], huge);
+  const block = messages.find((m) => m.role === 'system' && m.content.includes('tail sentence.'));
+  assert.ok(block, 'the summary is still in the prompt');
+  assert.ok(
+    block.content.length <= MAX_SUMMARY_CHARS + 200,
+    `summary block is ${block.content.length} chars`,
+  );
+});
+
+test('a summary already within the cap is carried through whole', async () => {
+  const stored = 'She keeps the archive. He never asks why.';
+  const messages = await prompt([turn('user', 'hello')], stored);
+  assert.ok(messages.some((m) => m.role === 'system' && m.content.endsWith(stored)));
 });

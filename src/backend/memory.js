@@ -185,10 +185,17 @@ async function ensureConversation(id, characterId = null) {
   return again.rows[0];
 }
 
+// The stored summary is clamped on the way OUT as well as on the way in.
+// MAX_SUMMARY_CHARS is per-device (it reads the environment), and the row can
+// arrive from the sync remote or a restore, so the cap this process budgets its
+// context against is not the cap that wrote the row. An over-long summary here
+// would push the persona off the front of the window on the engine's side,
+// silently, which is the one part of the prompt nothing else can restore.
+// A summary already within the cap comes back untouched.
 async function getSummary(id) {
   const db = await getDb();
   const res = await db.execute({ sql: 'SELECT summary FROM conversations WHERE id = ?', args: [id] });
-  return res.rows.length ? (res.rows[0].summary || '') : '';
+  return res.rows.length ? clampSummary(res.rows[0].summary || '') : '';
 }
 
 async function touchConversation(id) {
