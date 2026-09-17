@@ -53,6 +53,13 @@ impl Engine for Ollama {
     fn honours_model(&self) -> bool {
         true
     }
+    /// Ollama exposes no prompt cache to key, so there is nothing to tell it.
+    fn keys_kv_by_conversation(&self) -> bool {
+        false
+    }
+
+    /// Ollama holds no per-conversation state, so there is nothing to drop.
+    fn forget_conversation(&self, _conversation: &str) {}
     fn describe(&self) -> Json {
         json!({
             "backend": "ollama",

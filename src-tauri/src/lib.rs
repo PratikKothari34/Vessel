@@ -246,11 +246,14 @@ async fn delete_character(id: String) -> Cmd<Json> {
     if !removed {
         return Err(CmdError::new("Character not found."));
     }
-    // Cached vectors and metrics are dropped only after the delete commits: a
-    // failed delete must leave them intact.
+    // Cached vectors, metrics and KV caches are dropped only after the delete
+    // commits: a failed delete must leave them intact. The KV cache matters most
+    // of the three - it is the persona and the story in another form, and this
+    // is the path that deletes a character's whole history at once.
     for c in &owned {
         memory::forget_archive(&c.id);
         metrics::forget_conversation(&c.id);
+        inference::forget_conversation(&c.id);
     }
     Ok(json!({ "deleted": true }))
 }

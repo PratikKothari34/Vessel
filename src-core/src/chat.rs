@@ -495,7 +495,7 @@ async fn prepare(
 /// `num_ctx` goes in FIRST so a character's own `sampling.num_ctx` still wins,
 /// and is omitted entirely on a backend that fixes the window at launch -
 /// sending it there is a silently ignored field.
-fn build_options(character: Option<&Character>) -> Map<String, Json> {
+fn build_options(character: Option<&Character>, conversation: &str) -> Map<String, Json> {
     let engine = inference::chat().ok();
     let mut options = Map::new();
     if engine.is_some_and(|e| e.accepts_num_ctx()) {
@@ -506,6 +506,14 @@ fn build_options(character: Option<&Character>) -> Map<String, Json> {
         for (k, v) in &c.sampling {
             options.insert(k.clone(), v.clone());
         }
+    }
+    // Never the character's to set: it decides which conversation's KV cache
+    // the turn runs against, and on a backend that does not key its cache it is
+    // a junk field forwarded to the wire. Dropped unconditionally, then put back
+    // only for a backend that asked to be told.
+    options.remove("conversation_id");
+    if engine.is_some_and(Engine::keys_kv_by_conversation) {
+        options.insert("conversation_id".into(), Json::from(conversation));
     }
     options
 }
@@ -566,7 +574,7 @@ async fn stream_and_record(
         )
         .with_detail(e.to_string())
     })?;
-    let options = build_options(prep.character.as_ref());
+    let options = build_options(prep.character.as_ref(), &conv_id);
 
     let start = tokio::select! {
         biased;
@@ -861,13 +869,38 @@ mod tests {
         };
         c.sampling.insert("num_predict".into(), Json::from(2048));
         c.sampling.insert("temperature".into(), Json::from(0.9));
-        let opts = build_options(Some(&c));
+        // A character that tries to point the turn at somebody else's KV cache
+        // is overwritten, because the id goes in after the character's map.
+        c.sampling
+            .insert("conversation_id".into(), Json::from("somebody-elses"));
+        let opts = build_options(Some(&c), "conv-a");
         assert_eq!(opts["num_predict"], Json::from(2048));
         assert_eq!(opts["temperature"], Json::from(0.9));
+        assert_ne!(
+            opts.get("conversation_id"),
+            Some(&Json::from("somebody-elses")),
+            "a character must not choose which cache a turn runs against"
+        );
 
         // And the ceiling still applies when the character says nothing.
-        let bare = build_options(None);
+        let bare = build_options(None, "conv-a");
         assert_eq!(bare["num_predict"], Json::from(default_num_predict()));
+    }
+
+    #[test]
+    fn a_backend_that_does_not_key_its_cache_is_never_sent_a_conversation_id() {
+        // The default test environment resolves to Ollama, which has no prompt
+        // cache to key. Sending the id anyway would put a field on the wire that
+        // upstream silently ignores - the exact shape of the SUMMARIZER_MODEL
+        // bug, one layer down.
+        let engine = inference::chat().ok();
+        let keys = engine.is_some_and(Engine::keys_kv_by_conversation);
+        let opts = build_options(None, "conv-a");
+        assert_eq!(
+            opts.contains_key("conversation_id"),
+            keys,
+            "the id is present exactly when the backend asked for it"
+        );
     }
 
     #[tokio::test]

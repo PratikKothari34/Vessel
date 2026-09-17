@@ -314,6 +314,54 @@ async fn sampling_outside_the_allowlist_cannot_reach_the_engine() {
 }
 
 #[tokio::test]
+async fn a_character_cannot_aim_a_turn_at_another_conversations_kv_cache() {
+    // `conversation_id` is not a sampling knob; the in-process engine reads it to
+    // decide whose KV cache the turn decodes against. A character row carrying
+    // that key would therefore be reading somebody else's story - so it is
+    // dropped before the engine is asked, and put back only for a backend that
+    // says it keys its cache that way.
+    //
+    // The engine here is the HTTP mock, which does not, so the correct outcome
+    // is that the key never reaches the wire at all. That is also the narrower
+    // bug: a field upstream silently ignores is exactly how `SUMMARIZER_MODEL`
+    // disappeared.
+    let steer = steer(common::DEFAULT_REPLY);
+    let _db = open().await;
+    let made = characters::create(
+        serde_json::from_value(json!({
+            "name": "Eavesdropper",
+            "sampling": { "conversation_id": "somebody-elses", "temperature": 0.7 },
+        }))
+        .expect("a patch"),
+    )
+    .await
+    .expect("create")
+    .expect("a character row");
+    assert!(
+        made.sampling.get("conversation_id").is_none(),
+        "the allowlist drops it at the row"
+    );
+
+    let (out, _) = run(ChatRequest {
+        messages: vec![Message::new("user", "hi")],
+        conversation_id: Some(new_id()),
+        character_id: Some(made.id),
+        ..Default::default()
+    })
+    .await;
+    out.expect("turn");
+
+    let sent: serde_json::Value =
+        serde_json::from_str(&steer.last_prompt()).expect("valid JSON reached the engine");
+    let opts = &sent["options"];
+    assert_eq!(opts["temperature"].as_f64(), Some(0.7), "{opts}");
+    assert!(
+        opts.get("conversation_id").is_none(),
+        "a backend with no cache to key is never told which conversation this is: {opts}"
+    );
+}
+
+#[tokio::test]
 async fn a_request_over_the_ceiling_is_refused_before_the_database_is_touched() {
     // The Express build got this from `express.json({ limit: '10mb' })`. Over
     // IPC there is no body parser, so the bound lives in `classify` - and it has

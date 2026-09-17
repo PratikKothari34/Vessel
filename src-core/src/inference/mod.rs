@@ -161,6 +161,23 @@ pub trait Engine {
     /// chat model. Asking the backend beats comparing `name()` against a string
     /// literal that a new backend would not update.
     fn honours_model(&self) -> bool;
+    /// Whether the backend keeps one KV cache per conversation, and so has to be
+    /// told which conversation a turn belongs to.
+    ///
+    /// Only the in-process engine does. llama-server keys its own prompt cache
+    /// by prefix and Ollama does not expose one at all, so telling either would
+    /// be a field it forwards and ignores - which is how `SUMMARIZER_MODEL`
+    /// disappeared once already.
+    fn keys_kv_by_conversation(&self) -> bool;
+    /// Drop anything the backend is holding for a conversation that no longer
+    /// exists. A no-op on a backend that holds nothing.
+    ///
+    /// The in-process engine parks a conversation's KV cache in host RAM, and
+    /// that cache is the prompt in another form - the story text, the persona,
+    /// every turn in the window. Deleting the conversation has to reach it, or
+    /// the rows are gone from an encrypted database while the plaintext sits in
+    /// memory until something else happens to evict it.
+    fn forget_conversation(&self, conversation: &str);
     fn describe(&self) -> Json;
 
     async fn chat_stream(
@@ -218,6 +235,12 @@ impl Engine for Backend {
     }
     fn honours_model(&self) -> bool {
         dispatch!(self, honours_model())
+    }
+    fn keys_kv_by_conversation(&self) -> bool {
+        dispatch!(self, keys_kv_by_conversation())
+    }
+    fn forget_conversation(&self, conversation: &str) {
+        dispatch!(self, forget_conversation(conversation))
     }
     fn describe(&self) -> Json {
         dispatch!(self, describe())
@@ -323,6 +346,21 @@ fn engines() -> Result<&'static Engines> {
 pub fn chat() -> Result<&'static Backend> {
     Ok(&engines()?.chat)
 }
+
+/// Tell every engine that a conversation is gone.
+///
+/// Deliberately infallible and deliberately silent when the engines are not up:
+/// this is called from the delete path, and a backend that was never started is
+/// holding nothing to forget. All three roles are told rather than just `chat`,
+/// because each is its own instance and a deployment is free to point the
+/// summarizer at the in-process engine too; forgetting twice costs nothing.
+pub fn forget_conversation(conversation: &str) {
+    let Ok(e) = engines() else { return };
+    for b in [&e.chat, &e.summarizer, &e.embedder] {
+        b.forget_conversation(conversation);
+    }
+}
+
 pub fn embedder() -> Result<&'static Backend> {
     Ok(&engines()?.embedder)
 }

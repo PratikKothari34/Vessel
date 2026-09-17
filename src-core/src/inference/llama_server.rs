@@ -207,6 +207,15 @@ impl Engine for LlamaServer {
     fn honours_model(&self) -> bool {
         false
     }
+    /// llama-server keys its own prompt cache by the prompt's prefix, inside the
+    /// slot it picked. A conversation id would be a field it does not read.
+    fn keys_kv_by_conversation(&self) -> bool {
+        false
+    }
+
+    /// llama-server owns its own prompt cache and evicts it by prefix; this
+    /// process holds nothing for a conversation.
+    fn forget_conversation(&self, _conversation: &str) {}
     fn describe(&self) -> Json {
         json!({
             "backend": "llama-server",

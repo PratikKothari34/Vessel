@@ -58,14 +58,17 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::{LlamaStateSeqFlags, SeqState};
 
 use super::util::{ollama_chunk, ollama_done, warn_once};
 use super::{
     gguf, modelfile, ChatStart, DoneStats, EmbedOpts, Engine, GenOpts, Message, StreamEvent,
 };
 
-/// The conversation lives here and is never cleared between turns. That is the
-/// persistent prompt cache.
+/// The conversation on screen lives here and is never cleared between turns.
+/// That is the persistent prompt cache. A switch to a different conversation
+/// does not clear it either - it is serialized out and put back later, which is
+/// what `ParkedCache` holds.
 const SEQ_CHAT: i32 = 0;
 /// The summarizer lives here and is cleared after every call. A summary prompt
 /// is a different prefix every time; letting it share sequence 0 would evict the
@@ -197,6 +200,11 @@ impl Sampling {
                     );
                     true
                 }
+                // Not a sampling knob. `chat_stream` reads it to decide which
+                // conversation's KV cache this turn runs against, and it is
+                // named here so the unknown-option warning does not fire for a
+                // field this backend is the one that asked for.
+                "conversation_id" => true,
                 _ => false,
             };
             if !known {
@@ -379,6 +387,10 @@ enum Job {
     Chat {
         messages: Vec<Message>,
         sampling: Box<Sampling>,
+        /// Which conversation's KV cache this turn belongs to. `None` means the
+        /// caller did not say, and every such turn shares one sequence - the
+        /// behaviour this engine had before parking existed.
+        conversation: Option<String>,
         out: UnboundedSender<StreamEvent>,
     },
     Generate {
@@ -388,6 +400,10 @@ enum Job {
     /// Load state, for the startup probe. It queues behind the load, which is
     /// what makes it a real health check rather than a config echo.
     Info(tokio::sync::oneshot::Sender<Json>),
+    /// A conversation is gone; drop its KV cache. Fire-and-forget on purpose -
+    /// the caller is a delete that has already committed, and there is nothing
+    /// useful it could do with a reply.
+    Forget(String),
 }
 
 pub struct LlamaLocal {
@@ -441,6 +457,12 @@ impl LlamaLocal {
             kv: kv.clone(),
             n_batch: env_num("LLAMA_N_BATCH", 2048u32).max(1),
             n_threads: env_num("LLAMA_THREADS", default_threads()),
+            // Parking costs host RAM, and how much depends on the model: an 8B
+            // at f16 serializes about 131 KB per token, so a conversation that
+            // filled a 12288-token window is ~1.6 GB. The default holds one of
+            // those plus several short ones. 0 turns parking off and restores
+            // the single-sequence behaviour.
+            kv_cache_bytes: env_num("LLAMA_KV_CACHE_MB", 2048usize).saturating_mul(1024 * 1024),
         };
         std::thread::Builder::new()
             .name("llama-local".into())
@@ -463,13 +485,22 @@ impl LlamaLocal {
     /// model loaded. `None` means it has not finished loading, or it failed;
     /// either way the health command is the place that reports it, not this.
     pub async fn probe_ctx(&self) -> Option<u32> {
+        let info = self.probe().await?;
+        info.get("nCtx").and_then(Json::as_u64).map(|n| n as u32)
+    }
+
+    /// Ask the engine thread what it is holding right now.
+    ///
+    /// Queued behind whatever it is doing, and bounded: a reply proves the
+    /// weights loaded, and no reply inside the window means the thread is busy
+    /// or gone - either way the caller reports "unknown", never a stale answer.
+    pub async fn probe(&self) -> Option<Json> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.send(Job::Info(tx)).ok()?;
-        let info = tokio::time::timeout(std::time::Duration::from_millis(1500), rx)
+        tokio::time::timeout(std::time::Duration::from_millis(1500), rx)
             .await
             .ok()?
-            .ok()?;
-        info.get("nCtx").and_then(Json::as_u64).map(|n| n as u32)
+            .ok()
     }
 
     fn send(&self, job: Job) -> Result<()> {
@@ -494,6 +525,18 @@ impl Engine for LlamaLocal {
     }
     fn model(&self) -> &str {
         &self.model
+    }
+    /// One KV cache per conversation, parked and restored on a switch - so it
+    /// does want to be told which conversation a turn belongs to.
+    fn keys_kv_by_conversation(&self) -> bool {
+        true
+    }
+
+    /// Queued behind whatever the worker is doing, so a delete during a reply
+    /// lands after that reply rather than pulling the cells out from under it.
+    /// A dead worker means a dead cache; nothing to forget.
+    fn forget_conversation(&self, conversation: &str) {
+        let _ = self.jobs.send(Job::Forget(conversation.to_string()));
     }
     /// Fixed when the context is built, same as llama-server.
     fn accepts_num_ctx(&self) -> bool {
@@ -530,10 +573,20 @@ impl Engine for LlamaLocal {
         sampling.apply(&self.model_params);
         sampling.apply(options);
 
+        // Which conversation this turn belongs to, so the worker can put that
+        // conversation's KV cache back before it decodes. `chat.rs` sends it
+        // only to a backend that says it keys its cache this way, so `None`
+        // here means the caller genuinely has no id, not that it forgot.
+        let conversation = options
+            .get("conversation_id")
+            .and_then(Json::as_str)
+            .map(str::to_owned);
+
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         self.send(Job::Chat {
             messages,
             sampling: Box::new(sampling),
+            conversation,
             out: tx,
         })?;
         Ok(ChatStart::Streaming(Box::pin(stream! {
@@ -591,6 +644,9 @@ struct WorkerCfg {
     kv: String,
     n_batch: u32,
     n_threads: i32,
+    /// Host memory this engine may hold for conversations that are not on
+    /// screen. See `LLAMA_KV_CACHE_MB`.
+    kv_cache_bytes: usize,
 }
 
 /// Owns the backend, the model and the context, and answers jobs until the
@@ -653,7 +709,80 @@ fn serve_error(mut rx: UnboundedReceiver<Job>, message: &str) {
             Job::Info(out) => {
                 let _ = out.send(json!({ "loaded": false, "error": message }));
             }
+            // Nothing ever loaded, so nothing is parked.
+            Job::Forget(_) => {}
         }
+    }
+}
+
+/// One conversation's KV cache, serialized out of the context so a different
+/// conversation can have the cells.
+///
+/// The bytes are host memory. `LlamaStateSeqFlags::ON_DEVICE` would keep the
+/// copy in VRAM and restore faster, which is exactly the wrong trade on an 8 GB
+/// card the weights already own 6 GB of - the whole point of parking is to stop
+/// paying for a prefill, not to buy that back in evictions.
+struct Parked<S> {
+    id: String,
+    /// What the restored sequence holds, so the next turn's prefix walk has
+    /// something real to compare the new prompt against.
+    tokens: Vec<LlamaToken>,
+    state: S,
+    /// Cached rather than asked of `state` on every comparison: the budget
+    /// arithmetic runs on every switch and the answer never changes.
+    bytes: usize,
+}
+
+/// Least-recently-used parked conversations, bounded by total bytes.
+///
+/// Bytes and not a count, because the sizes are not comparable: a two-turn
+/// conversation parks a few megabytes and one that filled the window parks
+/// ~1.6 GB. A count-based cap would either hold several of the large ones - and
+/// swap the machine - or evict four small ones to make room for nothing.
+struct ParkedCache<S> {
+    budget: usize,
+    bytes: usize,
+    /// Oldest first; the back is the most recently parked.
+    entries: Vec<Parked<S>>,
+}
+
+impl<S> ParkedCache<S> {
+    fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            bytes: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Remove and return one conversation's cache, giving its bytes back to the
+    /// budget.
+    fn take(&mut self, id: &str) -> Option<Parked<S>> {
+        let at = self.entries.iter().position(|e| e.id == id)?;
+        let entry = self.entries.remove(at);
+        self.bytes -= entry.bytes;
+        Some(entry)
+    }
+
+    /// Park one conversation, evicting the oldest until it fits.
+    ///
+    /// `false` means it does not fit even in an empty cache, so nothing was
+    /// evicted to make room for something that was never going to be kept. The
+    /// caller has lost those cells either way; the difference is whether the
+    /// budget is the reason, which is the only version worth a log line.
+    fn put(&mut self, entry: Parked<S>) -> bool {
+        // A re-park replaces its older self rather than sitting beside it.
+        let _ = self.take(&entry.id);
+        if entry.bytes > self.budget {
+            return false;
+        }
+        while self.bytes + entry.bytes > self.budget {
+            let old = self.entries.remove(0);
+            self.bytes -= old.bytes;
+        }
+        self.bytes += entry.bytes;
+        self.entries.push(entry);
+        true
     }
 }
 
@@ -666,6 +795,17 @@ struct Session<'a> {
     /// Exactly the tokens currently held in `SEQ_CHAT`. The prefix this shares
     /// with the next prompt is what does not have to be decoded again.
     resident: Vec<LlamaToken>,
+    /// Which conversation those tokens belong to. `None` before the first turn,
+    /// and after a switch that had nothing to restore.
+    resident_id: Option<String>,
+    /// Set when a clear failed, so the cells `SEQ_CHAT` holds no longer match
+    /// what `resident`/`resident_id` say they do. While it is set, the
+    /// same-conversation fast path is off and the next switch clears again -
+    /// otherwise a turn that aborted on a failed clear would be followed by one
+    /// that took the fast path straight into the cells it never dropped.
+    dirty: bool,
+    /// Every other conversation this process has seen, up to the budget.
+    parked: ParkedCache<SeqState>,
 }
 
 impl<'a> Session<'a> {
@@ -691,6 +831,9 @@ impl<'a> Session<'a> {
             ctx,
             name,
             resident: Vec::new(),
+            resident_id: None,
+            dirty: false,
+            parked: ParkedCache::new(cfg.kv_cache_bytes),
         })
     }
 
@@ -699,9 +842,10 @@ impl<'a> Session<'a> {
             Job::Chat {
                 messages,
                 sampling,
+                conversation,
                 out,
             } => {
-                if let Err(e) = self.chat(messages, &sampling, cfg, &out) {
+                if let Err(e) = self.chat(messages, &sampling, conversation, cfg, &out) {
                     let _ = out.send(StreamEvent::Error {
                         message: e.to_string(),
                     });
@@ -715,8 +859,35 @@ impl<'a> Session<'a> {
                     "loaded": true,
                     "residentTokens": self.resident.len(),
                     "nCtx": self.ctx.n_ctx(),
+                    "parkedConversations": self.parked.entries.len(),
+                    "parkedBytes": self.parked.bytes,
+                    "parkedBudgetBytes": self.parked.budget,
                 }));
             }
+            Job::Forget(id) => self.forget(&id),
+        }
+    }
+
+    /// Drop everything this session holds for a conversation that no longer
+    /// exists - parked or resident.
+    ///
+    /// A failed clear is only logged here, unlike in `switch_to`: nothing is
+    /// about to decode into those cells, and the failure sets `dirty`, so the
+    /// next switch clears again before anything does. Losing the delete over it
+    /// would be worse.
+    fn forget(&mut self, id: &str) {
+        let parked = self.parked.take(id).is_some();
+        let was_resident = self.resident_id.as_deref() == Some(id);
+        if was_resident {
+            // Cleared, not parked: `park_current` would put it straight back.
+            self.resident_id = None;
+            self.resident.clear();
+            if let Err(e) = self.clear_chat_seq() {
+                tracing::warn!("llama-local: {e}");
+            }
+        }
+        if parked || was_resident {
+            tracing::debug!(conversation = %id, "llama-local: KV cache dropped");
         }
     }
 
@@ -785,15 +956,141 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// Make `id` the conversation that owns `SEQ_CHAT`.
+    ///
+    /// Without this, every conversation shares one sequence, so switching to
+    /// another one finds a prefix no longer than the persona the two happen to
+    /// have in common and re-decodes the rest of the window. Parking serializes
+    /// the outgoing cache to host memory and puts the incoming one back, which
+    /// turns a switch from a prefill into a memcpy.
+    ///
+    /// Failing to park or to restore costs a prefill and nothing else, so both
+    /// are swallowed - a turn that refuses to start because a cache could not be
+    /// saved would be strictly worse than a slow one. Failing to CLEAR is not in
+    /// that class: decoding from position zero into a sequence that still holds
+    /// another conversation's cells produces a confident, wrong reply, so that
+    /// one is returned.
+    fn switch_to(&mut self, id: Option<&str>) -> Result<()> {
+        if !self.dirty && self.resident_id.as_deref() == id {
+            return Ok(());
+        }
+        self.park_current();
+        // Whatever is still in the sequence now belongs to somebody else, or to
+        // nobody. Either way it is not this turn's.
+        self.clear_chat_seq()?;
+        self.resident.clear();
+        self.resident_id = id.map(str::to_owned);
+
+        let Some(id) = id else { return Ok(()) };
+        let Some(entry) = self.parked.take(id) else {
+            return Ok(());
+        };
+        let restored = self.ctx.state_seq_set(&entry.state, SEQ_CHAT);
+        match restored {
+            Ok(()) => {
+                self.resident = entry.tokens;
+                tracing::debug!(
+                    conversation = %id,
+                    tokens = self.resident.len(),
+                    "llama-local: KV cache restored"
+                );
+            }
+            Err(e) => {
+                // The cells are in an unknown state after a partial read, so
+                // drop them and take the full prefill.
+                self.clear_chat_seq()?;
+                warn_once(
+                    "local_kv_restore",
+                    &format!(
+                        "llama-local: a parked KV cache could not be restored ({e}); it re-prefills."
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop every cell `SEQ_CHAT` holds, and record whether it worked.
+    fn clear_chat_seq(&mut self) -> Result<()> {
+        match self
+            .ctx
+            .clear_kv_cache_seq(Some(SEQ_CHAT as u32), None, None)
+        {
+            Ok(_) => {
+                self.dirty = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.dirty = true;
+                Err(anyhow!(
+                    "llama-local: the KV cache could not be cleared - {e}"
+                ))
+            }
+        }
+    }
+
+    /// Serialize whatever `SEQ_CHAT` holds into the cache, so the cells can be
+    /// handed to the next conversation without losing the work that filled them.
+    fn park_current(&mut self) {
+        let Some(id) = self.resident_id.take() else {
+            return;
+        };
+        if self.resident.is_empty() || self.parked.budget == 0 {
+            return;
+        }
+        let captured = self
+            .ctx
+            .state_seq_get(SEQ_CHAT, LlamaStateSeqFlags::empty());
+        match captured {
+            Ok(state) => {
+                let bytes = state.byte_len();
+                let tokens = std::mem::take(&mut self.resident);
+                let entry = Parked {
+                    id,
+                    tokens,
+                    state,
+                    bytes,
+                };
+                if !self.parked.put(entry) {
+                    warn_once(
+                        "local_kv_budget",
+                        &format!(
+                            concat!(
+                                "llama-local: a {} MiB KV cache is larger than ",
+                                "LLAMA_KV_CACHE_MB, so that conversation re-prefills on every ",
+                                "switch. Raise the budget, or lower LLAMA_NUM_CTX."
+                            ),
+                            bytes / (1024 * 1024)
+                        ),
+                    );
+                }
+            }
+            Err(e) => warn_once(
+                "local_kv_park",
+                &format!("llama-local: a KV cache could not be parked ({e}); it re-prefills."),
+            ),
+        }
+    }
+
     fn chat(
         &mut self,
         messages: Vec<Message>,
         sampling: &Sampling,
+        conversation: Option<String>,
         cfg: &WorkerCfg,
         out: &UnboundedSender<StreamEvent>,
     ) -> Result<()> {
         let started = Instant::now();
         let tokens = self.tokenize(&messages)?;
+        if tokens.is_empty() {
+            // `tokenize` prepends BOS, so this needs a model that has no BOS
+            // token AND a template that rendered nothing. Guarded rather than
+            // assumed away: the prefix clamp below subtracts one from the
+            // length, and on an empty prompt that underflows.
+            return Err(anyhow!(
+                "llama-local: the chat template produced an empty prompt."
+            ));
+        }
         let n_ctx = self.ctx.n_ctx() as usize;
         if tokens.len() + 16 >= n_ctx {
             // Refusing beats truncating: the caller trimmed history to fit a
@@ -805,6 +1102,10 @@ impl<'a> Session<'a> {
                 tokens.len()
             ));
         }
+
+        // After the window check, not before: a prompt this engine refuses must
+        // not cost the conversation that is currently resident its cache.
+        self.switch_to(conversation.as_deref())?;
 
         // Measured, not estimated. One token is always re-decoded: logits come
         // out of a decode, so reusing the whole prompt would leave nothing to
@@ -1107,6 +1408,117 @@ mod tests {
     fn an_invalid_byte_does_not_wedge_the_buffer() {
         let mut e = Emitter::new(Vec::new());
         assert_eq!(e.push(&[0xFF, 111, 107, 33]).as_deref(), Some("ok!"));
+    }
+
+    // ---- Parked KV caches ------------------------------------------------
+    //
+    // The eviction policy is tested on its own rather than through a loaded
+    // model: the payload is opaque to the cache, so a unit that never links
+    // llama.cpp proves everything the policy is responsible for.
+
+    fn parked(id: &str, bytes: usize) -> Parked<()> {
+        Parked {
+            id: id.into(),
+            tokens: Vec::new(),
+            state: (),
+            bytes,
+        }
+    }
+
+    fn ids<S>(c: &ParkedCache<S>) -> Vec<&str> {
+        c.entries.iter().map(|e| e.id.as_str()).collect()
+    }
+
+    #[test]
+    fn the_oldest_parked_conversation_is_the_one_evicted() {
+        let mut c = ParkedCache::new(300);
+        assert!(c.put(parked("a", 100)));
+        assert!(c.put(parked("b", 100)));
+        assert!(c.put(parked("c", 100)));
+        assert_eq!(ids(&c), ["a", "b", "c"]);
+        assert_eq!(c.bytes, 300);
+
+        assert!(c.put(parked("d", 100)));
+        assert_eq!(ids(&c), ["b", "c", "d"], "a was the oldest");
+        assert_eq!(c.bytes, 300);
+    }
+
+    #[test]
+    fn one_large_cache_evicts_as_many_small_ones_as_it_needs() {
+        let mut c = ParkedCache::new(300);
+        c.put(parked("a", 50));
+        c.put(parked("b", 50));
+        c.put(parked("c", 50));
+        assert!(c.put(parked("big", 250)));
+        assert_eq!(ids(&c), ["c", "big"]);
+        assert_eq!(c.bytes, 300);
+    }
+
+    #[test]
+    fn re_parking_replaces_rather_than_double_counting() {
+        // The same conversation is parked again every time the user leaves it,
+        // and a second entry would both leak bytes and let a stale state win the
+        // lookup.
+        let mut c = ParkedCache::new(300);
+        c.put(parked("a", 100));
+        c.put(parked("a", 120));
+        assert_eq!(ids(&c), ["a"]);
+        assert_eq!(c.bytes, 120);
+    }
+
+    #[test]
+    fn taking_a_cache_out_returns_its_bytes_to_the_budget() {
+        let mut c = ParkedCache::new(300);
+        c.put(parked("a", 100));
+        c.put(parked("b", 100));
+        let got = c.take("a").expect("a was parked");
+        assert_eq!(got.bytes, 100);
+        assert_eq!(c.bytes, 100);
+        assert!(c.take("a").is_none(), "taking is not a peek");
+        assert_eq!(ids(&c), ["b"]);
+    }
+
+    #[test]
+    fn a_cache_bigger_than_the_whole_budget_evicts_nothing() {
+        // The important half is the eviction: throwing away three usable caches
+        // to make room for something that will not be kept is strictly worse
+        // than refusing.
+        let mut c = ParkedCache::new(300);
+        c.put(parked("a", 100));
+        c.put(parked("b", 100));
+        assert!(!c.put(parked("huge", 400)));
+        assert_eq!(ids(&c), ["a", "b"]);
+        assert_eq!(c.bytes, 200);
+    }
+
+    #[test]
+    fn taking_a_conversation_that_was_never_parked_leaves_the_rest_alone() {
+        let mut c = ParkedCache::new(100);
+        assert!(c.put(parked("a", 10)));
+        assert!(c.take("never-here").is_none());
+        assert_eq!(ids(&c), ["a"]);
+        assert_eq!(c.bytes, 10);
+    }
+
+    #[test]
+    fn a_zero_budget_keeps_nothing() {
+        let mut c = ParkedCache::new(0);
+        assert!(!c.put(parked("a", 1)));
+        assert!(c.entries.is_empty());
+        assert_eq!(c.bytes, 0);
+    }
+
+    #[test]
+    fn a_reparked_conversation_is_the_newest_again() {
+        // Re-parking has to refresh the position too, or the conversation the
+        // user keeps coming back to becomes the one evicted first.
+        let mut c = ParkedCache::new(300);
+        c.put(parked("a", 100));
+        c.put(parked("b", 100));
+        c.put(parked("a", 100));
+        assert_eq!(ids(&c), ["b", "a"]);
+        c.put(parked("d", 200));
+        assert_eq!(ids(&c), ["a", "d"], "b was the oldest by then");
     }
 
     #[test]

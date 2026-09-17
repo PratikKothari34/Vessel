@@ -2079,6 +2079,9 @@ pub async fn delete_conversation(db: &Db, id: &str) -> Result<bool> {
         .await?;
     forget_archive(id); // cached vectors would outlive the rows they describe
     crate::metrics::forget_conversation(id);
+    // And the KV cache, which is the prompt in another form: the rows are gone
+    // from an encrypted database, so the plaintext must not outlive them in RAM.
+    crate::inference::forget_conversation(id);
     Ok(n > 0)
 }
 
