@@ -304,6 +304,18 @@ enum Shape {
 /// sentence the user can act on.
 const MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
 
+/// Ceiling on the director note specifically.
+///
+/// It is the one prompt-contributing field with no cap of its own: every
+/// character field has one (`CAP_*` in `characters`, 4-16k) and the stored summary is
+/// clamped on both the way in and the way out. Only `MAX_REQUEST_BYTES` stood
+/// behind this one, three orders of magnitude past any context window. A long
+/// note pushes the front of the prompt - the persona - out of the window, and
+/// the failure is silent: the character stops being the character and nothing
+/// says why. Reject rather than truncate, so the user gets a sentence they can
+/// act on instead of half an instruction.
+const MAX_DIRECTOR_CHARS: usize = 4000;
+
 fn request_bytes(req: &ChatRequest) -> usize {
     req.messages
         .iter()
@@ -322,6 +334,17 @@ fn classify(req: &ChatRequest) -> Result<Shape, ChatError> {
         return Err(ChatError::new(
             ErrorKind::BadRequest,
             "Message is too large. Trim it and send again.",
+        ));
+    }
+
+    if has_director
+        && req.director.as_deref().unwrap_or("").trim().chars().count() > MAX_DIRECTOR_CHARS
+    {
+        return Err(ChatError::new(
+            ErrorKind::BadRequest,
+            format!(
+                "Director note is too long (max {MAX_DIRECTOR_CHARS} characters). Trim it and send again."
+            ),
         ));
     }
 
@@ -794,6 +817,41 @@ mod tests {
         let r = ChatRequest {
             messages: vec![Message::new("user", "hi")],
             director: Some("be colder".into()),
+            ..Default::default()
+        };
+        assert_eq!(classify(&r).unwrap(), Shape::Normal);
+    }
+
+    #[test]
+    fn a_director_note_past_the_cap_is_refused_with_a_sentence_to_act_on() {
+        let r = ChatRequest {
+            messages: vec![Message::new("user", "hi")],
+            director: Some("x".repeat(MAX_DIRECTOR_CHARS + 1)),
+            ..Default::default()
+        };
+        let e = classify(&r).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::BadRequest);
+        assert!(e.error.contains("Director note is too long"), "{}", e.error);
+    }
+
+    #[test]
+    fn a_director_note_at_the_cap_is_still_accepted() {
+        let r = ChatRequest {
+            messages: vec![Message::new("user", "hi")],
+            director: Some("x".repeat(MAX_DIRECTOR_CHARS)),
+            ..Default::default()
+        };
+        assert_eq!(classify(&r).unwrap(), Shape::Normal);
+    }
+
+    #[test]
+    fn the_director_cap_counts_characters_not_bytes() {
+        // An emoji is four bytes and one character. Counting bytes would refuse
+        // a note a quarter of the allowed length, and would disagree with the
+        // JS track, which counts code points too.
+        let r = ChatRequest {
+            messages: vec![Message::new("user", "hi")],
+            director: Some("\u{1f600}".repeat(MAX_DIRECTOR_CHARS)),
             ..Default::default()
         };
         assert_eq!(classify(&r).unwrap(), Shape::Normal);

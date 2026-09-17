@@ -96,6 +96,17 @@ function buildPersonaMessage(character) {
   return { role: 'system', content: parts.join('\n\n') };
 }
 
+// The director note is the one prompt-contributing field with no length cap of
+// its own: every character field has one (CAP in characters.js, 4-16k), and the
+// stored summary is clamped both on the way in and on the way out. Only the
+// 10 MB body limit stood behind this one, which is three orders of magnitude
+// past any context window. A long note therefore pushes the front of the
+// prompt - the persona - out of the window, and the failure is silent: the
+// character simply stops being the character and nothing says why. Reject
+// rather than truncate, so the user gets a sentence they can act on instead of
+// half an instruction.
+const MAX_DIRECTOR_CHARS = 4000;
+
 // Director / OOC note: a meta-instruction that steers the model WITHOUT becoming
 // part of the story. Injected as a high-priority system message, never recorded.
 function buildDirectorMessage(director) {
@@ -434,6 +445,13 @@ app.post('/chat', async (req, res) => {
         typeof m.content === 'string' && m.content.trim())) {
     return res.status(400).json({
       error: 'No valid messages: each must have a known role and non-empty string content.',
+    });
+  }
+  // Counted in code points, the way the Rust track counts it (chars()), so the
+  // two tracks reject the same note rather than differing on astral characters.
+  if (hasDirector && Array.from(director.trim()).length > MAX_DIRECTOR_CHARS) {
+    return res.status(400).json({
+      error: `Director note is too long (max ${MAX_DIRECTOR_CHARS} characters). Trim it and send again.`,
     });
   }
   // A director-only request has no story user turn to record.

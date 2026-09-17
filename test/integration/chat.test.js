@@ -131,6 +131,44 @@ test('a director-only request continues the scene without inventing a user turn'
   assert.ok(!conv.verbatim.some((t) => /Describe the weather/.test(t.content)));
 });
 
+test('a director note past the cap is refused instead of silently evicting the persona', async () => {
+  const first = await app.sse({ characterId: hero.id, messages: [say('Hello.')] });
+  const convId = first.meta.conversationId;
+
+  const res = await app.post('/chat', {
+    conversationId: convId,
+    director: 'x'.repeat(4001),
+    messages: [say('And then?')],
+  });
+  assert.equal(res.status, 400);
+  assert.match(res.json.error, /Director note is too long/);
+
+  // Refused before anything reached the engine or the database.
+  const conv = (await app.get(`/conversations/${convId}`)).json;
+  assert.equal(conv.verbatim.length, 2, 'the refused request recorded nothing');
+});
+
+test('a director note at the cap is still accepted, and it is counted in characters', async () => {
+  const first = await app.sse({ characterId: hero.id, messages: [say('Hello.')] });
+  const convId = first.meta.conversationId;
+
+  const atCap = await app.sse({
+    conversationId: convId,
+    director: 'x'.repeat(4000),
+    messages: [say('Once.')],
+  });
+  assert.equal(atCap.status, 200);
+
+  // An emoji is four bytes and one character. A byte count would refuse this at
+  // a quarter of the allowed length, and would disagree with the Rust track.
+  const astral = await app.sse({
+    conversationId: convId,
+    director: '\u{1f600}'.repeat(4000),
+    messages: [say('Twice.')],
+  });
+  assert.equal(astral.status, 200);
+});
+
 test('regenerate appends a variant instead of a new turn, and hides the old reply', async () => {
   const first = await app.sse({ characterId: hero.id, messages: [say('Roll once.')] });
   const convId = first.meta.conversationId;
