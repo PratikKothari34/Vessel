@@ -207,7 +207,19 @@ async function getVerbatim(id, limit = VERBATIM_CEILING) {
     sql: 'SELECT role, content FROM turns WHERE conversation_id = ? ORDER BY id DESC LIMIT ?',
     args: [id, limit],
   });
-  return [...res.rows].reverse().map((r) => ({ role: r.role, content: r.content }));
+  // The role is clamped on the way OUT, not trusted from the column. This
+  // process only ever writes 'user' or 'assistant', but a row can also arrive
+  // from the sync remote, written by another device or an older build, or be
+  // restored from a backup - and buildContext pushes this role straight into
+  // the outbound prompt. A stored role of 'system' would be a system message
+  // mid-conversation, which is exactly what the HTTP layer refuses from a
+  // caller. Anything that is not 'user' becomes an assistant turn: attributing
+  // an unknown row to the character is the reading that carries the least
+  // instruction weight, and it keeps the text rather than dropping it.
+  return [...res.rows].reverse().map((r) => ({
+    role: r.role === 'user' ? 'user' : 'assistant',
+    content: r.content,
+  }));
 }
 
 // ---- Engine calls --------------------------------------------------------

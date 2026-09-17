@@ -357,11 +357,24 @@ async fn get_verbatim_limit(db: &Db, id: &str, limit: usize) -> Result<Vec<Turn>
             vec![TValue::Text(id.into()), TValue::Integer(limit as i64)],
         )
         .await?;
+    // The role is clamped on the way OUT, not trusted from the column. This
+    // process only ever writes "user" or "assistant", but a row can also arrive
+    // from the sync remote, written by another device or an older build, or be
+    // restored from a backup - and `build_context` puts this role straight into
+    // the outbound prompt. A stored role of "system" would be a system message
+    // mid-conversation, which is exactly what the HTTP layer refuses from a
+    // caller. Anything that is not "user" becomes an assistant turn:
+    // attributing an unknown row to the character is the reading that carries
+    // the least instruction weight, and it keeps the text rather than dropping
+    // it.
     let mut out: Vec<Turn> = rows
         .iter()
         .map(|r| Turn {
             id: int(r, "id"),
-            role: text(r, "role"),
+            role: match text(r, "role").as_str() {
+                "user" => "user".to_string(),
+                _ => "assistant".to_string(),
+            },
             content: text(r, "content"),
         })
         .collect();
