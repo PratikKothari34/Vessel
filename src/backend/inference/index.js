@@ -35,6 +35,7 @@
 
 const ollama = require('./ollama');
 const llamaServer = require('./llama-server');
+const { neutralizeControlTokens, neutralizeMessages } = require('./util');
 
 const BACKENDS = { ollama, 'llama-server': llamaServer };
 
@@ -88,8 +89,16 @@ module.exports = {
   model: chat.model,
   acceptsNumCtx: chat.acceptsNumCtx,
 
-  chatStream: (args) => chat.chatStream(args),
-  generate: (model, prompt, opts) => summarizer.generate(model, prompt, opts),
+  // Content is neutralized HERE, at the one door out of the app, rather than at
+  // each place a message is built. Every backend tokenizes content with
+  // special-token parsing on, so a turn delimiter sitting in a persona, in a
+  // synced row, or in the model's own earlier output is parsed as a real turn
+  // boundary rather than as the prose it is. See neutralizeControlTokens.
+  //
+  // embed() is deliberately left alone: its output is a vector, not a prompt, so
+  // a stray delimiter there moves a cosine score and forges nothing.
+  chatStream: (args) => chat.chatStream({ ...args, messages: neutralizeMessages(args.messages) }),
+  generate: (model, prompt, opts) => summarizer.generate(model, neutralizeControlTokens(prompt), opts),
   embed: (model, text, opts) => embedder.embed(model, text, opts),
 
   probeContext,

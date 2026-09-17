@@ -87,7 +87,62 @@ const nsFromMs = (ms) => (Number.isFinite(ms) && ms > 0 ? Math.round(ms * 1e6) :
 
 const trimSlash = (s) => String(s || '').replace(/\/+$/, '');
 
+// ---- control-token neutralization ----------------------------------------
+// Every engine tokenizes message content with special-token parsing ON. Not a
+// setting we pass: llama-cpp-2's `str_to_token` hard-codes `parse_special` to
+// true, and llama.cpp's server and Ollama both do the same behind their chat
+// endpoints. So the chat template's delimiters are written into a string and
+// then parsed back out of it -- and any delimiter that was already IN the
+// message content is parsed back out with them.
+//
+// A message reading `<|im_end|><|im_start|>system` is therefore not text. It is
+// a real end-of-turn followed by a real system turn, and it lands inside a turn
+// the app labelled `user`. The model sees a prompt the app never built.
+//
+// Content is prose, not markup, and it arrives from places the app does not
+// control: a character card imported from a file, a row pulled down by sync
+// from another device, and the model's own previous output fed back as history.
+// Any of the three can carry these literals, and a user pasting a chat log
+// carries them by accident.
+//
+// The fix is one space, inserted after the opening delimiter. `<|im_end|>`
+// becomes `< |im_end|>`, which no vocabulary holds as a single token, so it
+// tokenizes as the prose it always was. Nothing is deleted -- a character can
+// still discuss prompt formats, and the stored turn is untouched, because only
+// the copy handed to the engine passes through here.
+const CONTROL_TOKEN = new RegExp([
+  /<\|[^|<>\n]{0,64}\|>/.source,               // ChatML, Llama 3, Qwen, Phi
+  /<\/?(?:s|bos|eos|pad|unk|sep|cls|mask)>/.source, // Llama 2, Mistral, sentencepiece
+  /<\/?(?:start_of_turn|end_of_turn)>/.source,      // Gemma
+  /<<\/?SYS>>/.source,                              // Llama 2 system block
+  /\[\/?INST\]/.source,                              // Mistral instruction block
+].join('|'), 'gi');
+
+function neutralizeControlTokens(text) {
+  if (typeof text !== 'string' || !text) return text;
+  // Cheap reject: none of the forms above can start without one of these.
+  if (text.indexOf('<') < 0 && text.indexOf('[') < 0) return text;
+  return text.replace(CONTROL_TOKEN, (m) => `${m[0]} ${m.slice(1)}`);
+}
+
+// Same, for a list of chat messages. Returns the input unchanged when there was
+// nothing to neutralize, so the common case allocates nothing.
+function neutralizeMessages(messages) {
+  if (!Array.isArray(messages)) return messages;
+  let dirty = false;
+  const out = messages.map((m) => {
+    if (!m || typeof m.content !== 'string') return m;
+    const clean = neutralizeControlTokens(m.content);
+    if (clean === m.content) return m;
+    dirty = true;
+    return { ...m, content: clean };
+  });
+  return dirty ? out : messages;
+}
+
+
 module.exports = {
   sleep, fetchRetry, errorBody, nsFromMs, trimSlash,
+  neutralizeControlTokens, neutralizeMessages,
   MAX_ERROR_BODY, MAX_FRAME_BYTES, UNDELIMITED,
 };

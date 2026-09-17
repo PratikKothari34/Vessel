@@ -245,14 +245,25 @@ impl Engine for Backend {
     fn describe(&self) -> Json {
         dispatch!(self, describe())
     }
+    // Content is defused HERE, at the one door out of the app, rather than at
+    // each place a message is built. Every backend tokenizes content with
+    // special-token parsing on, so a turn delimiter sitting in a persona, in a
+    // synced row, or in the model's own earlier output is read as a real turn
+    // boundary rather than as the prose it is. See `util::neutralize_control_tokens`.
+    //
+    // `embed` is deliberately left alone: its output is a vector, not a prompt,
+    // so a stray delimiter there moves a cosine score and forges nothing.
     async fn chat_stream(
         &self,
-        messages: Vec<Message>,
+        mut messages: Vec<Message>,
         options: &Map<String, Json>,
     ) -> Result<ChatStart> {
+        util::neutralize_messages(&mut messages);
         dispatch!(async self, chat_stream(messages, options))
     }
     async fn generate(&self, model: &str, prompt: &str, opts: GenOpts) -> Result<String> {
+        let prompt = util::neutralize_control_tokens(prompt);
+        let prompt = prompt.as_ref();
         dispatch!(async self, generate(model, prompt, opts))
     }
     async fn embed(&self, model: &str, text: &str, opts: EmbedOpts) -> Result<Vec<f32>> {
