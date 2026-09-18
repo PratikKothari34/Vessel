@@ -517,27 +517,29 @@ with. Roughly half of the Node security suite defended a perimeter that no
 longer exists - see the module doc on `src-core/tests/security.rs` for which
 tests were carried across and which were deleted, and why.
 
-Re-counted 2026-09-17. The Rust figures are **after** the one-time
+Re-counted 2026-09-18. The Rust figures are **after** the one-time
 `cargo fmt` pass, which splits long lines and so inflates every Rust row against
-the numbers this table carried before; the Electron rows are unaffected.
+the numbers this table carried before; the Electron rows are unaffected. A Rust
+file's inline `#[cfg(test)]` module counts as test, not production, which is why
+`src-core/src` reads smaller here than `wc -l` over the same files.
 
 | Area | Electron track | Rust track | |
 |---|---|---|---|
-| backend / core, production only | 4,298 | 8,053 | [M] |
-| of which `inference/` | 793 | 2,970 | [M] |
-| shell (main + preload / Tauri) | 239 | 564 | [M] |
-| tests | 3,461 | 3,974 | [M] |
-| test count | 202 | 167 | [M] |
-| renderer JS/JSX | 1,536 | shared, unchanged | [M] |
+| backend / core, production only | 4,551 | 8,190 | [M] |
+| of which `inference/` | 862 | 3,118 | [M] |
+| shell (main + preload / Tauri) | 239 | 567 | [M] |
+| tests | 4,059 | 4,274 | [M] |
+| test count | 253 | 191 | [M] |
+| renderer JS/JSX | 1,425 | shared, unchanged | [M] |
 | renderer CSS | 752 | shared, unchanged | [M] |
 
 Rust is longer per unit of behaviour and that is the trade: explicit error
 types, no prototype chain to smuggle a key through, and a compiler that rejects
 the shape of bug the Node suite had to test for. The test counts are close
-because both suites cover the same behaviour; the Rust side folds 139 of its
-167 into the modules they test, so a failure names the function rather than an
+because both suites cover the same behaviour; the Rust side folds 160 of its
+191 into the modules they test, so a failure names the function rather than an
 endpoint. The Electron suite is the larger of the two because it also has to
-test a perimeter the Rust track does not have: 32 of its 202 are red-team tests
+test a perimeter the Rust track does not have: 34 of its 253 are red-team tests
 against the HTTP surface.
 
 **Not yet verified at runtime.** The shell needs a visible desktop window

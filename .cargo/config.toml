@@ -8,7 +8,7 @@
 #   cargo test -p vessel-core
 #   cargo clippy --workspace --all-targets
 #
-# Measured on that toolchain: 126 unit + 12 chat_turn + 12 security, all green,
+# Measured on that toolchain: 160 unit + 15 chat_turn + 16 security, all green,
 # and clippy silent across the workspace including src-tauri.
 #
 # The blocks below exist only for the legacy `+stable-x86_64-pc-windows-gnu`
