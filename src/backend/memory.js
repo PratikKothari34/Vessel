@@ -129,6 +129,26 @@ const VERBATIM_CEILING = intEnv(
 const MAX_FOLD_TURNS = intEnv('MAX_FOLD_TURNS', 24, { min: 2 });
 const RETRIEVE_K = intEnv('RETRIEVE_K', 4);
 const RETRIEVE_MIN_SCORE = floatEnv('RETRIEVE_MIN_SCORE', 0.45, { min: -1, max: 1 });
+// How alike two archived turns may be before retrieval treats them as one
+// memory rather than two.
+//
+// Near-identical rows are ordinary in a long conversation: a question the user
+// asks again every few hundred turns, a greeting, a line the character repeats.
+// They score near-identically against a query, so they win adjacent slots, and
+// the reply is built on k copies of one memory.
+//
+// The 20,000-turn run measured what that costs. Its probe questions are asked
+// once per distance, so by the fifth ask the archive held four earlier copies
+// of the question, every one of them closer to the query than the answer was.
+// Retrieval handed back the user's own question four times and recall at that
+// distance was 0 of 40 -- while the top-4 held 1.00 distinct rows. What looked
+// like a limit on how far back memory reaches was a diversity failure at every
+// distance; it only became total once the duplicates outnumbered the slots.
+//
+// Set high on purpose. The failure is duplicates, not neighbours, and a lower
+// bar starts discarding genuinely different turns that happen to share a
+// subject -- which is most of a conversation about one thing.
+const RETRIEVE_DUP_MAX = floatEnv('RETRIEVE_DUP_MAX', 0.97, { min: -1, max: 1 });
 const MAX_SUMMARY_CHARS = intEnv('MAX_SUMMARY_CHARS', 6000, { min: 500 });
 // The prompt never used to state a length, so the summarizer answered with
 // whatever it felt like -- measured at 5,792 to 12,422 chars against a 6,000
@@ -492,6 +512,9 @@ async function retrieve(conversationId, queryText, k = RETRIEVE_K) {
   // only a winner pays an O(k) insert. k is 4, so that insert is free.
   const topId = new Float64Array(k);
   const topScore = new Float64Array(k);
+  // The matrix row behind each held winner, so a candidate can be compared
+  // against what is already held without going back to the database.
+  const topRow = new Int32Array(k);
   let filled = 0;
   let cutoff = RETRIEVE_MIN_SCORE;
   const { ids, mat, norms, n } = cache;
@@ -508,16 +531,46 @@ async function retrieve(conversationId, queryText, k = RETRIEVE_K) {
     // finite and positive by construction -- but the guard is free, and it is
     // the last line of defence if a future format lets one back in.
     if (!(score >= cutoff)) continue;
+
+    // Is this the same memory as one already held? The check runs on winners,
+    // not on rows: reaching here is rare and gets rarer as the cutoff climbs,
+    // so the cost is at most k row-against-row dot products a handful of times
+    // per query, against one query-against-row dot product for every row.
+    let dup = -1;
+    for (let t = 0; t < filled; t++) {
+      const o = topRow[t] * EMBED_DIM;
+      let ab = 0;
+      for (let j = 0; j < EMBED_DIM; j++) ab += mat[off + j] * mat[o + j];
+      // Same identity as above, applied to two rows instead of a unit query
+      // and a row: the raw int8 product scaled by both inverse norms.
+      if (ab * norms[i] * norms[topRow[t]] >= RETRIEVE_DUP_MAX) { dup = t; break; }
+    }
+    if (dup >= 0) {
+      // Keep whichever copy says it better and leave the slot count alone, so
+      // a repeated line can never cost more than the one slot it deserves.
+      if (!(score > topScore[dup])) continue;
+      for (let t = dup; t < filled - 1; t++) {
+        topScore[t] = topScore[t + 1];
+        topId[t] = topId[t + 1];
+        topRow[t] = topRow[t + 1];
+      }
+      filled--;
+    }
+
     // Descending insert; drops the weakest once full.
     let j = filled < k ? filled++ : k - 1;
     while (j > 0 && topScore[j - 1] < score) {
       topScore[j] = topScore[j - 1];
       topId[j] = topId[j - 1];
+      topRow[j] = topRow[j - 1];
       j--;
     }
     topScore[j] = score;
     topId[j] = ids[i];
+    topRow[j] = i;
     // Once k winners are held, nothing weaker than the weakest can ever win.
+    // Eviction cannot undo that: the copy that replaces a duplicate always
+    // scores higher than the one it evicted, so the k-th best only ever rises.
     if (filled === k) cutoff = topScore[k - 1];
   }
   if (!filled) return [];
@@ -1408,6 +1461,10 @@ module.exports = {
   setTitle,
   deleteConversation,
   forgetArchive,
+  // Exported for tests. Retrieval is reached through buildContext in
+  // production, but its selection rules -- the score floor, the k cap and the
+  // duplicate suppression -- are worth asserting on directly.
+  retrieve,
   // Pure vector helpers, exported for the unit tests only. They sit below the
   // database and the engine, so testing them through retrieve() would need both
   // just to exercise arithmetic.

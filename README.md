@@ -121,6 +121,7 @@ full list. Key ones:
 | `SUMMARIZE_THRESHOLD` | `12` | When to archive old turns — see the note below |
 | `RETRIEVE_K` | `4` | Max recalled turns per message |
 | `RETRIEVE_MIN_SCORE` | `0.45` | Min cosine similarity (0–1) for a recalled turn to count as relevant |
+| `RETRIEVE_DUP_MAX` | `0.97` | Cosine above which two recalled turns count as one memory and share one slot |
 | `MAX_SUMMARY_CHARS` | `6000` | Hard cap on rolling-summary length |
 | `SUMMARIZER_NUM_CTX` | `8192` | Summarizer context window |
 

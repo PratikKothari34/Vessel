@@ -85,6 +85,14 @@ async function start(opts = {}) {
       generateFails: false,
       // Set to true to make /api/embeddings return nothing usable.
       embedFails: false,
+      // Optional (text) => number[] override for /api/embeddings, for tests that
+      // need a chosen geometry rather than a hash.
+      //
+      // fakeEmbedding hashes the whole string, so two texts are either the same
+      // vector or unrelated ones -- there is no "almost the same", which is
+      // exactly the case retrieval's duplicate suppression turns on. A test that
+      // needs one row to sit at cosine 0.9 from another has to say so.
+      embedFor: null,
       // Numbers the final done chunk reports.
       promptEvalCount: 100,
       evalCount: 10,
@@ -145,7 +153,9 @@ async function start(opts = {}) {
     if (req.url === '/api/embeddings') {
       state.embedRequests.push(body);
       if (state.script.embedFails) return json(200, { embedding: [] });
-      return json(200, { embedding: fakeEmbedding(String(body.prompt || '')) });
+      const text = String(body.prompt || '');
+      const chosen = state.script.embedFor && state.script.embedFor(text);
+      return json(200, { embedding: chosen || fakeEmbedding(text) });
     }
 
     return json(404, { error: `no fake route for ${req.url}` });

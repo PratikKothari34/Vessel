@@ -78,6 +78,9 @@ pub struct Config {
     pub max_fold_turns: usize,
     pub retrieve_k: usize,
     pub retrieve_min_score: f32,
+    /// How alike two archived turns may be before retrieval treats them as
+    /// one memory rather than two. See `top_k`.
+    pub retrieve_dup_max: f32,
     pub max_summary_chars: usize,
     pub summary_target_chars: usize,
     /// Whether the rolling summary is maintained at all. Folding, embedding and
@@ -183,6 +186,7 @@ impl Config {
             max_fold_turns: int_env("MAX_FOLD_TURNS", 24, 2) as usize,
             retrieve_k: int_env("RETRIEVE_K", 4, 0) as usize,
             retrieve_min_score: float_env("RETRIEVE_MIN_SCORE", 0.45, -1.0, 1.0),
+            retrieve_dup_max: float_env("RETRIEVE_DUP_MAX", 0.97, -1.0, 1.0),
             max_summary_chars,
             summary_target_chars,
             summary_enabled,
@@ -528,6 +532,17 @@ fn normalize_in_place(v: &mut [f32]) -> bool {
 /// grows with the story. Here each row costs one compare against the current
 /// k-th best, and only a winner pays an O(k) insert - k is 4, so that insert is
 /// free.
+///
+/// Rows within `dup_max` of one another are one memory, and share one slot.
+/// A long conversation repeats itself - a question the user asks again every
+/// few hundred turns, a line the character comes back to - and those rows score
+/// near-identically against a query, so they win adjacent slots and the reply is
+/// built on k copies of one thing. The 20,000-turn run measured it on the
+/// JavaScript side: its probe questions were asked once per distance, and by the
+/// fifth ask four earlier copies of the question sat in the archive, all of them
+/// closer to the query than the answer. Retrieval returned the question four
+/// times and found the answer in 0 of 40 probes; suppressing duplicates over the
+/// same rows found it in 35.
 fn top_k(
     query: &[f32],
     ids: &[i64],
@@ -535,8 +550,13 @@ fn top_k(
     norms: &[f32],
     k: usize,
     min_score: f32,
+    dup_max: f32,
 ) -> Vec<(i64, f32)> {
     let mut top: Vec<(i64, f32)> = Vec::with_capacity(k);
+    // The matrix row behind each held winner, in the same order as `top`, so a
+    // candidate can be compared against what is already held without another
+    // pass over the archive.
+    let mut top_rows: Vec<usize> = Vec::with_capacity(k);
     if k == 0 {
         return top;
     }
@@ -560,12 +580,40 @@ fn top_k(
         if !(score >= cutoff) {
             continue;
         }
-        if top.len() == k {
+        // Is this the same memory as one already held? The check runs on
+        // winners, not on rows: reaching here is rare and gets rarer as the
+        // cutoff climbs, so the cost is at most k row-against-row dot products
+        // a handful of times per query, against one query-against-row dot
+        // product for every row.
+        let dup = top_rows.iter().position(|&t| {
+            let other = &mat[t * EMBED_DIM..(t + 1) * EMBED_DIM];
+            let ab: f32 = row.iter().zip(other).map(|(&a, &b)| a as f32 * b as f32).sum();
+            // The same identity as above, applied to two rows instead of a unit
+            // query and a row: the raw i8 product scaled by both inverse norms.
+            ab * norms[i] * norms[t] >= dup_max
+        });
+        if let Some(d) = dup {
+            // Keep whichever copy says it better and leave the slot count alone,
+            // so a repeated line can never cost more than the one slot it
+            // deserves.
+            // Plain, not negated: unlike the cutoff test above, both sides here
+            // are known non-NaN -- `score` only reaches this line by clearing
+            // the cutoff, and a held score cleared it earlier.
+            if score <= top[d].1 {
+                continue;
+            }
+            top.remove(d);
+            top_rows.remove(d);
+        } else if top.len() == k {
             top.pop();
+            top_rows.pop();
         }
         let at = top.partition_point(|(_, s)| *s >= score);
         top.insert(at, (*id, score));
+        top_rows.insert(at, i);
         // Once k winners are held, nothing weaker than the weakest can win.
+        // Eviction cannot undo that: the copy that replaces a duplicate always
+        // scores higher than the one it evicted, so the k-th best only rises.
         if top.len() == k {
             cutoff = top[k - 1].1;
         }
@@ -790,6 +838,7 @@ pub async fn retrieve(db: &Db, conversation_id: &str, query_text: &str) -> Resul
         &e.norms,
         cfg.retrieve_k,
         cfg.retrieve_min_score,
+        cfg.retrieve_dup_max,
     );
     drop(e);
     if top.is_empty() {
@@ -2276,6 +2325,48 @@ mod tests {
         (ids, mat, norms)
     }
 
+    /// Duplicate suppression off. At 1.0 only a bit-identical row counts as a
+    /// duplicate, and no fixture below has one, so the tests that predate
+    /// suppression keep testing what they were written to test.
+    const NO_DUP: f32 = 1.0;
+
+    /// A unit vector at `deg` from the first axis, in the plane of the first
+    /// two. Used as a query, where it stays float.
+    fn query_at(deg: f32) -> Vec<f32> {
+        let r = deg.to_radians();
+        let mut v = vec![0.0f32; EMBED_DIM];
+        v[0] = r.cos();
+        v[1] = r.sin();
+        normalize_in_place(&mut v);
+        v
+    }
+
+    /// The same vectors as archive rows: quantized and normed the way
+    /// `absorb_rows` leaves them, ids 1..n in the order given.
+    ///
+    /// Angles rather than seeds because duplicate suppression turns on how
+    /// close two rows are to each other, and in this plane the cosine between
+    /// any two rows is the cosine of the angle between them -- so what each
+    /// test expects is arithmetic rather than a guess.
+    fn at_angles(degrees: &[f32]) -> (Vec<i64>, Vec<i8>, Vec<f32>) {
+        let mut ids = Vec::new();
+        let mut mat = Vec::new();
+        let mut norms = Vec::new();
+        for (i, deg) in degrees.iter().enumerate() {
+            let v = query_at(*deg);
+            assert!(codec::decode_int8(
+                &codec::encode_int8(&v),
+                EMBED_DIM,
+                &mut mat
+            ));
+            let row = &mat[mat.len() - EMBED_DIM..];
+            let sq: i32 = row.iter().map(|&x| x as i32 * x as i32).sum();
+            norms.push(1.0 / (sq as f32).sqrt());
+            ids.push(i as i64 + 1);
+        }
+        (ids, mat, norms)
+    }
+
     #[test]
     fn one_nan_row_cannot_outrank_the_real_matches_or_unblock_the_rest() {
         // The failure this guards: NaN loses no comparison, so a direct
@@ -2291,7 +2382,7 @@ mod tests {
         let (ids, mat, mut norms) = quantized(&[5.0, 0.0, 9.0]);
         norms[0] = f32::NAN;
 
-        let top = top_k(&q, &ids, &mat, &norms, 4, 0.9);
+        let top = top_k(&q, &ids, &mat, &norms, 4, 0.9, NO_DUP);
         assert_eq!(
             top.len(),
             1,
@@ -2320,7 +2411,7 @@ mod tests {
         let mut q = unit(0.0);
         normalize_in_place(&mut q);
         let (ids, mat, norms) = quantized(&[0.0, 2.0, 0.05, 4.0]);
-        let top = top_k(&q, &ids, &mat, &norms, 2, -1.0);
+        let top = top_k(&q, &ids, &mat, &norms, 2, -1.0, NO_DUP);
         assert_eq!(top.len(), 2);
         assert_eq!(top[0].0, 1, "the identical vector wins");
         assert_eq!(top[1].0, 3, "the near-identical one is second");
@@ -2332,10 +2423,79 @@ mod tests {
         let mut q = unit(0.0);
         normalize_in_place(&mut q);
         let (ids, mat, norms) = quantized(&[9.0]);
-        assert!(top_k(&q, &ids, &mat, &norms, 4, 0.999).is_empty());
+        assert!(top_k(&q, &ids, &mat, &norms, 4, 0.999, NO_DUP).is_empty());
         assert!(
-            top_k(&q, &ids, &mat, &norms, 0, -1.0).is_empty(),
+            top_k(&q, &ids, &mat, &norms, 0, -1.0, NO_DUP).is_empty(),
             "k=0 disables retrieval"
+        );
+    }
+
+    // ---- duplicate suppression ------------------------------------------
+    // The floor is dropped to 0.05 in these: what is under test is which rows
+    // count as one memory, not which clear the bar.
+
+    #[test]
+    fn a_row_the_archive_holds_four_times_takes_one_slot() {
+        // The 20,000-turn shape: four copies of the question (10 degrees, the
+        // closest thing to it in the archive) and the answer further out at 30.
+        // Ungoverned, the copies take all four slots and the answer never
+        // reaches the model.
+        let q = query_at(0.0);
+        let (ids, mat, norms) = at_angles(&[10.0, 10.0, 10.0, 10.0, 30.0, 50.0, 70.0]);
+        let top = top_k(&q, &ids, &mat, &norms, 4, 0.05, 0.97);
+        assert_eq!(top.len(), 4, "the budget is still spent in full: {top:?}");
+        assert_eq!(
+            top.iter().filter(|(id, _)| *id <= 4).count(),
+            1,
+            "one copy of the repeated row, not four: {top:?}"
+        );
+        assert!(
+            top.iter().any(|(id, _)| *id == 5),
+            "the answer is not crowded out: {top:?}"
+        );
+    }
+
+    #[test]
+    fn of_two_copies_of_one_memory_the_better_one_is_kept() {
+        // 34 then 25 degrees: 0.829 and 0.906 against the query, 0.988 against
+        // each other. The archive is scanned oldest first, so the worse copy is
+        // already held when the better one turns up -- keeping the better one
+        // means evicting what is there.
+        let q = query_at(0.0);
+        let (ids, mat, norms) = at_angles(&[34.0, 25.0, 60.0]);
+        let top = top_k(&q, &ids, &mat, &norms, 4, 0.05, 0.97);
+        assert_eq!(top.len(), 2, "the pair collapses to one: {top:?}");
+        assert_eq!(top[0].0, 2, "and it is the better copy");
+    }
+
+    #[test]
+    fn rows_that_are_merely_near_are_two_memories_not_one() {
+        // 20 and 40 degrees: 0.940 against each other, under the bar. Turns that
+        // share a subject are most of a long conversation, and losing them to
+        // suppression would cost more than the duplicates do.
+        let q = query_at(0.0);
+        let (ids, mat, norms) = at_angles(&[20.0, 40.0]);
+        let top = top_k(&q, &ids, &mat, &norms, 4, 0.05, 0.97);
+        assert_eq!(top.len(), 2, "near is not the same: {top:?}");
+    }
+
+    #[test]
+    fn a_duplicate_does_not_cost_a_genuine_memory_its_slot() {
+        // 15, 45 and 65 fill three slots; 23 is a second, worse copy of the
+        // first; 85 is a fourth genuine memory, and the weakest. Ungoverned, the
+        // duplicate takes the fourth slot and 85 is dropped.
+        let q = query_at(0.0);
+        let (ids, mat, norms) = at_angles(&[15.0, 45.0, 65.0, 23.0, 85.0]);
+        let top = top_k(&q, &ids, &mat, &norms, 4, 0.05, 0.97);
+        assert_eq!(top.len(), 4);
+        assert_eq!(
+            top.iter().filter(|(id, _)| *id == 1 || *id == 4).count(),
+            1,
+            "the repeated row is held once: {top:?}"
+        );
+        assert!(
+            top.iter().any(|(id, _)| *id == 5),
+            "the weakest genuine memory gets the slot: {top:?}"
         );
     }
 
