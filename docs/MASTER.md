@@ -305,6 +305,67 @@ One model, one character, one scripted conversation. Probes are concrete noun
 phrases, which favour retrieval. Says nothing about a summary as a *reading
 surface* for the user - a different job from feeding the model.
 
+## The 20,000-exchange run - retrieval was returning one memory k times
+
+A longer run of the same shape as the A/B above, summariser off, one character,
+one romantic-setting script: 40% explicitly adult turns, 10% sarcasm, 5% wit.
+Facts planted and probed at +40, +180, +600, +1400 and +4000 turns. In flight at
+the time of writing; the numbers below are from its first 7,405 turns and from
+an offline replay against its own database. All [M].
+
+The recall curve looked like a reach limit:
+
+| probe distance | recall | unique rows in the top-4 |
+|---|---|---|
+| +40 | 52.5% (21/40) | 2.95 |
+| +180 | 55.0% (22/40) | 3.20 |
+| +600 | 32.5% (13/40) | 2.83 |
+| +1400 | 27.5% (11/40) | 2.00 |
+| +4000 | **0.0%** (0/40) | **1.00** |
+
+It was not a reach limit. The probes are asked once per distance, so the fifth
+ask met four earlier copies of the same question already archived, every one of
+them closer to the query than the answer was. Retrieval was handing back the
+user's own question four times over, at 0.94 each. The second column is the
+tell: the budget was being spent, on one memory.
+
+The general shape of the bug: **a bounded top-k with no diversity rule spends
+its whole budget on one thing as soon as that thing is in the corpus more than
+k times.** It was present at every distance and only went total once the
+duplicates outnumbered the slots.
+
+The fix is a diversity rule. A candidate within `RETRIEVE_DUP_MAX` of a winner
+already held is the same memory: it takes that slot if it scores higher, and is
+dropped if it does not. The comparison runs on winners, not on rows, so it costs
+at most k row-against-row dot products the few times a row clears the cutoff -
+against one query-against-row product for every row.
+
+Measured by replaying all 40 probes through the real `retrieve()` against a
+snapshot of the run's own database, so both arms see identical rows:
+
+| | before | after |
+|---|---|---|
+| recall | 0/40 | **35/40 (87.5%)** |
+| unique rows in the top-4 | 1.00 | 4.00 |
+| per-probe latency | 79-85 ms | 79-85 ms |
+
+The threshold was swept on that snapshot rather than chosen: 0.85 gives 82.5%
+(over-suppression starting), 0.90 through 0.99 are flat at 87.5%, and 1.0
+collapses to 20% because float equality fails on rows that are bit-identical.
+0.97 sits mid-plateau, clear of both edges.
+
+Fixed on both tracks. Tests on both sides were verified to fail without the fix
+- 4 of 5 in `test/integration/memory-duplicates.test.js`, 3 of 4 in
+`src-core/src/memory.rs`. The one that passes either way in each suite is the
+regression guard: two turns about one subject are still two memories, which is
+what stops the rule from costing more than the bug did.
+
+### Limits
+
+The live run kept the pre-fix code until its next restart, so its own recall
+column is not a clean before/after - the replay above is. Distances +10000 and
++17000 are in the script and have not been reached.
+
 ## Live window ceiling
 
 The memory architecture caps the window by construction:
@@ -517,7 +578,7 @@ with. Roughly half of the Node security suite defended a perimeter that no
 longer exists - see the module doc on `src-core/tests/security.rs` for which
 tests were carried across and which were deleted, and why.
 
-Re-counted 2026-09-18. The Rust figures are **after** the one-time
+Re-counted 2026-09-18, after the retrieval fix below landed. The Rust figures are **after** the one-time
 `cargo fmt` pass, which splits long lines and so inflates every Rust row against
 the numbers this table carried before; the Electron rows are unaffected. A Rust
 file's inline `#[cfg(test)]` module counts as test, not production, which is why
@@ -525,21 +586,21 @@ file's inline `#[cfg(test)]` module counts as test, not production, which is why
 
 | Area | Electron track | Rust track | |
 |---|---|---|---|
-| backend / core, production only | 4,551 | 8,190 | [M] |
+| backend / core, production only | 4,608 | 8,243 | [M] |
 | of which `inference/` | 862 | 3,118 | [M] |
 | shell (main + preload / Tauri) | 239 | 567 | [M] |
-| tests | 4,059 | 4,274 | [M] |
-| test count | 253 | 191 | [M] |
+| tests | 4,274 | 4,398 | [M] |
+| test count | 258 | 195 | [M] |
 | renderer JS/JSX | 1,425 | shared, unchanged | [M] |
 | renderer CSS | 752 | shared, unchanged | [M] |
 
 Rust is longer per unit of behaviour and that is the trade: explicit error
 types, no prototype chain to smuggle a key through, and a compiler that rejects
 the shape of bug the Node suite had to test for. The test counts are close
-because both suites cover the same behaviour; the Rust side folds 160 of its
-191 into the modules they test, so a failure names the function rather than an
+because both suites cover the same behaviour; the Rust side folds 164 of its
+195 into the modules they test, so a failure names the function rather than an
 endpoint. The Electron suite is the larger of the two because it also has to
-test a perimeter the Rust track does not have: 34 of its 253 are red-team tests
+test a perimeter the Rust track does not have: 34 of its 258 are red-team tests
 against the HTTP surface.
 
 **Not yet verified at runtime.** The shell needs a visible desktop window

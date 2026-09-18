@@ -45,6 +45,14 @@ and are **archived with embeddings** (nomic-embed-text); relevant ones are
 recalled per message by cosine-ranking the stored embeddings in JS (the Turso
 sync engine has no native vector search).
 
+Those recalled turns are distinct by construction. A long conversation repeats
+itself, and near-identical turns score near-identically against a query, so
+without a rule against it a single repeated line wins every slot and the reply is
+built on one memory instead of four. Turns within `RETRIEVE_DUP_MAX` cosine of an
+already-chosen one share its slot; measured over a 20,000-exchange run this moved
+recall at +4000 turns from 0/40 to 35/40 at no measurable cost. See
+`docs/decisions/0005-retrieval-returns-distinct-memories.md`.
+
 Ollama is the default, not the only option. `INFERENCE_BACKEND=llama-server`
 points the same backend at a llama.cpp server instead, which on an RTX 4060 8GB
 measured faster on every axis - decode 46.5 vs 39.4 tok/s, prefill ~2,200 vs
