@@ -585,12 +585,15 @@ fn top_k(
         // cutoff climbs, so the cost is at most k row-against-row dot products
         // a handful of times per query, against one query-against-row dot
         // product for every row.
+        // Fold this row's inverse norm into the bar once rather than into every
+        // product: it is the same for all k comparisons.
+        let bar = dup_max / norms[i];
         let dup = top_rows.iter().position(|&t| {
             let other = &mat[t * EMBED_DIM..(t + 1) * EMBED_DIM];
             let ab: f32 = row.iter().zip(other).map(|(&a, &b)| a as f32 * b as f32).sum();
             // The same identity as above, applied to two rows instead of a unit
             // query and a row: the raw i8 product scaled by both inverse norms.
-            ab * norms[i] * norms[t] >= dup_max
+            ab * norms[t] >= bar
         });
         if let Some(d) = dup {
             // Keep whichever copy says it better and leave the slot count alone,

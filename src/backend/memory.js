@@ -537,13 +537,16 @@ async function retrieve(conversationId, queryText, k = RETRIEVE_K) {
     // so the cost is at most k row-against-row dot products a handful of times
     // per query, against one query-against-row dot product for every row.
     let dup = -1;
+    // Fold this row's inverse norm into the bar once rather than into every
+    // product: it is the same for all k comparisons.
+    const bar = RETRIEVE_DUP_MAX / norms[i];
     for (let t = 0; t < filled; t++) {
       const o = topRow[t] * EMBED_DIM;
       let ab = 0;
       for (let j = 0; j < EMBED_DIM; j++) ab += mat[off + j] * mat[o + j];
       // Same identity as above, applied to two rows instead of a unit query
       // and a row: the raw int8 product scaled by both inverse norms.
-      if (ab * norms[i] * norms[topRow[t]] >= RETRIEVE_DUP_MAX) { dup = t; break; }
+      if (ab * norms[topRow[t]] >= bar) { dup = t; break; }
     }
     if (dup >= 0) {
       // Keep whichever copy says it better and leave the slot count alone, so
@@ -1473,7 +1476,7 @@ module.exports = {
     CHAT_MODEL, CHAT_NUM_CTX,
     SUMMARIZER_MODEL, SUMMARIZER_NUM_CTX, SUMMARIZER_NUM_GPU, EMBED_MODEL, EMBED_NUM_GPU,
     SUMMARY_ENABLED, MAX_SUMMARY_CHARS, SUMMARY_TARGET_CHARS,
-    VERBATIM_TURNS, VERBATIM_CEILING, MAX_FOLD_TURNS, SUMMARIZE_THRESHOLD, RETRIEVE_K, RETRIEVE_MIN_SCORE,
+    VERBATIM_TURNS, VERBATIM_CEILING, MAX_FOLD_TURNS, SUMMARIZE_THRESHOLD, RETRIEVE_K, RETRIEVE_MIN_SCORE, RETRIEVE_DUP_MAX,
     ARCHIVE_CACHE_CONVS, EMBED_CONCURRENCY,
   },
 };
