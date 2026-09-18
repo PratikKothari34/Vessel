@@ -315,19 +315,23 @@ an offline replay against its own database. All [M].
 
 The recall curve looked like a reach limit:
 
-| probe distance | recall | unique rows in the top-4 |
-|---|---|---|
-| +40 | 52.5% (21/40) | 2.95 |
-| +180 | 55.0% (22/40) | 3.20 |
-| +600 | 32.5% (13/40) | 2.83 |
-| +1400 | 27.5% (11/40) | 2.00 |
-| +4000 | **0.0%** (0/40) | **1.00** |
+| probe distance | recall | unique rows in the top-4 | probes handed back their own question |
+|---|---|---|---|
+| +40 | 52.5% (21/40) | 2.95 | 0/40 |
+| +180 | 55.0% (22/40) | 3.20 | **40/40** |
+| +600 | 32.5% (13/40) | 2.83 | **40/40** |
+| +1400 | 27.5% (11/40) | 2.00 | **40/40** |
+| +4000 | **0.0%** (0/40) | **1.00** | **40/40** |
 
 It was not a reach limit. The probes are asked once per distance, so the fifth
 ask met four earlier copies of the same question already archived, every one of
 them closer to the query than the answer was. Retrieval was handing back the
-user's own question four times over, at 0.94 each. The second column is the
-tell: the budget was being spent, on one memory.
+user's own question four times over, at 0.94 each.
+
+The last column is the whole finding. At +40 the question has never been asked
+before and cannot crowd anything; from +180 on, **every probe at every distance
+got its own question back**. The question always won a slot. What changed with
+distance was only how many it won, until at +4000 it had all four.
 
 The general shape of the bug: **a bounded top-k with no diversity rule spends
 its whole budget on one thing as soon as that thing is in the corpus more than
