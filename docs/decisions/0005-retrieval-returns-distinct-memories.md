@@ -58,11 +58,24 @@ long conversation is.
 Replaying all 40 probes through the real `retrieve()` against a snapshot of the
 run's own database, so both arms see identical rows:
 
-| | before | after |
-|---|---|---|
-| recall | 0/40 | **35/40 (87.5%)** |
-| unique rows in the top-4 | 1.00 | 4.00 |
-| per-probe latency | 79–85 ms | 79–85 ms |
+| distance | recall, before | recall, after | unique rows, before | after |
+|---|---|---|---|---|
+| +40 | 85.0% | **92.5%** | 2.95 | 4.00 |
+| +180 | 82.5% | **90.0%** | 3.20 | 4.00 |
+| +600 | 80.0% | **90.0%** | 2.83 | 4.00 |
+| +1400 | 67.5% | **90.0%** | 2.00 | 4.00 |
+| +4000 | **0.0%** | **87.5%** | **1.00** | 4.00 |
+| +10000 | **0.0%** | **87.5%** | **1.00** | 4.00 |
+| +17000 | **0.0%** | **87.5%** | **1.00** | 4.00 |
+
+Per-probe latency is 79–85 ms in both arms, at every distance.
+
+The run has since finished all 20,000 turns, and the replay above now covers
+the full distance ladder against the complete 39,976-row archive. It settles
+the reach question the pre-fix curve appeared to be asking: **once duplicates
+are suppressed, recall is flat with distance.** A fact planted 17,000 turns
+back is recalled as reliably as one planted 4,000 back, and the three distances
+that read 0% all read 87.5%. There was never a reach limit to find.
 
 ### Why 0.97 and not a rounder number
 
@@ -92,6 +105,10 @@ and at 1.0 bit-identical rows still merge — correctly. A cosine above 1 is not
 cosine.
 
 ### Limits
+
+The replay fixes k=4 and floor=0.45 and asks each probe once against the
+finished archive, so it measures what retrieval *selects*, not what the model
+then does with it — a row retrieved is not proof the reply used it.
 
 One run, one script, one embedding model. The probes are concrete noun phrases,
 which favour retrieval, and they are asked in a pattern that guarantees the

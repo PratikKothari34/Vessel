@@ -309,19 +309,28 @@ surface* for the user - a different job from feeding the model.
 
 A longer run of the same shape as the A/B above, summariser off, one character,
 one romantic-setting script: 40% explicitly adult turns, 10% sarcasm, 5% wit.
-Facts planted and probed at +40, +180, +600, +1400 and +4000 turns. In flight at
-the time of writing; the numbers below are from its first 7,405 turns and from
-an offline replay against its own database. All [M].
+Facts planted and probed at +40, +180, +600, +1400, +4000, +10000 and +17000
+turns. The run is complete: 20,000 of 20,000 turns, 19,994 archived rows, one
+known gap and no duplicates. Mix landed on target - adult 40.00%, sarcasm
+10.00%, wit 5.00% - with 10 refusals in 20,000 turns (0.05%). All [M].
 
 The recall curve looked like a reach limit:
 
-| probe distance | recall | unique rows in the top-4 | probes handed back their own question |
-|---|---|---|---|
-| +40 | 52.5% (21/40) | 2.95 | 0/40 |
-| +180 | 55.0% (22/40) | 3.20 | **40/40** |
-| +600 | 32.5% (13/40) | 2.83 | **40/40** |
-| +1400 | 27.5% (11/40) | 2.00 | **40/40** |
-| +4000 | **0.0%** (0/40) | **1.00** | **40/40** |
+| probe distance | probe window | code | recall | unique rows in the top-4 | probes handed back their own question |
+|---|---|---|---|---|---|
+| +40 | t101-2,479 | pre-fix | 52.5% (21/40) | 2.95 | 0/40 |
+| +180 | t241-2,619 | pre-fix | 55.0% (22/40) | 3.20 | **40/40** |
+| +600 | t661-3,039 | pre-fix | 32.5% (13/40) | 2.83 | **40/40** |
+| +1400 | t1,461-3,839 | pre-fix | 27.5% (11/40) | 2.00 | **40/40** |
+| +4000 | t4,061-6,439 | pre-fix | **0.0%** (0/40) | **1.00** | **40/40** |
+| +10000 | t10,061-12,439 | post-fix | 35.0% (14/40) | - | - |
+| +17000 | t17,061-19,439 | post-fix | 45.0% (18/40) | - | - |
+
+Read the first five rows only. Each distance probes in its own non-overlapping
+turn window and the fix landed mid-run, so distance, corpus size and code
+version all move together - the last two rows are a different build answering a
+different corpus, not a longer reach. The controlled measurement is the replay
+below, where both arms see identical rows.
 
 It was not a reach limit. The probes are asked once per distance, so the fifth
 ask met four earlier copies of the same question already archived, every one of
@@ -347,11 +356,22 @@ against one query-against-row product for every row.
 Measured by replaying all 40 probes through the real `retrieve()` against a
 snapshot of the run's own database, so both arms see identical rows:
 
-| | before | after |
-|---|---|---|
-| recall | 0/40 | **35/40 (87.5%)** |
-| unique rows in the top-4 | 1.00 | 4.00 |
-| per-probe latency | 79-85 ms | 79-85 ms |
+| distance | recall, before | recall, after | unique rows in the top-4, before | after |
+|---|---|---|---|---|
+| +40 | 85.0% (34/40) | **92.5% (37/40)** | 2.95 | 4.00 |
+| +180 | 82.5% (33/40) | **90.0% (36/40)** | 3.20 | 4.00 |
+| +600 | 80.0% (32/40) | **90.0% (36/40)** | 2.83 | 4.00 |
+| +1400 | 67.5% (27/40) | **90.0% (36/40)** | 2.00 | 4.00 |
+| +4000 | **0.0%** (0/40) | **87.5% (35/40)** | **1.00** | 4.00 |
+| +10000 | **0.0%** (0/40) | **87.5% (35/40)** | **1.00** | 4.00 |
+| +17000 | **0.0%** (0/40) | **87.5% (35/40)** | **1.00** | 4.00 |
+
+Per-probe latency is 79-85 ms in both arms at every distance.
+
+**Retrieval reach is flat.** Once duplicates are suppressed, a fact 17,000
+turns back is recalled as reliably as one 4,000 turns back - 87.5% at all three
+of the distances that previously read 0%, against a 39,976-row archive. The
+"memory fades with distance" curve was duplicate crowding the whole way down.
 
 The threshold was swept on that snapshot rather than chosen: 0.85 gives 82.5%
 (over-suppression starting), 0.90 through 0.99 are flat at 87.5%, and 1.0
@@ -367,8 +387,10 @@ what stops the rule from costing more than the bug did.
 ### Limits
 
 The live run kept the pre-fix code until its next restart, so its own recall
-column is not a clean before/after - the replay above is. Distances +10000 and
-+17000 are in the script and have not been reached.
+column is not a clean before/after - the replay above is. The replay fixes k=4
+and floor=0.45 and asks each probe once against the finished archive, so it
+measures selection, not the live engine's answer: a row retrieved is not proof
+the model used it. One model, one character, one script.
 
 ## Live window ceiling
 
