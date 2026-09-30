@@ -677,6 +677,59 @@ handshake, the keychain bug needs the user's real Credential Manager, and the
 dev-URL trap needs a window. This is the class of defect that only a live launch
 finds, which is exactly what this stage was waiting on.
 
+### Encryption at rest, exercised at runtime
+
+The first launch left one gap: it ran with sync ON, so the file opened through
+the *sync* driver, which is plaintext by design. The keychain fix above was
+proven to return the right *value* - the SHA-256 fingerprints matched across
+tracks - but that key had never actually opened an encrypted file in the real
+app. Closed on 2026-09-30 by running the same release binary with
+`VESSEL_NO_SYNC=1` and a scratch `LOCAL_DB_PATH`, which takes the `open_local`
+branch instead:
+
+| | live `data/scenario.db` (sync on) | scratch DB (sync off) |
+|---|---|---|
+| banner | `-> sync: enabled` | `-> sync: local-only` |
+| first 8 bytes | `SQLite format 3 ` | `Turso  ` |
+| plain driver | opens | `file is not a database` |
+| keychain key | n/a | reads all 9 app tables |
+| wrong key | n/a | `Decryption failed for page=1` |
+
+Same binary, same keychain, different driver - chosen at runtime from live
+config, exactly as the two-driver split claims.
+
+The one-time plaintext -> encrypted migration was exercised the same way, since
+it had also never run outside a unit test. A seeded plaintext DB holding a
+canary row was handed to the real app: it logged `1 rows encrypted`, wrote
+`Turso `, and kept the original as `.plaintext-backup`. The canary string
+is greppable in the backup and **absent from the encrypted file**, and the row
+reads back as `"pre-migration-canary-row"` only with the real key. So the
+migration preserves data and genuinely removes the plaintext.
+
+Failing at page 1 on a wrong key is the part that matters: it means the
+encryption is whole-file AES, not a header flag.
+
+### Why the renderer's own CSP does not block IPC
+
+`app/out/renderer/index.html` ships its own `<meta>` CSP with
+`connect-src 'self'` - no `ipc:`, unlike the policy in `tauri.conf.json`. Tauri
+does not replace that tag: `tauri_utils::html2::inject_csp` *appends* a second
+`<meta>`, and per spec multiple policies are enforced as an intersection, so the
+stricter one wins. By that reading IPC should have been blocked. It was not.
+
+The reason is that `connect-src` never had jurisdiction. Tauri has two IPC
+transports (`scripts/ipc-protocol.js`), and the `fetch`-based one is gated on
+`canUseCustomProtocol`; otherwise it falls back to
+`window.__TAURI_INTERNALS__.postMessage`, a native webview binding installed by
+wry's `with_ipc_handler`. That is the path this app takes, and a host-object
+call is not a fetch, an XHR or a WebSocket - CSP's `connect-src` does not govern
+it.
+
+Keep the `ipc:` entries in `tauri.conf.json` regardless: they are what makes the
+fetch transport work wherever that branch *is* taken. But do not read a working
+IPC call as evidence that the renderer's CSP permits `ipc:` - it does not, and
+the call simply does not travel over a channel CSP inspects.
+
 ## Cross-track keychain interop
 
 Both tracks read `SERVICE = 'scenario-chat'` with the same two account names,

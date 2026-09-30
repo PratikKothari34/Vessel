@@ -122,5 +122,16 @@ is not the same as them agreeing on how that identifier is spelled to the
 system underneath.** The frozen `scenario-chat` service name was necessary and
 was never violated - and was still not sufficient.
 
+**Closed end-to-end, 2026-09-30.** Reading the right key back was verified by
+fingerprint; *using* it was not, because the first launch ran with sync on and
+the sync driver writes plaintext. The release binary was then run with
+`VESSEL_NO_SYNC=1` and a scratch `LOCAL_DB_PATH`, taking the `open_local`
+branch: the file it wrote carries the `Turso\x00\x02` container header, the plain
+driver rejects it as "file is not a database", the real keychain key reads all
+nine app tables, and a wrong key fails at page 1. The one-time plaintext ->
+encrypted migration was exercised the same way, with a canary row that survives
+into the encrypted file and is absent from it in cleartext. Numbers and method
+in `docs/MASTER.md`, *Encryption at rest, exercised at runtime*.
+
 Re-verify if the pinned crate version moves: this was proven at 0.7.2 on both
 sides, and the container carries a format version byte (`\x02`).
