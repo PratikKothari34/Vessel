@@ -468,6 +468,22 @@ async function connectDb() {
   const openLocal = async () => {
     const connect = await getLocalConnect();
     if (!encryption) {
+      // No key. Plaintext is the right open for a fresh or already-plaintext
+      // database and catastrophic for an encrypted one: the plain driver cannot
+      // read it, and where the file is absent or replaced it would start a NEW
+      // cleartext database over the top. keystore.js now refuses to mint a key
+      // when a database already exists, so this branch is reachable with an
+      // encrypted file present — check before writing.
+      let existsNonEmpty = false;
+      try { existsNonEmpty = fs.statSync(dbPath).size > 0; } catch { /* absent */ }
+      if (existsNonEmpty && !(await isPlaintextDb(dbPath))) {
+        console.error('[db] the database is encrypted but no key is available (keychain empty or unreadable, and no DB_ENCRYPTION_KEY).');
+        throw new Error(
+          `The database at ${dbPath} is encrypted, but no encryption key is available. ` +
+          'Refusing to continue — your data is still encrypted and untouched. ' +
+          'Restore the keychain entry or set DB_ENCRYPTION_KEY.',
+        );
+      }
       console.warn('[db] local database is NOT encrypted at rest (no keychain key and no DB_ENCRYPTION_KEY).');
       _encryptedAtRest = false;
       _unencryptedReason = 'no-key';

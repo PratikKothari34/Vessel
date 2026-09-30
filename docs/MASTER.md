@@ -690,7 +690,7 @@ branch instead:
 | | live `data/scenario.db` (sync on) | scratch DB (sync off) |
 |---|---|---|
 | banner | `-> sync: enabled` | `-> sync: local-only` |
-| first 8 bytes | `SQLite format 3 ` | `Turso  ` |
+| first 8 bytes | `SQLite format 3\0` | `Turso\x00\x02` |
 | plain driver | opens | `file is not a database` |
 | keychain key | n/a | reads all 9 app tables |
 | wrong key | n/a | `Decryption failed for page=1` |
@@ -701,7 +701,7 @@ config, exactly as the two-driver split claims.
 The one-time plaintext -> encrypted migration was exercised the same way, since
 it had also never run outside a unit test. A seeded plaintext DB holding a
 canary row was handed to the real app: it logged `1 rows encrypted`, wrote
-`Turso `, and kept the original as `.plaintext-backup`. The canary string
+`Turso\x00\x02`, and kept the original as `.plaintext-backup`. The canary string
 is greppable in the backup and **absent from the encrypted file**, and the row
 reads back as `"pre-migration-canary-row"` only with the real key. So the
 migration preserves data and genuinely removes the plaintext.
@@ -773,6 +773,42 @@ secret.
 work proved the aes256gcm *container format* reads identically from the Rust
 `turso` crate - canary row and negative control. It said nothing about the *key
 lookup*, and the key lookup is where this stage actually broke.
+
+### The branch that turned a lookup bug into a second credential
+
+Fixing the target name stops *this* bug. It does not stop the next one, because
+the damage came from what happened after the lookup missed: both tracks minted a
+key whenever the keychain came back empty. That is right on a genuine first run
+and wrong every other time, and the two are indistinguishable at the keychain
+API - "no credential" and "the credential is there but I asked for it wrong"
+return the same thing.
+
+The disk can tell them apart. An existing database means this is not a first
+run, so an absent key means something is broken, not new. Both tracks now check
+before minting (`database_already_exists` in `src-core/src/keystore.rs`,
+`databaseAlreadyExists` in `src/backend/keystore.js`) and refuse with an error
+that says what to do, rather than quietly generating a replacement that cannot
+open the existing file.
+
+That change makes a second branch reachable that previously was not: `open_local`
+can now be handed no key at all with an encrypted database present. Opening
+plaintext there would report "not encrypted at rest" about a file it cannot
+read, and on any path where the file is missing or replaced it would start a new
+cleartext database over the top - the same privacy hole the wrong-key path was
+already hardened against. Both tracks now fail closed there too.
+
+Net effect: a keychain that reads empty when it should not now **degrades
+loudly** instead of silently forking the user's key. Covered by
+`no_key_at_all_fails_loudly_on_an_encrypted_database` and
+`no_key_still_opens_a_fresh_or_plaintext_database`, which also pins the
+legitimate degraded path so the guard cannot quietly break a first run.
+
+**The stray credentials from the first Tauri run were deleted on 2026-09-30**
+after checking what they held: the token was a byte-identical duplicate, and the
+DB key was a genuinely different value that nothing on disk was encrypted under
+(no `Turso\x00\x02` file existed anywhere, and there is no packaged-app data
+directory). The live keytar pair was verified unchanged afterwards, and the app
+still opens an encrypted database without minting anything.
 
 ## Stage 4b result - llama.cpp inside the process
 

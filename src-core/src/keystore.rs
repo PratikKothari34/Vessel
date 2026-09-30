@@ -101,6 +101,31 @@ fn read(account: &str) -> Result<Option<String>, KeyringError> {
     get(account)
 }
 
+/// Is there already a database on disk? Then this is NOT a first run, whatever
+/// the keychain says.
+///
+/// This is the guard on minting. An absent key has two causes that look
+/// identical at the keychain API - a genuine first run, and a lookup that failed
+/// for some other reason - and they want opposite handling: generate, or stop.
+/// The database file tells them apart, because a prior install leaves one behind
+/// and a first run does not.
+///
+/// MEASURED, 2026-09-30: this is not hypothetical. The target-name mismatch
+/// above made the Rust track read an empty store on a machine that had a live
+/// key, and the old generate-on-empty branch minted a second one - leaving a
+/// stray credential behind and, had the DB been encrypted rather than synced,
+/// rendering it unreadable. The keychain bug is fixed; this closes the branch
+/// that turned it into a second credential, so the next such bug degrades
+/// instead of orphaning.
+fn database_already_exists() -> bool {
+    let Ok(path) = crate::config::local_db_abs() else {
+        // Can't resolve the path: assume an install exists. Refusing to mint is
+        // always recoverable; minting over someone's key is not.
+        return true;
+    };
+    std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false)
+}
+
 /// Resolve the local-DB encryption key (hex), or `None` if encryption cannot be
 /// enabled. Order:
 ///   1. `DB_ENCRYPTION_KEY` env var (explicit override — lets advanced users BYO key).
@@ -109,7 +134,7 @@ fn read(account: &str) -> Result<Option<String>, KeyringError> {
 ///
 /// Returning a *fresh* random key when one already exists would make the
 /// existing encrypted DB unreadable, so we only ever generate when the keychain
-/// has nothing AND no override is set.
+/// has nothing, no override is set, AND there is no database on disk to orphan.
 pub fn db_encryption_key() -> Option<String> {
     let override_key = crate::config::db_encryption_key_override();
     if !override_key.is_empty() {
@@ -119,6 +144,19 @@ pub fn db_encryption_key() -> Option<String> {
     match read(KEY_ACCOUNT_DB) {
         Ok(Some(k)) if !k.is_empty() => Some(k),
         Ok(_) => {
+            // The keychain has no key. Mint one only if nothing can be orphaned.
+            if database_already_exists() {
+                tracing::error!(
+                    "[keystore] a database exists but the keychain has NO encryption key.\n     \
+                     Refusing to generate a replacement: a new key cannot open the old file, and\n     \
+                     writing one would strand the real key if it is merely unreadable right now.\n     \
+                     The database will be opened as-is. If it is encrypted, restore the keychain\n     \
+                     entry or set DB_ENCRYPTION_KEY; if this really is a fresh start, move the\n     \
+                     existing database aside and relaunch."
+                );
+                return None;
+            }
+
             let mut buf = [0u8; 32]; // 256-bit
             rand::thread_rng().fill_bytes(&mut buf);
             let key = hex::encode(buf);

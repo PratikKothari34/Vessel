@@ -20,6 +20,8 @@
  */
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 // Keychain service name. Intentionally kept as 'scenario-chat' (the app's former
 // name) even though the product is now "Vessel": the DB encryption key + Turso
@@ -47,6 +49,22 @@ function keytar() {
 }
 
 /**
+ * Is there already a database on disk? Then this is NOT a first run, whatever
+ * the keychain says — and minting a key would strand whatever encrypts it.
+ *
+ * Resolved the same way db.js does, not imported from it: db.js requires this
+ * module, so reaching back would be circular.
+ */
+function databaseAlreadyExists() {
+  try {
+    const p = path.resolve(process.env.LOCAL_DB_PATH || './data/scenario.db');
+    return fs.statSync(p).size > 0;
+  } catch {
+    return false; // ENOENT is the honest first-run answer
+  }
+}
+
+/**
  * Resolve the local-DB encryption key (hex string), or null if encryption can't
  * be enabled. Order:
  *   1. DB_ENCRYPTION_KEY env var (explicit override — lets advanced users BYO key).
@@ -67,6 +85,22 @@ async function getDbEncryptionKey() {
   try {
     let key = await kt.getPassword(SERVICE, DB_KEY_ACCOUNT);
     if (!key) {
+      // The keychain has no key. That is either a genuine first run or a lookup
+      // that failed for another reason, and the two are indistinguishable here —
+      // so let the disk decide. An existing database means this is not a first
+      // run, and minting a replacement would strand the real key. See the Rust
+      // port's `database_already_exists` for the incident that motivated this.
+      if (databaseAlreadyExists()) {
+        console.error(
+          '[keystore] a database exists but the keychain has NO encryption key.\n' +
+          '     Refusing to generate a replacement: a new key cannot open the old file, and\n' +
+          '     writing one would strand the real key if it is merely unreadable right now.\n' +
+          '     The database will be opened as-is. If it is encrypted, restore the keychain\n' +
+          '     entry or set DB_ENCRYPTION_KEY; if this really is a fresh start, move the\n' +
+          '     existing database aside and relaunch.'
+        );
+        return null;
+      }
       key = crypto.randomBytes(32).toString('hex'); // 256-bit
       await kt.setPassword(SERVICE, DB_KEY_ACCOUNT, key);
       console.log('[keystore] generated and stored a new local-DB encryption key.');

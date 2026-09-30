@@ -367,6 +367,12 @@ async fn open_local_encrypted(path: &Path, hexkey: &str) -> Result<turso::Databa
         .await?)
 }
 
+/// Does a real database file exist here? A missing or zero-byte file is not one,
+/// and both are normal on a first run.
+fn file_exists_nonempty(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+}
+
 /// Is this file already plaintext? The encrypted driver refuses a plaintext file
 /// ("Decryption failed for page=1") and the plain driver refuses an encrypted
 /// one, so probe cheaply: try to read the schema with no key. Succeeding means
@@ -773,6 +779,24 @@ async fn open_local(
     key: Option<&str>,
 ) -> Result<(turso::Database, bool, Option<UnencryptedReason>)> {
     let Some(key) = key else {
+        // No key. Opening plaintext is right for a fresh or already-plaintext
+        // database and catastrophic for an encrypted one: the plain driver
+        // cannot read it, and on any path where the file is absent or replaced
+        // it would start a NEW cleartext database over the top. `keystore` now
+        // refuses to mint a key when a database already exists, so this branch
+        // is reachable with an encrypted file present - check before writing.
+        if file_exists_nonempty(path) && !is_plaintext_db(path).await {
+            tracing::error!(
+                "[db] the database is encrypted but no key is available (keychain empty or \
+                 unreadable, and no DB_ENCRYPTION_KEY)."
+            );
+            return Err(anyhow!(
+                "The database at {} is encrypted, but no encryption key is available. Refusing to \
+                 continue - your data is still encrypted and untouched. Restore the keychain entry \
+                 or set DB_ENCRYPTION_KEY.",
+                path.display()
+            ));
+        }
         tracing::warn!(
             "[db] local database is NOT encrypted at rest (no keychain key and no DB_ENCRYPTION_KEY)."
         );
@@ -1098,6 +1122,47 @@ mod tests {
             !readable,
             "an encrypted file must not be readable without the key"
         );
+    }
+
+    #[tokio::test]
+    async fn no_key_at_all_fails_loudly_on_an_encrypted_database() {
+        // The companion to the wrong-key case below. `keystore` refuses to mint
+        // a replacement key when a database already exists, so `open_local` can
+        // now be handed `None` with an encrypted file on disk. Opening plaintext
+        // there would report "not encrypted at rest" about a file it cannot read,
+        // and on any path where the file went missing it would start a new
+        // cleartext database in its place.
+        let (_dir, path) = scratch();
+        let (db, encrypted, _) = open_local(&path, Some(KEY_A)).await.unwrap();
+        assert!(encrypted);
+        init_schema(&db.connect().unwrap()).await.unwrap();
+        drop(db);
+
+        let err = open_local(&path, None)
+            .await
+            .expect_err("no key + an encrypted file must not open plaintext");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no encryption key is available"),
+            "the error must say the key is missing, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_key_still_opens_a_fresh_or_plaintext_database() {
+        // The guard above must not break the legitimate no-key path: a first run
+        // and an existing plaintext file both still open, degraded and labelled.
+        let (_dir, path) = scratch();
+        let (db, encrypted, reason) = open_local(&path, None).await.unwrap();
+        assert!(!encrypted);
+        assert_eq!(reason, Some(UnencryptedReason::NoKey));
+        init_schema(&db.connect().unwrap()).await.unwrap();
+        drop(db);
+
+        // Now it exists and is plaintext - still fine to reopen without a key.
+        let (_db, encrypted, reason) = open_local(&path, None).await.unwrap();
+        assert!(!encrypted);
+        assert_eq!(reason, Some(UnencryptedReason::NoKey));
     }
 
     #[tokio::test]
