@@ -305,7 +305,14 @@ async function runMigrations(db) {
 // file is plaintext; failing means it's encrypted (or unreadable, which the real
 // open will report properly).
 async function isPlaintextDb(dbPath) {
-  if (!fs.existsSync(dbPath)) return false; // no file yet → nothing to migrate
+  // A missing file has nothing to migrate. So does a zero-byte one, and that
+  // case matters: an empty file opens fine with the plain driver, which reads
+  // as "plaintext" and runs a whole migration to produce an empty encrypted
+  // database plus a pointless .plaintext-backup. The Rust track already
+  // guarded this; this track did not.
+  let size = -1;
+  try { size = fs.statSync(dbPath).size; } catch { /* absent */ }
+  if (size <= 0) return false;
   const connect = await getLocalConnect();
   let db = null;
   try {
@@ -410,6 +417,60 @@ async function migratePlaintextToEncrypted(dbPath, encryption) {
   }
 }
 
+// A migration that dies between its two renames leaves the main DB file ABSENT
+// while `.encrypting` holds the finished encrypted copy and `.plaintext-backup`
+// holds the original. Nothing downstream notices: isPlaintextDb sees no file and
+// returns false, so no migration runs, and the encrypted open then creates a
+// FRESH EMPTY database over the gap. The user's library is still on disk, in two
+// files the app never looks at again, and the boot that lost it prints nothing.
+//
+// Finish the interrupted swap instead. The encrypted copy was fully written and
+// closed before the first rename, so promoting it is the completion of the
+// operation that was already committed to -- not a guess about intent. The
+// backup is left exactly where it is; the user is told it holds their data in
+// cleartext, same as a migration that completed normally.
+function completeInterruptedMigration(abs) {
+  const tmpPath = `${abs}.encrypting`;
+  let tmpSize = -1;
+  try { tmpSize = fs.statSync(tmpPath).size; } catch { return; } // nothing staged
+  if (tmpSize <= 0) { try { fs.rmSync(tmpPath, { force: true }); } catch { /* ignore */ } return; }
+
+  let mainSize = -1;
+  try { mainSize = fs.statSync(abs).size; } catch { /* absent */ }
+  if (mainSize > 0) {
+    // The swap completed and only the temp file's cleanup was missed, OR a
+    // migration died BEFORE its first rename (main file still the plaintext
+    // original). Either way the staged copy is not the live database and must
+    // not overwrite one. Drop it and let isPlaintextDb decide as usual.
+    for (const suffix of ['', '-wal', '-info', '-changes', '-wal-revert']) {
+      try { fs.rmSync(`${tmpPath}${suffix}`, { force: true }); } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  console.warn('[db] an encryption migration was interrupted mid-swap; completing it now.');
+  // Clear whatever sidecars survived for the absent main file -- they describe
+  // the plaintext original and would corrupt reads of the encrypted file.
+  for (const suffix of ['-wal', '-info', '-changes', '-wal-revert']) {
+    try { fs.rmSync(`${abs}${suffix}`, { force: true }); } catch { /* ignore */ }
+  }
+  try {
+    fs.renameSync(tmpPath, abs);
+  } catch (e) {
+    console.error('[db] could not complete the interrupted migration:', e.message);
+    return;
+  }
+  for (const suffix of ['-wal', '-info', '-changes', '-wal-revert']) {
+    try { fs.rmSync(`${tmpPath}${suffix}`, { force: true }); } catch { /* ignore */ }
+  }
+  console.warn(
+    `[db] recovered. The previous plaintext file is kept at
+     ${abs}.plaintext-backup
+` +
+    '     Delete it once you have confirmed the app works - it is NOT encrypted.',
+  );
+}
+
 // ---- Connect --------------------------------------------------------------
 // Memoized on the PROMISE, not on the resolved handle. `if (_db) return _db`
 // alone only closes the window after connect() finishes, and everything in
@@ -452,6 +513,10 @@ async function connectDb() {
   }
 
   const dbPath = localAbsPath();
+  // Before anything reads the file or picks a driver: finish a swap that a
+  // crash cut in half, or the encrypted open below creates an empty DB in the
+  // gap and the library is silently gone.
+  completeInterruptedMigration(dbPath);
   clearOrphanedSyncMetadata(dbPath);
   if (SYNC_ENABLED) clearSyncMetadataIfRemoteChanged(dbPath, syncUrl);
 
@@ -780,4 +845,8 @@ module.exports = {
   get _config() {
     return { SYNC_INTERVAL };
   },
+  // Test-only, same convention as memory.js. These two decide whether an
+  // existing library survives a boot, and both were unreachable from a test
+  // because connectDb needs a real driver and a real keychain.
+  _internals: { completeInterruptedMigration, isPlaintextDb },
 };

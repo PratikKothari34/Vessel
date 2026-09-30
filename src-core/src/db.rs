@@ -287,6 +287,64 @@ pub fn value_to_json(v: TValue) -> Json {
 
 // ---- Sidecar hygiene -------------------------------------------------------
 
+/// A migration that dies between its two renames leaves the main DB file ABSENT
+/// while `.encrypting` holds the finished encrypted copy and `.plaintext-backup`
+/// holds the original. Nothing downstream notices: `is_plaintext_db` sees no
+/// file and returns false, so no migration runs, and the encrypted open then
+/// creates a FRESH EMPTY database over the gap. The user's library is still on
+/// disk, in two files the app never looks at again, and the boot that lost it
+/// logs nothing.
+///
+/// Finish the interrupted swap instead. The encrypted copy was fully written
+/// and its connection dropped before the first rename, so promoting it
+/// completes an operation already committed to rather than guessing at intent.
+/// The backup is left where it is.
+fn complete_interrupted_migration(abs: &Path) {
+    let disp = abs.display();
+    let tmp = PathBuf::from(format!("{disp}.encrypting"));
+    let tmp_len = match std::fs::metadata(&tmp) {
+        Ok(m) => m.len(),
+        Err(_) => return, // nothing staged
+    };
+    if tmp_len == 0 {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+
+    let main_len = std::fs::metadata(abs).map(|m| m.len()).unwrap_or(0);
+    if main_len > 0 {
+        // Either the swap completed and only the temp cleanup was missed, or a
+        // migration died BEFORE its first rename (main file is still the
+        // plaintext original). Either way the staged copy is not the live
+        // database and must not overwrite one. Drop it and let
+        // `is_plaintext_db` decide as usual.
+        let _ = std::fs::remove_file(&tmp);
+        for suffix in ["-wal", "-info", "-changes", "-wal-revert"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", tmp.display()));
+        }
+        return;
+    }
+
+    tracing::warn!("[db] an encryption migration was interrupted mid-swap; completing it now.");
+    // Clear whatever sidecars survived for the absent main file - they describe
+    // the plaintext original and would corrupt reads of the encrypted file.
+    for suffix in ["-wal", "-info", "-changes", "-wal-revert"] {
+        let _ = std::fs::remove_file(format!("{disp}{suffix}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, abs) {
+        tracing::error!("[db] could not complete the interrupted migration: {e}");
+        return;
+    }
+    for suffix in ["-wal", "-info", "-changes", "-wal-revert"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", tmp.display()));
+    }
+    tracing::warn!(
+        "[db] recovered. The previous plaintext file is kept at
+     {disp}.plaintext-backup
+     Delete it once you have confirmed the app works - it is NOT encrypted."
+    );
+}
+
 /// The sync engine writes sidecars next to the DB (`-info`, `-wal*`, ...). If
 /// the MAIN file is gone but sidecars remain (crash mid-write, manual deletion,
 /// partial restore), connect throws "main DB file doesn't exist, but metadata
@@ -693,6 +751,10 @@ async fn connect() -> Result<Db> {
     };
     let want_sync = !sync_url.is_empty() && !auth_token.is_empty();
 
+    // Before anything reads the file or picks a driver: finish a swap that a
+    // crash cut in half, or the encrypted open below creates an empty DB in the
+    // gap and the library is silently gone.
+    complete_interrupted_migration(&path);
     clear_orphaned_sync_metadata(&path);
     if want_sync {
         clear_sync_metadata_if_remote_changed(&path, &sync_url);
@@ -1204,6 +1266,74 @@ mod tests {
             !is_plaintext_db(&path).await,
             "the live file is encrypted now"
         );
+    }
+
+    #[tokio::test]
+    async fn a_migration_interrupted_mid_swap_is_completed_rather_than_lost() {
+        // The crash window: between `rename(main -> backup)` and
+        // `rename(tmp -> main)`. Nothing downstream notices on its own -
+        // is_plaintext_db sees no main file, returns false, and the encrypted
+        // open then creates a fresh EMPTY database over the gap.
+        let (_dir, path) = scratch();
+        let disp = path.display().to_string();
+        let tmp = PathBuf::from(format!("{disp}.encrypting"));
+        let backup = PathBuf::from(format!("{disp}.plaintext-backup"));
+
+        // Build the exact on-disk state that crash leaves behind: a finished
+        // encrypted copy at `.encrypting`, the original at `.plaintext-backup`,
+        // and NO main file.
+        seed_plaintext(&path, &[("a", "Ada"), ("b", "Bo")]).await;
+        open_local(&path, Some(KEY_A)).await.unwrap(); // real migration
+        std::fs::rename(&path, &tmp).unwrap();
+        assert!(!path.exists(), "the main file is absent, as after the crash");
+        assert!(tmp.exists() && backup.exists());
+
+        complete_interrupted_migration(&path);
+
+        assert!(path.exists(), "the staged copy is promoted into place");
+        assert!(!tmp.exists(), "the staging file is consumed");
+        assert!(backup.exists(), "the plaintext backup is left alone");
+        let (db, encrypted, _) = open_local(&path, Some(KEY_A)).await.unwrap();
+        assert!(encrypted);
+        assert_eq!(
+            names(&db.connect().unwrap()).await,
+            vec!["Ada", "Bo"],
+            "the library survived the interrupted swap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_staged_copy_never_overwrites_a_live_database() {
+        // The other half: a crash BEFORE the first rename leaves `.encrypting`
+        // beside an intact main file. Promoting it there would replace the live
+        // database with a partial copy - strictly worse than the crash.
+        let (_dir, path) = scratch();
+        let tmp = PathBuf::from(format!("{}.encrypting", path.display()));
+        seed_plaintext(&path, &[("a", "Ada")]).await;
+        std::fs::write(&tmp, b"partial garbage that is not a database").unwrap();
+
+        complete_interrupted_migration(&path);
+
+        assert!(!tmp.exists(), "the stale staging file is dropped");
+        assert!(is_plaintext_db(&path).await, "the live file is untouched");
+        let (db, _, _) = open_local(&path, Some(KEY_A)).await.unwrap();
+        assert_eq!(names(&db.connect().unwrap()).await, vec!["Ada"]);
+    }
+
+    #[tokio::test]
+    async fn a_zero_byte_database_is_not_treated_as_plaintext() {
+        // An empty file opens fine with the plain driver. Reading that as
+        // "plaintext" runs a whole migration to produce an empty encrypted
+        // database plus a pointless backup of nothing.
+        let (_dir, path) = scratch();
+        std::fs::write(&path, b"").unwrap();
+        assert!(!is_plaintext_db(&path).await);
+
+        let (_db, encrypted, reason) = open_local(&path, Some(KEY_A)).await.unwrap();
+        assert!(encrypted);
+        assert_eq!(reason, None);
+        let backup = PathBuf::from(format!("{}.plaintext-backup", path.display()));
+        assert!(!backup.exists(), "nothing was migrated, so nothing is backed up");
     }
 
     #[tokio::test]
