@@ -1,6 +1,49 @@
 //! Small helpers with no home of their own.
 
+use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Pick the process-level rustls crypto provider, once.
+///
+/// rustls 0.23 will not guess when more than one provider is compiled in, and
+/// two of them arrive here independently:
+///
+///   - `reqwest`, with our `rustls-tls` feature, turns on `rustls/ring`
+///   - `turso` 0.7.2 pulls `hyper-rustls` with DEFAULT features, which turns on
+///     `rustls/aws_lc_rs`
+///
+/// Cargo unifies those into one `rustls` build with both, so the first TLS
+/// handshake panics:
+///
+/// ```text
+/// thread 'turso-sync-io' panicked at rustls-0.23.44/src/crypto/mod.rs:249:14:
+/// Could not automatically determine the process-level CryptoProvider ...
+/// ```
+///
+/// In the Tauri shell that panic lands before `.setup()` gets to show the
+/// window (it is created `"visible": false`), so the symptom is not a crash
+/// dialog - it is an app that starts and never draws anything.
+///
+/// `turso` is pinned `=0.7.2` because decision 0001 verified the aes256gcm
+/// container against exactly that version, so turning its `hyper-rustls`
+/// defaults off is not on the table. Choosing the provider explicitly is, and
+/// it keeps working whatever a future dependency drags in.
+///
+/// `ring` is the choice because it is what our own `reqwest` already asked for.
+/// Idempotent and safe from any thread: `install_default` fails if a provider is
+/// already installed, and that is fine - someone won the race and there is
+/// exactly one provider either way.
+pub fn install_crypto_provider() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if rustls::crypto::ring::default_provider()
+            .install_default()
+            .is_err()
+        {
+            tracing::debug!("[tls] a rustls CryptoProvider was already installed.");
+        }
+    });
+}
 
 /// The timestamp format every row in the database already uses.
 ///

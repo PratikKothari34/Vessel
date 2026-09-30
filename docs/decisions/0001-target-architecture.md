@@ -61,7 +61,7 @@ Each stage ships and measures independently. Every stage survives the next.
 | 1 | KV quant test | **done, and it answered differently than expected.** The spill is real (9.52 GB resident, 3.27 GB on CPU), but `num_ctx` is the lever, not KV dtype: 32768 -> 12288 takes decode 13.69 -> 39.37 tok/s, while `q8_0` at 12288 is *slower* than f16. Adopted `OLLAMA_NUM_CTX=12288`, rejected `q8_0`. Numbers in `docs/MASTER.md`. |
 | 2 | Prompt reorder + retrieval fixes | **done** — prefill reuse p50 0.408 -> 0.717; stable prefix 8% -> 88%. |
 | 3 | Ollama -> llama-server | **done, measured on the target GPU.** Adapter behind `INFERENCE_BACKEND`; both backends pass the same suite. Decode 39.4 -> 46.5 tok/s, prefill ~1,600 -> ~2,200 tok/s, 6.4 -> 6.03 GB resident, and the summariser's 19,365 ms reload becomes 0. KV reuse is now measured (`cache_n` p50 0.985), not estimated. Numbers in `docs/MASTER.md`. |
-| 4a | Rust core + Tauri shell | **done, not yet run against a live window.** Two crates: `vessel-core` (no GUI dependency) and the `vessel` shell in `src-tauri/`. The renderer is the same React build. The loopback socket, the CORS allowlist, the Host guard and the CSRF header all go away with the HTTP tier. Open risk below is closed. The IPC ACL has never faced a live renderer - that needs a desktop window, which no test here can open. |
+| 4a | Rust core + Tauri shell | **done, and run against a live window on 2026-09-30.** Two crates: `vessel-core` (no GUI dependency) and the `vessel` shell in `src-tauri/`. The renderer is the same React build. The loopback socket, the CORS allowlist, the Host guard and the CSRF header all go away with the HTTP tier. Open risk below is closed. The IPC ACL has now faced a live renderer: `list_characters` completed renderer -> IPC -> capability check -> core -> database. Three launch-only defects were found and fixed on the way - rustls provider, keychain interop, and the dev URL baked into a release build - see `docs/MASTER.md`, *Stage 4a result*. |
 | 4b | In-process llama.cpp | **done, behind a feature.** `llama-cpp-2` in `src-core/src/inference/llama_local.rs`, built with `local-llama` (CPU) or `local-llama-cuda`; the default build still talks to llama-server. Chat and summarisation share one resident model, and `cached_tokens` becomes a measured prefix rather than an estimate. Per-conversation KV is **done in RAM**: switching parks the outgoing cache and restores the incoming one, budgeted in bytes by `LLAMA_KV_CACHE_MB`; the disk tier was rejected on SSD wear, so a cache still does not outlive the process. **Measured on the 4060:** decode 45.1 tok/s and prefill 2,287 tok/s - parity with llama-server, because the HTTP hop was never on the token path - while re-entering a parked conversation costs 112 ms against 1,226 ms to re-prefill. The cache is the win, not the tokens per second. |
 
 Stage 1 also surfaced the cost Stage 3 and Stage 4 are meant to delete. Ollama
@@ -107,6 +107,20 @@ unchanged rather than being a Node-specific workaround.
 **Consequence:** Stage 4 needs **no export path** and no transitional Node
 backend. An existing encrypted database opens directly, with the key still read
 from the OS keychain under `SERVICE = 'scenario-chat'`.
+
+**Scope correction, 2026-09-30.** The above verifies the *container format*, and
+only that. It does not verify the *key lookup*, and the first live launch of the
+shell broke on precisely that: the same `SERVICE` and account names reach the
+Windows Credential Manager through two libraries that disagree about both the
+target name and the blob encoding, so the Rust track read an empty store and
+minted a second key rather than finding the one keytar wrote. Reading the right
+key back is now verified too, by comparing a SHA-256 fingerprint across both
+stacks. Full detail in `docs/MASTER.md`, *Cross-track keychain interop*.
+
+The lesson generalises past this bug: **two components agreeing on an identifier
+is not the same as them agreeing on how that identifier is spelled to the
+system underneath.** The frozen `scenario-chat` service name was necessary and
+was never violated - and was still not sufficient.
 
 Re-verify if the pinned crate version moves: this was proven at 0.7.2 on both
 sides, and the container carries a format version byte (`\x02`).

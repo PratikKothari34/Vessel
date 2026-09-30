@@ -38,6 +38,21 @@ turso = { version = "=0.7.2", default-features = false, features = ["sync", "mim
 # Windows Credential Manager only. The Linux/macOS stores are off so the build
 # does not drag dbus/secret-service in on a Windows-only product.
 keyring = { version = "4.2.0", default-features = false, features = ["v1", "windows-native-keyring-store"] }
+# Needed for `Entry::new_with_modifiers`, which keyring's v1 wrapper does not
+# re-export. keystore.rs uses it to pin the Windows credential target name to
+# the spelling keytar already wrote, so both tracks read ONE credential instead
+# of silently minting a second key. Version tracks keyring 4.2.0's own dep.
+keyring-core = "1.0.0"
+
+# Not used directly for TLS - only to choose the process-level CryptoProvider.
+#
+# rustls 0.23 refuses to pick a provider when more than one is compiled in, and
+# two arrive here independently: our own `reqwest/rustls-tls` turns on
+# `rustls/ring`, while `turso`'s `hyper-rustls` default features turn on
+# `rustls/aws_lc_rs`. turso is pinned `=0.7.2` (a bump is a re-verification, not
+# an update), so its defaults cannot be switched off from here. Installing the
+# default explicitly is the fix that survives further dependency churn.
+rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
 
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"

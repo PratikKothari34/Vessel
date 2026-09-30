@@ -447,7 +447,7 @@ Ranked by bytes saved.
 | Q4_K_M -> IQ4_XS | ~0.47 GB disk + VRAM | negligible quality |
 | 384-dim embedder (bge-small / MiniLM) | ~0.18 GB disk, 2x faster cosine | slight recall loss |
 | int8 embeddings in DB | 3072 -> 774 B/turn (3.97x) [M] | **done** — max cosine error 1.2e-3, ranking identical |
-| Electron -> Tauri | 0.19 GB disk, ~150 MB RAM [E] | **code-complete (stage 4a)** — 239 lines of main+preload became a 524-line shell; unverified at runtime, see *Stage 4a* |
+| Electron -> Tauri | 0.19 GB disk, ~150 MB RAM [E] | **runs (stage 4a)** — 239 lines of main+preload became a 524-line shell; window opened and IPC exercised 2026-09-30, see *Stage 4a* |
 | Node backend -> in-process Rust | 0.04 GB disk, ~70 MB RAM [E] | **code-complete (stage 4a)** — 3,996 lines became 5,690, no loopback HTTP left |
 
 **Banked so far:** VRAM 9.52 GB spilling -> **6.03 GB fully resident** [M].
@@ -629,10 +629,97 @@ endpoint. The Electron suite is the larger of the two because it also has to
 test a perimeter the Rust track does not have: 34 of its 258 are red-team tests
 against the HTTP surface.
 
-**Not yet verified at runtime.** The shell needs a visible desktop window
-(WebView2), which no test here can open. The IPC ACL in
-`src-tauri/capabilities/default.json` and `permissions/ipc.toml` has never been
-exercised against a live renderer.
+**Verified at runtime on 2026-09-30.** The shell was built and opened on this
+machine: window titled `Vessel` at 1294x882, the React bundle served from
+`frontendDist`, and the character list rendered its empty state. That last part
+is the IPC ACL result - `list_characters` went renderer -> IPC -> capability
+check -> `vessel-core` -> database and came back - so
+`src-tauri/capabilities/default.json` and `permissions/ipc.toml` have now faced
+a live renderer. The database read is honest: `characters` is genuinely empty,
+in the live file and in `scenario.db.plaintext-backup` alike.
+
+Getting there took three fixes, all in this repo, none of them in the shell's
+own logic. They are worth recording because every one of them is invisible to
+both test suites:
+
+1. **No rustls CryptoProvider.** `reqwest` (our `rustls-tls` feature) turns on
+   `rustls/ring`; `turso` 0.7.2 pulls `hyper-rustls` with default features,
+   which turns on `rustls/aws_lc_rs`. Cargo unifies them into one `rustls` with
+   two providers, and rustls refuses to guess - the `turso-sync-io` thread
+   panicked at `crypto/mod.rs:249` on the first handshake. The window is created
+   `"visible": false` and shown from `.setup()`, so the panic pre-empted the
+   `show()` and the symptom was an app that started and drew nothing at all.
+   Fixed by `util::install_crypto_provider()`, called at the top of
+   `db::connect()` before either TLS user can run.
+2. **Two credentials where there should be one.** keytar and the `keyring`
+   crate disagree about the Windows Credential Manager target name AND about
+   the blob encoding. Details in *Cross-track keychain interop* below; the
+   effect was that the Rust track read an empty store and minted a second DB
+   encryption key.
+3. **The dev URL baked into a release build.** `tauri.conf.json` names both a
+   `devUrl` and a `frontendDist`, and which one is compiled in is decided by
+   `dev = !custom_protocol` in tauri's build script - not by the cargo profile.
+   Built with plain `cargo build --release`, the binary pointed at
+   `localhost:5173` and the window opened on `ERR_CONNECTION_REFUSED`. The
+   `cargo tauri` CLI sets that feature itself, which is why this only bites a
+   repo that builds with cargo directly, as this one does. Added as the
+   `bundled-ui` feature on the `vessel` crate, off by default so `cargo build`
+   keeps the hot-reload workflow.
+
+**The correct invocation, therefore:**
+
+```
+cargo build -p vessel --release --features bundled-ui
+```
+
+Neither suite catches any of the three. The rustls panic needs a real TLS
+handshake, the keychain bug needs the user's real Credential Manager, and the
+dev-URL trap needs a window. This is the class of defect that only a live launch
+finds, which is exactly what this stage was waiting on.
+
+## Cross-track keychain interop
+
+Both tracks read `SERVICE = 'scenario-chat'` with the same two account names,
+and `src-core/src/config.rs:17-19` matches `src/backend/keystore.js:28-30`
+character for character. That is not enough, because the two libraries
+underneath disagree twice over.
+
+**The target name.** keytar 7.9.0 composes `service + '/' + account`
+(`keytar_win.cc:120`). The `keyring` crate's Windows store composes
+`user + '.' + service` (default divider `.`,
+`windows-native-keyring-store/src/cred.rs:53`). Same service, same account, two
+different credentials:
+
+| Writer | Windows target name |
+|---|---|
+| keytar (Electron) | `scenario-chat/db-encryption-key` |
+| keyring, unconfigured (Rust) | `db-encryption-key.scenario-chat` |
+
+**The blob encoding.** keytar hands `CredWrite` the UTF-8 bytes directly
+(`keytar_win.cc:133`, `CredentialBlobSize = password.size()`). The `keyring`
+store writes UTF-16LE and decodes the same way (`utils.rs:80`, `:275`). Point
+`keyring` at a credential keytar wrote and `get_password` does not error - it
+decodes the UTF-8 bytes as UTF-16 and returns a plausible String. The 64-char
+hex key comes back as 32 CJK characters. Returning a *wrong* key without
+failing is the dangerous half.
+
+Left alone the two compound into the failure mode
+`docs/memory/vessel-rename-preserved-identifiers.md` warns about, reached by a
+different route: the Rust track reads an empty store, `db_encryption_key` takes
+its generate-on-empty branch exactly as designed, and the app mints a second key
+while the real one sits untouched under keytar's name.
+
+`src-core/src/keystore.rs` now pins keytar's spelling with the store's `target`
+modifier and does its own UTF-8 encoding via `get_secret`/`set_secret`. keytar's
+conventions win because that is the side with the user's live data behind it.
+Verified by fingerprint: SHA-256 of the key read through `vessel-core` and
+through keytar agree (`58e96842...`), compared without either side printing a
+secret.
+
+**This also corrects the scope of the Open risk closed in decision 0001.** That
+work proved the aes256gcm *container format* reads identically from the Rust
+`turso` crate - canary row and negative control. It said nothing about the *key
+lookup*, and the key lookup is where this stage actually broke.
 
 ## Stage 4b result - llama.cpp inside the process
 

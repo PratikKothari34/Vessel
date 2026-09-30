@@ -671,6 +671,10 @@ pub(crate) async fn open_scratch(path: &Path) -> Result<Db> {
 }
 
 async fn connect() -> Result<Db> {
+    // Before anything can open a TLS connection - the sync engine here, or
+    // reqwest in `inference` - rustls needs to be told which provider to use.
+    crate::util::install_crypto_provider();
+
     let path = config::local_db_abs()?;
     let encryption_key = keystore::db_encryption_key();
     let auth_token = keystore::turso_token();

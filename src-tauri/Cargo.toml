@@ -27,8 +27,10 @@ tauri-build = { version = "2.6.3", features = [] }
 # decision about the user's data to the core.
 vessel-core = { path = "../src-core" }
 
-# No extra features: avatars are remote URLs or data: URIs (capped at 4096 in
-# characters.rs), never local files, so the asset protocol stays off.
+# No extra features here: avatars are remote URLs or data: URIs (capped at 4096
+# in characters.rs), never local files, so the asset protocol stays off.
+# `custom-protocol` is wired through the `bundled-ui` feature below rather than
+# turned on unconditionally - see that feature for why.
 tauri = { version = "2.11.5" }
 
 serde = { version = "1.0.229", features = ["derive"] }
@@ -41,3 +43,23 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+
+# Serve the renderer from `frontendDist` instead of `devUrl`.
+#
+# `tauri.conf.json` names both a `devUrl` (the Vite server on :5173) and a
+# `frontendDist` (`app/out/renderer`, already built). Which one the binary uses
+# is decided AT COMPILE TIME, and not by the cargo profile: tauri's build script
+# computes `dev = !custom_protocol` (tauri-2.11.5/build.rs:257) and passes it to
+# `tauri_build` as `DEP_TAURI_DEV`. So without this feature even
+# `cargo build --release` bakes in the dev URL, and the window opens on
+# ERR_CONNECTION_REFUSED unless a Vite server happens to be running.
+#
+# The `cargo tauri` CLI sets this itself, which is why the trap only shows up
+# when building with plain cargo - which is what this repo does, since the
+# renderer is prebuilt and there is no tauri-cli installed.
+#
+# Left OFF by default so `cargo build` keeps the hot-reload workflow.
+bundled-ui = ["tauri/custom-protocol"]
