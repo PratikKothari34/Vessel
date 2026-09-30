@@ -418,6 +418,18 @@ test('oversized text fields are capped rather than stored whole', async () => {
   }
 });
 
+test('the whole chat request is bounded, not just one message', async () => {
+  // Deliberately inside the 10mb body limit and outside the 2mb content limit,
+  // so this pins OUR check rather than express.json()'s 413 -- a test that
+  // accepts either status passes with the check removed, which is no test at
+  // all. Many merely-large messages add up to the same problem as one huge
+  // one, so the ceiling counts the request, not the message.
+  const half = 'x'.repeat(1536 * 1024); // 3 MB across two messages
+  const res = await app.post('/chat', { messages: [say(half), say(half)] });
+  assert.equal(res.status, 400, 'the content check fires, not the body parser');
+  assert.match(res.json.error, /too large/i, 'the message names the problem');
+});
+
 test('sampling values outside the allowlist cannot reach the engine', async () => {
   const made = (await app.post('/characters', {
     name: 'Overclock',

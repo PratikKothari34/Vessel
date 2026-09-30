@@ -107,6 +107,23 @@ function buildPersonaMessage(character) {
 // half an instruction.
 const MAX_DIRECTOR_CHARS = 4000;
 
+// Ceiling on the assembled message content of one request.
+//
+// express.json() caps the BODY at 10mb, but that bounds the transport, not the
+// content, and it is the wrong error: a 413 from the body parser says nothing
+// a user can act on. This sits BELOW the transport limit deliberately, so the
+// check that fires is the one that can explain itself. Counting the whole
+// request rather than one message is the point -- many merely-large messages
+// add up to the same stalled model as one huge one. The Rust track carries the
+// same check (chat.rs MAX_REQUEST_BYTES); it has no body parser behind it.
+//
+// 2 MB is far past any real turn and still an order of magnitude under the
+// smallest context window, so nothing legitimate is refused.
+const MAX_REQUEST_CHARS = (() => {
+  const v = parseInt(process.env.MAX_REQUEST_CHARS, 10);
+  return Number.isFinite(v) && v > 0 ? v : 2 * 1024 * 1024;
+})();
+
 // Director / OOC note: a meta-instruction that steers the model WITHOUT becoming
 // part of the story. Injected as a high-priority system message, never recorded.
 function buildDirectorMessage(director) {
@@ -446,6 +463,17 @@ app.post('/chat', async (req, res) => {
     return res.status(400).json({
       error: 'No valid messages: each must have a known role and non-empty string content.',
     });
+  }
+  // The whole request, not one message: many merely-large messages add up to
+  // the same stalled model as one huge one. Checked before anything opens the
+  // database, so an oversized turn is never written and never synced.
+  let requestChars = typeof director === 'string' ? director.length : 0;
+  for (const m of messages) {
+    if (m && typeof m.content === 'string') requestChars += m.content.length;
+    if (m && typeof m.role === 'string') requestChars += m.role.length;
+  }
+  if (requestChars > MAX_REQUEST_CHARS) {
+    return res.status(400).json({ error: 'Message is too large. Trim it and send again.' });
   }
   // Counted in code points, the way the Rust track counts it (chars()), so the
   // two tracks reject the same note rather than differing on astral characters.
