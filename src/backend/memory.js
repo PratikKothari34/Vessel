@@ -295,13 +295,32 @@ async function acquireLock(id, waitMs = LOCK_WAIT_MS) {
   const chain = prev.then(() => next);
   _locks.set(id, chain);
 
+  // Waiting is bounded: past waitMs the caller proceeds WITHOUT the lock, which
+  // is the behaviour that existed before the lock did. A turn is willing to
+  // queue behind a whole generation; a delete is not, and should not leave a
+  // button spinning for two minutes because a stream is stuck.
   let timer;
-  const waited = new Promise((r) => { timer = setTimeout(r, waitMs); });
+  let timedOut = false;
+  const waited = new Promise((r) => {
+    timer = setTimeout(() => { timedOut = true; r(); }, waitMs);
+  });
   await Promise.race([prev.catch(() => {}), waited]);
   clearTimeout(timer);
 
+  if (timedOut) {
+    // The one event that can interleave two writers on one conversation. Every
+    // call site drops the return value on the floor, so without this line the
+    // only thing that can tear a turn happens in silence and the resulting mess
+    // has no cause anyone can find.
+    console.warn(
+      `[memory] lock wait expired after ${waitMs}ms for conversation ${id}; proceeding ` +
+      'WITHOUT the turn lock. Concurrent writes to this conversation are possible. ' +
+      'A generation that outlives LOCK_WAIT_MS is the usual cause.',
+    );
+  }
+
   let released = false;
-  return () => {
+  const release_ = () => {
     if (released) return;
     released = true;
     release();
@@ -309,6 +328,10 @@ async function acquireLock(id, waitMs = LOCK_WAIT_MS) {
     // already replaced the tail with their own chain.
     if (_locks.get(id) === chain) _locks.delete(id);
   };
+  // Mirrors TurnLock.timed_out on the Rust side. Callers invoke the return value
+  // as a function; the flag rides along for anyone who wants to check.
+  release_.timedOut = timedOut;
+  return release_;
 }
 
 // ---- Retrieval -----------------------------------------------------------
@@ -1471,7 +1494,11 @@ module.exports = {
   // Pure vector helpers, exported for the unit tests only. They sit below the
   // database and the engine, so testing them through retrieve() would need both
   // just to exercise arithmetic.
-  _internals: { normalizeInPlace, _absorbRows, _newCacheEntry },
+  // lockCount is the registry-leak probe: the map must return to empty once
+  // nobody holds a conversation. It grew by a dead promise per conversation
+  // before the tail-identity check in acquireLock; Rust says the same thing by
+  // refcount. Test-only, like the rest of this object.
+  _internals: { normalizeInPlace, _absorbRows, _newCacheEntry, lockCount: () => _locks.size },
   _config: {
     CHAT_MODEL, CHAT_NUM_CTX,
     SUMMARIZER_MODEL, SUMMARIZER_NUM_CTX, SUMMARIZER_NUM_GPU, EMBED_MODEL, EMBED_NUM_GPU,

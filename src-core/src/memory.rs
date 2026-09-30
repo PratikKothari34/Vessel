@@ -490,10 +490,25 @@ pub async fn acquire_lock(id: &str, wait: Duration) -> TurnLock {
             _guard: Some(guard),
             timed_out: false,
         },
-        Err(_) => TurnLock {
-            _guard: None,
-            timed_out: true,
-        },
+        Err(_) => {
+            // Proceeding unlocked is the deliberate choice documented above, but
+            // it is also the ONE event that can interleave two writers on one
+            // conversation. Every call site discards the flag, so without this
+            // the only thing that can produce a torn turn happens in silence and
+            // the resulting mess has no cause anyone can find. Whatever the
+            // caller does next, the wait is in the log.
+            tracing::warn!(
+                conversation = %id,
+                wait_ms = wait.as_millis(),
+                "[memory] lock wait expired; proceeding WITHOUT the turn lock. \
+                 Concurrent writes to this conversation are possible. A generation \
+                 that outlives LOCK_WAIT_MS is the usual cause."
+            );
+            TurnLock {
+                _guard: None,
+                timed_out: true,
+            }
+        }
     }
 }
 
