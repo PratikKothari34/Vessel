@@ -9,7 +9,18 @@ import { toBlocks, tokenize } from '../lib/prose.mjs';
 //
 // Everything that decides WHAT the spans are lives in lib/prose.mjs, which the
 // suite can exercise without a DOM. This file only turns tokens into elements.
-export default function MessageText({ text }) {
+//
+// Memoized on `text`, and that is not a micro-optimization. Streaming calls
+// setStreamText on EVERY token, so Chat re-renders per token and re-runs its
+// whole `messages.map`. Without this, each token re-parses every settled message
+// in the conversation through toBlocks + tokenize - O(tokens x history) parses
+// for one reply, on the thread that also has to paint. The settled messages
+// cannot have changed, because a new token only ever appends to the streaming
+// bubble, which is a separate element with its own changing `text`.
+//
+// The default shallow compare is exactly right here: the only prop is a string,
+// so it is compared by value, not identity.
+function MessageText({ text }) {
   return (
     <div className="msg-text">
       {toBlocks(text).map((block, bi) => (
@@ -20,6 +31,8 @@ export default function MessageText({ text }) {
     </div>
   );
 }
+
+export default React.memo(MessageText);
 
 // A block's lines, with the single newlines between them kept as <br>.
 function renderBlock(block) {

@@ -150,14 +150,27 @@ function pct(sorted, p) {
   return sorted[i];
 }
 
+// One pass, six buckets. The old form ran `map().filter().sort()` per series:
+// seven walks of `recs` and twelve intermediate arrays, half of them full-length
+// and mostly null, since a null field still occupies a slot until `filter` copies
+// the array again. Pushing only finite values straight into their own array does
+// the same work with one walk and no temporaries. `reloads` is folded in here for
+// the same reason -- it was an eighth pass.
 function summarize(recs) {
-  const withTokens = recs.filter((r) => Number.isFinite(r.promptTokens));
-  const prompt = withTokens.map((r) => r.promptTokens).sort((a, b) => a - b);
-  const decode = recs.map((r) => r.decodeTps).filter(Number.isFinite).sort((a, b) => a - b);
-  const prefill = recs.map((r) => r.prefillTps).filter(Number.isFinite).sort((a, b) => a - b);
-  const reuse = recs.map((r) => r.prefillReuse).filter(Number.isFinite).sort((a, b) => a - b);
-  const cacheReuse = recs.map((r) => r.cacheReuse).filter(Number.isFinite).sort((a, b) => a - b);
-  const cpt = recs.map((r) => r.charsPerToken).filter(Number.isFinite).sort((a, b) => a - b);
+  const prompt = [], decode = [], prefill = [], reuse = [], cacheReuse = [], cpt = [];
+  let reloads = 0;
+  for (const r of recs) {
+    if (Number.isFinite(r.promptTokens)) prompt.push(r.promptTokens);
+    if (Number.isFinite(r.decodeTps)) decode.push(r.decodeTps);
+    if (Number.isFinite(r.prefillTps)) prefill.push(r.prefillTps);
+    if (Number.isFinite(r.prefillReuse)) reuse.push(r.prefillReuse);
+    if (Number.isFinite(r.cacheReuse)) cacheReuse.push(r.cacheReuse);
+    if (Number.isFinite(r.charsPerToken)) cpt.push(r.charsPerToken);
+    if (r.loadMs > 50) reloads++;
+  }
+  const asc = (a, b) => a - b;
+  prompt.sort(asc); decode.sort(asc); prefill.sort(asc);
+  reuse.sort(asc); cacheReuse.sort(asc); cpt.sort(asc);
   return {
     samples: recs.length,
     // The number that decides num_ctx. Compare p95 against Modelfile num_ctx.
@@ -173,7 +186,7 @@ function summarize(recs) {
     charsPerToken: { p50: pct(cpt, 50) },
     // Non-zero load time means the model was evicted between turns — the
     // signature of VRAM pressure, not of a cold start, when it recurs.
-    reloads: recs.filter((r) => r.loadMs > 50).length,
+    reloads,
   };
 }
 

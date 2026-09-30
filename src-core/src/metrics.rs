@@ -280,14 +280,16 @@ fn pct(sorted: &[f64], p: f64) -> Option<f64> {
     Some(sorted[i.saturating_sub(1).min(sorted.len() - 1)])
 }
 
-fn sorted_by<F: Fn(&Record) -> Option<f64>>(recs: &[&Record], f: F) -> Vec<f64> {
-    let mut v: Vec<f64> = recs
-        .iter()
-        .filter_map(|r| f(r))
-        .filter(|x| x.is_finite())
-        .collect();
+fn push_finite(v: &mut Vec<f64>, x: Option<f64>) {
+    if let Some(x) = x {
+        if x.is_finite() {
+            v.push(x);
+        }
+    }
+}
+
+fn sort_asc(v: &mut [f64]) {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    v
 }
 
 fn band(sorted: &[f64]) -> serde_json::Value {
@@ -295,12 +297,34 @@ fn band(sorted: &[f64]) -> serde_json::Value {
 }
 
 pub fn summarize(recs: &[&Record]) -> serde_json::Value {
-    let prompt = sorted_by(recs, |r| r.prompt_tokens.map(|n| n as f64));
-    let decode = sorted_by(recs, |r| r.decode_tps);
-    let prefill = sorted_by(recs, |r| r.prefill_tps);
-    let reuse = sorted_by(recs, |r| r.prefill_reuse);
-    let cache_reuse = sorted_by(recs, |r| r.cache_reuse);
-    let cpt = sorted_by(recs, |r| r.chars_per_token);
+    // One walk, six buckets, `reloads` counted alongside. The old form called
+    // `sorted_by` once per series, so `recs` was traversed seven times over to
+    // read six independent fields off each record - work that grows with the
+    // ring while the record stays in cache for exactly one of those passes.
+    let mut prompt = Vec::new();
+    let mut decode = Vec::new();
+    let mut prefill = Vec::new();
+    let mut reuse = Vec::new();
+    let mut cache_reuse = Vec::new();
+    let mut cpt = Vec::new();
+    let mut reloads = 0usize;
+    for r in recs {
+        push_finite(&mut prompt, r.prompt_tokens.map(|n| n as f64));
+        push_finite(&mut decode, r.decode_tps);
+        push_finite(&mut prefill, r.prefill_tps);
+        push_finite(&mut reuse, r.prefill_reuse);
+        push_finite(&mut cache_reuse, r.cache_reuse);
+        push_finite(&mut cpt, r.chars_per_token);
+        if r.load_ms > 50.0 {
+            reloads += 1;
+        }
+    }
+    sort_asc(&mut prompt);
+    sort_asc(&mut decode);
+    sort_asc(&mut prefill);
+    sort_asc(&mut reuse);
+    sort_asc(&mut cache_reuse);
+    sort_asc(&mut cpt);
 
     json!({
         "samples": recs.len(),
@@ -327,7 +351,7 @@ pub fn summarize(recs: &[&Record]) -> serde_json::Value {
         "charsPerToken": { "p50": pct(&cpt, 50.0) },
         // Non-zero load time means the model was evicted between turns - the
         // signature of VRAM pressure, not of a cold start, when it recurs.
-        "reloads": recs.iter().filter(|r| r.load_ms > 50.0).count(),
+        "reloads": reloads,
     })
 }
 
@@ -479,6 +503,82 @@ mod tests {
             "only the record that reloaded weights counts"
         );
         assert!(s["cacheReuse"].is_null(), "no backend reported KV reuse");
+    }
+
+    #[test]
+    fn a_series_skips_its_own_missing_values_without_shifting_the_rank() {
+        // Each series is independent - a record can carry a decode rate and no
+        // prompt count, or the reverse. A missing value has to be absent from
+        // that series rather than counted, or every percentile above it sits one
+        // rank low. The single-pass `summarize` fills six buckets from one walk,
+        // and this is what pins each bucket to its own field.
+        let mk = |decode: Option<f64>, prompt: Option<u64>| Record {
+            at: String::new(),
+            conversation_id: None,
+            character_id: None,
+            backend: "ollama".into(),
+            model: None,
+            aborted: false,
+            prompt_tokens: prompt,
+            eval_tokens: None,
+            prompt_ms: 0.0,
+            eval_ms: 0.0,
+            total_ms: 0.0,
+            load_ms: 0.0,
+            prefill_tps: None,
+            decode_tps: decode,
+            chars_per_token: None,
+            prefill_reuse: None,
+            cached_tokens: None,
+            cache_reuse: None,
+            window: None,
+        };
+        // decode has three values; prompt has two, and they interleave with the
+        // holes differently, so a bucket reading the wrong field cannot agree.
+        let recs = [
+            mk(Some(100.0), None),
+            mk(Some(200.0), Some(7)),
+            mk(None, Some(9)),
+            mk(Some(300.0), None),
+        ];
+        let s = summarize(&recs.iter().collect::<Vec<_>>());
+        assert_eq!(s["samples"], 4);
+        assert_eq!(s["decodeTps"]["p50"], 200.0, "nearest rank of three values");
+        assert_eq!(s["decodeTps"]["p95"], 300.0);
+        assert_eq!(s["promptTokens"]["max"], 9.0);
+        assert_eq!(s["reloads"], 0);
+    }
+
+    #[test]
+    fn a_missing_value_is_null_rather_than_zero() {
+        // Zero is a measurement; absence is not. A 0 tps summary reads as a
+        // stalled engine.
+        let rec = Record {
+            at: String::new(),
+            conversation_id: None,
+            character_id: None,
+            backend: "ollama".into(),
+            model: None,
+            aborted: true,
+            prompt_tokens: None,
+            eval_tokens: None,
+            prompt_ms: 0.0,
+            eval_ms: 0.0,
+            total_ms: 0.0,
+            load_ms: 0.0,
+            prefill_tps: None,
+            decode_tps: None,
+            chars_per_token: None,
+            prefill_reuse: None,
+            cached_tokens: None,
+            cache_reuse: None,
+            window: None,
+        };
+        let s = summarize(&[&rec]);
+        assert_eq!(s["samples"], 1);
+        assert!(s["decodeTps"]["p50"].is_null());
+        assert!(s["promptTokens"]["max"].is_null());
+        assert_eq!(s["reloads"], 0);
     }
 
     /// The only test that touches the global ring, so it cannot race another.

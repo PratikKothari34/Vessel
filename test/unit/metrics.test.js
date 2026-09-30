@@ -160,6 +160,43 @@ test('snapshot summarises, filters by conversation and honours the limit', () =>
   assert.equal(metrics.snapshot({ limit: 2 }).recent.length, 2);
 });
 
+test('a series skips the records that carry no number for it, without shifting its percentiles', () => {
+  // Each series is independent: a record can report prompt tokens and no decode
+  // rate, or the reverse. A null has to be absent from that series, not counted
+  // as a zero and not left as a hole that drags the rank -- and the series that
+  // DID get a number must land on the same percentile either way.
+  //
+  // This is what the single-pass `summarize` has to preserve. The shape it
+  // replaced built one full-length array per series and filtered it afterwards,
+  // so a bug that let a null through would surface here as a percentile sitting
+  // one rank low.
+  metrics.record({ conversationId: 'c1', done: done({ eval_count: 100, eval_duration: 1e9 }) });     // 100 tps
+  metrics.record({ conversationId: 'c1', done: done({ eval_count: 200, eval_duration: 1e9 }) });     // 200 tps
+  metrics.record({ conversationId: 'c1', aborted: true, done: null });  // nothing at all
+  metrics.record({ conversationId: 'c1', done: done({ eval_count: 300, eval_duration: 1e9 }) });     // 300 tps
+
+  const s = metrics.snapshot({}).summary;
+  assert.equal(s.samples, 4, 'the aborted turn is still a sample');
+  // Three finite rates; nearest-rank p50 of [100,200,300] is the 2nd.
+  assert.equal(s.decodeTps.p50, 200);
+  assert.equal(s.decodeTps.p95, 300);
+  // The aborted record has no prompt tokens either, so `max` comes from the rest.
+  assert.equal(s.promptTokens.max, 1000);
+  // Nothing here reported cached_tokens, so the whole series is absent.
+  assert.equal(s.cacheReuse, null);
+});
+
+test('a summary over records that carry no numbers at all is null, not zero', () => {
+  // A zero is a measurement; these are the absence of one. Reporting 0 tps would
+  // read as a stalled engine.
+  metrics.record({ conversationId: 'c1', aborted: true, done: null });
+  const s = metrics.snapshot({}).summary;
+  assert.equal(s.samples, 1);
+  assert.equal(s.decodeTps.p50, null);
+  assert.equal(s.promptTokens.max, null);
+  assert.equal(s.reloads, 0);
+});
+
 test('a reload is counted only when load time is real', () => {
   metrics.record({ conversationId: 'c1', done: done({ load_duration: 1e6 }) });   // 1 ms
   metrics.record({ conversationId: 'c1', done: done({ load_duration: 19e9 }) });  // 19 s

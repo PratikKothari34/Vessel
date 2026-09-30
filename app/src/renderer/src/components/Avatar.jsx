@@ -15,7 +15,11 @@ function safeAvatarSrc(src) {
 
 // Character avatar: image if provided, else a deterministic tinted glyph.
 // If the image fails to load (dead URL, bad path, offline), fall back to the glyph.
-export default function Avatar({ character, size = 48, ring = false }) {
+// Memoized for the same reason as MessageText: Chat re-renders on every
+// streamed token, and an Avatar sits on each assistant row. `character` is
+// App-level state, so its reference is stable between tokens and the shallow
+// compare holds.
+function Avatar({ character, size = 48, ring = false }) {
   const name = character?.name || '?';
   const hue = hashHue(name);
   const px = `${size}px`;
@@ -62,3 +66,5 @@ export default function Avatar({ character, size = 48, ring = false }) {
     </div>
   );
 }
+
+export default React.memo(Avatar);
