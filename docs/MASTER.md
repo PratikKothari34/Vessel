@@ -17,12 +17,24 @@ waiting to be checked — replace it the moment a measurement exists.
 | GL / swiftshader / d3dcompiler / vulkan | 20 MB | [M] |
 | NSIS installer | 87 MB | [M] |
 
-Electron doubles as the Node runtime — `app/src/main/index.js:60` spawns the
+Electron doubled as the Node runtime — `app/src/main/index.js:60` spawned the
 backend via `process.execPath` with `ELECTRON_RUN_AS_NODE=1`. No separate Node
-is shipped. Three N-API addons in `resources/`: `@tursodatabase/database`,
+was shipped. Three N-API addons in `resources/`: `@tursodatabase/database`,
 `@tursodatabase/sync`, `keytar`.
 
+> **Historical as of 2026-10-03.** The Electron shell is gone: `app/src/main`,
+> `app/src/preload`, `app/scripts`, `electron.vite.config.mjs` and the
+> electron/electron-builder dependencies were removed once the renderer build
+> was proved independent of them (byte-identical output with electron-vite
+> uninstalled). The sizes above are kept because they are measured, and they
+> are the baseline the Tauri binary is compared against — `vessel.exe` is
+> ~20 MB against the 173 MB row. What remains of `app/` is the React UI, which
+> both tracks always shared.
+
 ## Models
+
+Three models are employed, one per role. Re-verified against `ollama list`
+2026-10-03; the sizes still match.
 
 | Model | Role | Size | |
 |---|---|---|---|
@@ -31,7 +43,19 @@ is shipped. Three N-API addons in `resources/`: `@tursodatabase/database`,
 | `nomic-embed-text` | embeddings, 768-dim | 0.27 GB | [M] |
 | **total** | | **8.53 GB** | [M] |
 
-Models are ~96% of on-disk footprint. The entire Electron shell is ~3.5%.
+`vessel` is a local alias, not an upstream model: `ollama create vessel -f
+Modelfile` derives it from `Tohur/natsumura-storytelling-rp-llama-3.1:8b`,
+baking in `num_ctx 32768` and the sampling and global-persona block. Both
+resolve to the same 4.9 GB blob, so pulling the base and creating the alias
+costs the disk of one model, not two. The alias is what `OLLAMA_MODEL` names;
+the base alone would run without the persona or the sampling.
+
+Only the summariser is optional, and it ships off (decision 0004), so a default
+install loads two of the three.
+
+Models are ~96% of on-disk footprint. The shell is ~3.5% - measured while that
+shell was Electron; the Tauri binary that replaced it on 2026-10-03 is 20.7 MB,
+which makes the models ~99.8%.
 
 ## KV cache
 
@@ -604,6 +628,12 @@ with. Roughly half of the Node security suite defended a perimeter that no
 longer exists - see the module doc on `src-core/tests/security.rs` for which
 tests were carried across and which were deleted, and why.
 
+> **Completed 2026-10-03.** The Node tier was removed outright, so the figures
+> below are the last measurements taken while both tracks existed. The 108
+> integration tests went with it, including the ~14 that drove the HTTP
+> perimeter; `npm test` is now 32 renderer-module tests and `cargo test
+> -p vessel-core` is the application's 201.
+
 Re-counted 2026-10-03, after the optimization, bug-fix and red-team passes
 below landed. The Rust figures are **after** the one-time `cargo fmt` pass,
 which splits long lines and so inflates every Rust row against the numbers this
@@ -629,6 +659,10 @@ because both suites cover the same behaviour; the Rust side folds 170 of its
 endpoint. The Electron suite is the larger of the two because it also has to
 test a perimeter the Rust track does not have: 35 of its 269 are red-team tests
 against the HTTP surface.
+
+> **The Electron column is a historical measurement as of 2026-10-03**, taken
+> while both tracks existed. The Node tier has since been deleted: what remains
+> on that side is 32 renderer-module tests. The Rust column is current.
 
 "Default features" is load-bearing in that row. `src-core` carries 188 `#[test]`
 attributes in `src-core/src`, but 21 of them sit in
@@ -678,8 +712,19 @@ both test suites:
 **The correct invocation, therefore:**
 
 ```
+cd app && npm run build:renderer     # refreshes app/out/renderer
 cargo build -p vessel --release --features bundled-ui
 ```
+
+The renderer step is not optional when any UI file changed: `frontendDist`
+is read at compile time, so cargo happily embeds a stale bundle and the
+binary disagrees with the source. Verify by asset hash:
+`grep -c "index-<hash>.js" target/release/vessel.exe`.
+
+`build:renderer` runs plain `vite` against `app/vite.renderer.config.mjs`.
+It is the only UI build - electron-vite was removed on 2026-10-03 after the
+replacement was shown to emit byte-identical JS, CSS and font files with
+`node_modules/electron-vite` renamed away.
 
 Neither suite catches any of the three. The rustls panic needs a real TLS
 handshake, the keychain bug needs the user's real Credential Manager, and the
@@ -742,9 +787,11 @@ the call simply does not travel over a channel CSP inspects.
 ## Cross-track keychain interop
 
 Both tracks read `SERVICE = 'scenario-chat'` with the same two account names,
-and `src-core/src/config.rs:17-19` matches `src/backend/keystore.js:28-30`
-character for character. That is not enough, because the two libraries
-underneath disagree twice over.
+and `src-core/src/config.rs:17-19` matched `src/backend/keystore.js:28-30`
+character for character. That was not enough, because the two libraries
+underneath disagree twice over. Only the Rust side is left since 2026-10-03,
+but the pinning below is what keeps it reading the credentials keytar wrote, so
+none of it is safe to simplify away.
 
 **The target name.** keytar 7.9.0 composes `service + '/' + account`
 (`keytar_win.cc:120`). The `keyring` crate's Windows store composes
@@ -794,8 +841,9 @@ return the same thing.
 
 The disk can tell them apart. An existing database means this is not a first
 run, so an absent key means something is broken, not new. Both tracks now check
-before minting (`database_already_exists` in `src-core/src/keystore.rs`,
-`databaseAlreadyExists` in `src/backend/keystore.js`) and refuse with an error
+before minting (`database_already_exists` in `src-core/src/keystore.rs`; the
+Node track had `databaseAlreadyExists` until it was removed) and refuse with an
+error
 that says what to do, rather than quietly generating a replacement that cannot
 open the existing file.
 

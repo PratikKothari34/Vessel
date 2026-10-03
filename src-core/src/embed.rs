@@ -52,8 +52,13 @@ pub fn encode_int8(v: &[f32]) -> Vec<u8> {
     for x in v {
         // Round half UP, not half away from zero, to match the JS encoder
         // byte for byte: `Math.round(-0.5)` is -0 where Rust's `f32::round`
-        // gives -1. Both codecs read each other's rows while the Electron
-        // build and this one run side by side, so the formats have to agree.
+        // gives -1. This mattered when both builds ran side by side; the JS one
+        // went on 2026-10-03 and the requirement did not go with it. Every
+        // embedding already in a user's database was written by that encoder,
+        // and retrieval ranks new query vectors against those stored rows -- a
+        // half-LSB disagreement here biases cosine scores against them with
+        // nothing failing loudly. Re-encoding the corpus is the only way out,
+        // so keep the rounding.
         let q = (x * inv + 0.5).floor().clamp(-127.0, 127.0);
         out.push(q as i8 as u8);
     }

@@ -3,9 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Governs the dev server only. Tauri STRIPS this tag at build time and
+         injects the `csp` from tauri.conf.json instead, which is where the
+         shipped policy lives (verified: zero occurrences of this meta in the
+         built .exe). It still has to admit Tauri's IPC origins, because a dev
+         build serves this file verbatim -- without `ipc:` every invoke() is
+         blocked by CSP with no hint as to why. Kept deliberately identical to
+         tauri.conf.json's policy so dev cannot pass what production refuses;
+         the loopback HTTP entries went with the Node backend on 2026-10-03. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; connect-src 'self' http://localhost:* http://127.0.0.1:*; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
+      content="default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';"
     />
     <title>Vessel</title>
   </head>

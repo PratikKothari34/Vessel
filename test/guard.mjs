@@ -1,16 +1,20 @@
 /**
  * Loaded with --import before every test file, in every test worker.
  *
- * Unit tests require the backend modules directly, and several of them capture
- * configuration at require time -- db.js and settings.js both read
- * LOCAL_DB_PATH at module scope, which is why setting it from inside a test
- * after the require has already happened does nothing at all.
+ * As of 2026-10-03 the Node backend is gone and the only tests left here are
+ * renderer unit tests over pure modules -- they open no database, read no
+ * keychain and look at no environment. So nothing in the current suite needs
+ * this file.
  *
- * So the safe value has to be in place before any test file is evaluated, and
- * this is the only hook that runs that early. It is a backstop, not the primary
- * mechanism: nothing in the unit tests opens a database, and the integration
- * tests pass an explicit environment to a spawned child. It exists so that a
- * future test which does open one cannot reach the real file by accident.
+ * It stays because of what it defends against, which did not go away: the
+ * keystore talks to the REAL OS keychain and LOCAL_DB_PATH defaults to the
+ * user's real database. A test that reached either would overwrite live data,
+ * and the failure is silent. This runs early enough to make that impossible --
+ * it is the only hook evaluated before the first test file -- so a future test
+ * that does open something starts out pointed somewhere safe.
+ *
+ * Delete it only along with the last test that could ever touch persistent
+ * state, not merely because today's tests do not.
  */
 
 import crypto from 'node:crypto';
@@ -26,7 +30,7 @@ function insideRepo(p) {
   return Boolean(rel) && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
-// Presence-only in db.js, so any value disables cloud sync.
+// Presence-only check in the data layer, so any value disables cloud sync.
 process.env.VESSEL_NO_SYNC = '1';
 
 // dotenv does not overwrite a key that is already present -- '' counts as
@@ -34,7 +38,7 @@ process.env.VESSEL_NO_SYNC = '1';
 process.env.TURSO_DATABASE_URL = '';
 process.env.TURSO_AUTH_TOKEN = '';
 
-// Never let keystore generate or read a real key for a test process.
+// Never let a test process generate or read a real key.
 if (!process.env.DB_ENCRYPTION_KEY) {
   process.env.DB_ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
 }

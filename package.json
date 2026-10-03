@@ -1,27 +1,14 @@
 {
-  "name": "vessel-backend",
+  "name": "vessel-tests",
   "version": "1.0.3",
-  "description": "Local roleplay backend for Vessel: long-context memory over Ollama, with optional Turso sync.",
+  "description": "Test harness for the Vessel renderer's pure modules. The application itself is Rust: src-core/ and src-tauri/.",
   "license": "GPL-3.0-only",
-  "main": "src/backend/server.js",
+  "private": true,
   "type": "commonjs",
   "engines": {
     "node": ">=18.0.0"
   },
   "scripts": {
-    "start": "node src/backend/server.js",
-    "dev": "node --watch src/backend/server.js",
-    "test": "node --test --import ./test/guard.mjs test/unit/*.test.js test/integration/*.test.js"
-  },
-  "dependencies": {
-    "@tursodatabase/database": "^0.7.2",
-    "@tursodatabase/sync": "^0.6.1",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "keytar": "^7.9.0"
-  },
-  "overrides": {
-    "qs": "^6.16.0"
+    "test": "node --test --import ./test/guard.mjs test/unit/*.test.js"
   }
 }

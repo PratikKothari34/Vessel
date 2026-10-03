@@ -12,8 +12,10 @@
 //!   whole-file encryption, cloud sync does not (its engine has no local-file
 //!   encryption), and the choice is made at runtime from live config, never
 //!   baked in at build time.
-//! - The **embedding blob format** in [`embed`], byte for byte, so the Electron
-//!   build and this one can read each other's rows while both exist.
+//! - The **embedding blob format** in [`embed`], byte for byte. Originally so
+//!   both builds could read each other's rows; now because the rows already in
+//!   a user's database were written by the other encoder and are never
+//!   rewritten.
 //!
 //! What does NOT carry over is the loopback HTTP server. Every Express route
 //! becomes a Tauri command, which deletes the whole DNS-rebinding / CORS /

@@ -1,52 +1,42 @@
 // The renderer's only data seam.
 //
-// Two hosts, one surface. Under Tauri every call is an IPC command and the chat
-// stream is a channel; under Electron it is the loopback HTTP backend and SSE.
-// Which one is live is decided once, at load, from what the host injected -- so
-// no component below this file knows or cares.
+// One transport: every call is a Tauri IPC command and the chat stream is a
+// channel. The HTTP half that spoke to a Node/Express backend on :3001 was
+// removed on 2026-10-03 along with the backend itself -- there is no HTTP
+// listener anywhere in the Rust track, so there is nothing left to fall back
+// to. If `window.__TAURI__` is missing the app is not running in its shell and
+// cannot work at all, which is worth failing loudly about rather than papering
+// over with a second code path that cannot succeed.
 //
-// The two transports return the SAME shapes, because the Rust commands were
-// written against the Express contract. Where they differ is cost: over IPC the
-// delta arrives as text, so the per-token JSON parse the SSE path needs is gone.
+// The shapes below are the ones the Express contract defined, because the Rust
+// commands were written against it. Keeping them is not legacy: components were
+// built on them, and over IPC the delta arrives as text, so the per-token JSON
+// parse the old SSE path needed is simply gone.
 
 const TAURI = typeof window !== 'undefined' && window.__TAURI__ ? window.__TAURI__ : null;
 
-const BASE =
-  (typeof window !== 'undefined' && window.scenario && window.scenario.backendUrl) ||
-  'http://localhost:3001';
-
-// A command rejects with the serialized error struct ({ error, detail }); HTTP
-// rejects with a body of the same shape. Flatten both to one Error.
+// A command rejects with the serialized error struct ({ error, detail }).
+// Flatten whatever comes back to one Error.
 function toError(e) {
   if (e instanceof Error) return e;
   if (e && typeof e === 'object') return new Error(e.error || e.detail || 'Request failed.');
   return new Error(String(e || 'Request failed.'));
 }
 
+const NO_HOST = 'Vessel must run inside its application window. The IPC bridge is unavailable.';
+
+// Rejects rather than throws. Callers are React handlers that attach .catch and
+// have no try/catch around the call, so a synchronous throw here escapes to
+// window.onerror instead of their error state -- every other failure on this
+// seam arrives as a rejection, and this one has to match.
 function invoke(cmd, args) {
+  if (!TAURI) return Promise.reject(new Error(NO_HOST));
   return TAURI.core.invoke(cmd, args).catch((e) => {
     throw toError(e);
   });
 }
 
-// Proof to the backend that this request came from the app and not from a page
-// the user happens to have open. A cross-site fetch cannot set a custom header
-// without a preflight, and the preflight is refused for any origin but ours.
-// Sent on every request; the backend only insists on it for the ones that write.
-const APP_HEADER = { 'X-Vessel-App': '1' };
-
-async function json(method, path, body) {
-  const res = await fetch(`${BASE}${path}`, {
-    method,
-    headers: body ? { 'Content-Type': 'application/json', ...APP_HEADER } : APP_HEADER,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || data.detail || `HTTP ${res.status}`);
-  return data;
-}
-
-const tauriApi = {
+export const api = {
   health: () => invoke('health'),
 
   listCharacters: () => invoke('list_characters').then((d) => d.characters),
@@ -77,33 +67,6 @@ const tauriApi = {
   relaunch: () => invoke('relaunch'),
 };
 
-const httpApi = {
-  health: () => json('GET', '/health'),
-
-  listCharacters: () => json('GET', '/characters').then((d) => d.characters),
-  createCharacter: (c) => json('POST', '/characters', c),
-  updateCharacter: (id, c) => json('PUT', `/characters/${id}`, c),
-  deleteCharacter: (id) => json('DELETE', `/characters/${id}`),
-
-  getSettings: () => json('GET', '/settings'),
-  saveSettings: (patch) => json('PUT', '/settings', patch),
-
-  listConversations: (characterId) =>
-    json('GET', `/conversations${characterId ? `?characterId=${encodeURIComponent(characterId)}` : ''}`)
-      .then((d) => d.conversations),
-  getConversation: (id) => json('GET', `/conversations/${id}`),
-  deleteConversation: (id) => json('DELETE', `/conversations/${id}`),
-  setActiveVariant: (id, turnId, variantId) =>
-    json('PUT', `/conversations/${id}/active-variant`, { turnId, variantId }),
-
-  relaunch:
-    typeof window !== 'undefined' && window.scenario && window.scenario.relaunch
-      ? () => window.scenario.relaunch()
-      : null,
-};
-
-export const api = TAURI ? tauriApi : httpApi;
-
 /**
  * Stream a chat reply.
  *
@@ -111,11 +74,14 @@ export const api = TAURI ? tauriApi : httpApi;
  * @param {object} handlers { onMeta(meta), onToken(text, full), onDone(fullText), onError(msg) }
  * @returns {function} abort() -- stops the in-flight generation.
  */
-export function streamChat(payload, handlers = {}) {
-  return TAURI ? streamViaChannel(payload, handlers) : streamViaSse(payload, handlers);
-}
+export function streamChat(payload, { onMeta, onToken, onDone, onError } = {}) {
+  if (!TAURI) {
+    const err = new Error(NO_HOST);
+    // Report asynchronously so the caller has returned and wired its handlers.
+    Promise.resolve().then(() => onError && onError(err.message));
+    return () => {};
+  }
 
-function streamViaChannel(payload, { onMeta, onToken, onDone, onError } = {}) {
   const channel = new TAURI.core.Channel();
   let full = '';
   // A stop can land before the first event, when the model is still loading and
@@ -166,81 +132,4 @@ function streamViaChannel(payload, { onMeta, onToken, onDone, onError } = {}) {
     stopped = true;
     stop();
   };
-}
-
-// EventSource cannot POST, so the SSE stream is parsed manually from fetch().
-function streamViaSse(payload, { onMeta, onToken, onDone, onError } = {}) {
-  const controller = new AbortController();
-  let full = '';
-
-  (async () => {
-    let res;
-    try {
-      res = await fetch(`${BASE}/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...APP_HEADER },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      if (err.name !== 'AbortError') onError && onError(err.message);
-      return;
-    }
-
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      onError && onError(data.error || data.detail || `HTTP ${res.status}`);
-      return;
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let event = 'message';
-
-    const handleEvent = (evt, dataStr) => {
-      if (evt === 'meta') {
-        try { onMeta && onMeta(JSON.parse(dataStr)); } catch { /* ignore */ }
-        return;
-      }
-      if (evt === 'error') {
-        try { onError && onError(JSON.parse(dataStr).error); } catch { onError && onError(dataStr); }
-        return;
-      }
-      // default: raw Ollama chunk
-      try {
-        const obj = JSON.parse(dataStr);
-        if (obj.message && typeof obj.message.content === 'string') {
-          full += obj.message.content;
-          onToken && onToken(obj.message.content, full);
-        }
-      } catch { /* non-JSON line */ }
-    };
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let idx;
-        while ((idx = buffer.indexOf('\n\n')) !== -1) {
-          const raw = buffer.slice(0, idx);
-          buffer = buffer.slice(idx + 2);
-          event = 'message';
-          let dataStr = '';
-          for (const line of raw.split('\n')) {
-            if (line.startsWith('event:')) event = line.slice(6).trim();
-            else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
-          }
-          if (dataStr) handleEvent(event, dataStr);
-        }
-      }
-      onDone && onDone(full);
-    } catch (err) {
-      if (err.name !== 'AbortError') onError && onError(err.message);
-    }
-  })();
-
-  return () => controller.abort();
 }

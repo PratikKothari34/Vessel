@@ -1,15 +1,12 @@
 {
-  "name": "vessel-app",
+  "name": "vessel-ui",
   "version": "1.0.3",
-  "description": "Vessel — local roleplay for Windows. Long stories that don't lose the thread.",
+  "description": "Vessel renderer: the React UI both the Tauri shell and its dev server load.",
   "license": "GPL-3.0-only",
-  "main": "out/main/index.js",
   "author": "Pratik",
   "scripts": {
-    "dev": "node scripts/dev.mjs",
-    "build": "electron-vite build",
-    "package": "electron-vite build && electron-builder",
-    "package:dir": "electron-vite build && electron-builder --dir"
+    "dev": "vite --config vite.renderer.config.mjs",
+    "build:renderer": "vite build --config vite.renderer.config.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -17,50 +14,8 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
-    "electron": "^31.3.0",
-    "electron-builder": "^26.15.3",
-    "electron-vite": "^2.3.0",
-    "sharp": "^0.35.3",
     "vite": "^5.4.0"
   },
-  "build": {
-    "appId": "com.vessel.app",
-    "productName": "Vessel",
-    "files": [
-      "out/**/*"
-    ],
-    "extraResources": [
-      {
-        "from": "../src",
-        "to": "backend/src",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
-        "from": "../node_modules",
-        "to": "backend/node_modules",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
-        "from": "../package.json",
-        "to": "backend/package.json"
-      },
-      {
-        "from": "../Modelfile",
-        "to": "backend/Modelfile"
-      }
-    ],
-    "win": {
-      "target": "nsis",
-      "icon": "build/icon.ico"
-    },
-    "nsis": {
-      "installerIcon": "build/icon.ico",
-      "uninstallerIcon": "build/icon.ico",
-      "shortcutName": "Vessel"
-    }
-  }
+  "private": true,
+  "type": "module"
 }

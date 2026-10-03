@@ -1,5 +1,5 @@
-//! Data layer. Port of `src/backend/db.js`, including the part that matters
-//! most: the two-driver split.
+//! Data layer. Originally a port of the Node `db.js` (removed 2026-10-03) and
+//! it kept the part that matters most: the two-driver split.
 //!
 //! Encryption at rest is real, via turso's aes256gcm whole-file encryption. The
 //! catch — and the reason there are two drivers — is that the *sync* engine has

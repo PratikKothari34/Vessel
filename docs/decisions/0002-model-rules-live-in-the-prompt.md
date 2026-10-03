@@ -7,10 +7,10 @@
 ## Decision
 
 The `Modelfile`'s `SYSTEM` block and its `PARAMETER` lines are read at runtime by
-`src/backend/inference/modelfile.js` and applied by Vessel itself:
+`src-core/src/inference/modelfile.rs` and applied by Vessel itself:
 
 - **`SYSTEM`** is prepended to the per-character persona message in
-  `server.js:buildPersonaMessage`.
+  `src-core/src/prompt.rs`.
 - **`PARAMETER`** values are sent as sampling defaults by the llama-server
   adapter, under anything the request supplies.
 
@@ -71,7 +71,8 @@ recurring cost is zero.
   exists to remove. The adapter deliberately does not touch messages.
 - **Apply the Modelfile's sampling to the summarizer too.** Those values are
   tuned to make roleplay prose surprising, which is wrong for a summary. The
-  summarizer sends its own low-variance sampling; see `llama-server.js:generate`.
+  summarizer sends its own low-variance sampling; see
+  `src-core/src/inference/llama_server.rs:generate`.
 
 ## Verification
 

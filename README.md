@@ -34,11 +34,20 @@ synced one (see Privacy).
 ## Architecture
 
 ```
-Electron main ──spawns──> Node/Express backend (127.0.0.1) ──HTTP──> Ollama
+Tauri shell (Rust) ──IPC──> vessel-core ──HTTP──> Ollama
      │                          │
   React renderer           Turso (@tursodatabase/sync)  (local file; optional cloud sync)
   (Vite)                   characters / conversations / turns / archive(+embeddings)
 ```
+
+There is no HTTP port in this path: every route is a `#[tauri::command]` in
+`src-tauri/src/lib.rs`, and the renderer reaches it over IPC. The React UI in
+`app/` is shared infrastructure, not a second app - `tauri.conf.json` points
+`frontendDist` at `app/out/renderer` and compiles it into the binary.
+
+There is one implementation. The Node/Express backend that used to serve this
+on port 3001 was removed on 2026-10-03, along with the Electron shell that
+spawned it - its logic lives in `src-core/` and its routes are Tauri commands.
 
 The model's live window is kept small - 12,288 tokens, not the 32,768 the model
 will accept - because that is the single largest speed lever measured: it freed
@@ -73,42 +82,56 @@ zero. Set `SUMMARY_ENABLED=1` to turn it on; see
 
 ## Prerequisites
 
-1. **Node.js 18+**
-2. **Ollama** running locally, with three models:
+1. **Ollama** running locally, with the three models Vessel employs - one per
+   role, and only the summariser is optional:
    ```bash
-   ollama pull Tohur/natsumura-storytelling-rp-llama-3.1:8b
-   ollama pull gemma3:4b
-   ollama pull nomic-embed-text
+   ollama pull Tohur/natsumura-storytelling-rp-llama-3.1:8b   # chat, 4.9 GB
+   ollama pull nomic-embed-text                               # embeddings, 274 MB
+   ollama pull gemma3:4b                                      # summariser, 3.3 GB
    ```
-3. **The custom chat model** (built from the included `Modelfile`):
+   `gemma3:4b` is only read when `SUMMARY_ENABLED=1`, which is not the default,
+   so you can skip it until you turn the rolling summary on.
+2. **The chat model itself** - `vessel`, built from the included `Modelfile`:
    ```bash
    ollama create vessel -f Modelfile
    ```
+   This is a local alias over the Natsumura pull above, not a second download:
+   it fixes `num_ctx` at 32768, sets the sampling (temperature 0.9, top_p 0.95,
+   min_p 0.05, repeat_penalty 1.1) and carries the global roleplay persona.
+   `OLLAMA_MODEL` names the alias, so pointing it at the base model directly
+   runs without any of that.
+
+Node.js is **not** required to run Vessel - the app is a single Rust binary. It
+is needed only to build the renderer and to run the Node test suite.
 
 ---
 
 ## Run (development)
 
 ```bash
-# 1. backend deps (repo root)
-npm install
-
-# 2. app deps
+# 1. renderer deps (the repo root has none - it is the Rust app plus a test
+#    harness, and `cargo` fetches its own)
 cd app && npm install
 
-# 3. (optional) config — copy and edit if you want cloud sync or different tuning
+# 2. (optional) config — copy and edit if you want cloud sync or different tuning
 cp ../.env.example ../.env
 
-# 4. launch (starts backend + Electron window)
-npm run dev
+# 3. build the UI, then the binary
+npm run build:renderer
+cd .. && cargo build -p vessel --release --features bundled-ui
 ```
 
-The app spawns the backend automatically and waits for it to be healthy before
-showing the window.
+Run `target/release/vessel.exe`. The `bundled-ui` feature is not optional —
+without it the binary compiles in `devUrl` and opens on
+`ERR_CONNECTION_REFUSED`; see `src-tauri/Cargo.toml` for why that is decided at
+compile time.
 
-> **Note:** if `ELECTRON_RUN_AS_NODE=1` is set in your shell, the dev launcher
-> (`app/scripts/dev.mjs`) clears it for the app process — otherwise Electron would
-> run headless as plain Node.
+**Working on the UI?** `cd app && npm run dev` serves it on
+`http://localhost:5173`, which is the `devUrl` in `tauri.conf.json`, so a
+`cargo build` *without* `bundled-ui` gives you hot reload. Re-run
+`npm run build:renderer` before any `bundled-ui` build — `frontendDist` is read
+at compile time, so a stale bundle is embedded silently. Verify with
+`grep -c "index-<hash>.js" target/release/vessel.exe`.
 
 ---
 
@@ -136,7 +159,7 @@ full list. Key ones:
 | `SUMMARIZER_NUM_CTX` | `8192` | Summarizer context window |
 
 > `SUMMARIZE_THRESHOLD` must sit above `VERBATIM_TURNS` — archiving can't trigger
-> below the verbatim window. If you set it lower, the backend raises it to
+> below the verbatim window. If you set it lower, Vessel raises it to
 > `VERBATIM_TURNS + 4` when it starts; `SUMMARIZE_THRESHOLD=6` with
 > `VERBATIM_TURNS=8` runs as `12`, not `6`. Like all `.env` tuning, it's read from
 > your config each launch — nothing here is fixed when the app is built.
@@ -173,16 +196,28 @@ Grab the latest `Vessel Setup *.exe` from the
 You still need **Ollama + the three models** (see Prerequisites) on the machine.
 Your data lives in `%APPDATA%/Vessel/data/` and survives updates.
 
-### Or build the installer yourself
+### Or build it yourself
 
 ```bash
-cd app
-npm run package      # -> app/dist/*.exe (NSIS installer)
+cd app && npm run build:renderer && cd ..
+cargo build -p vessel --release --features bundled-ui   # -> target/release/vessel.exe
 ```
 
-The backend (`src/`, `node_modules`, `Modelfile`) is bundled into the app's
-resources. The installed app still requires **Ollama + the models** on the target
-machine.
+That is the whole app: one ~20 MB binary with the UI compiled in, no Node
+runtime and no backend process to spawn. It still requires **Ollama + the
+models** on the target machine.
+
+For an NSIS installer instead of a bare binary, `tauri.conf.json` is already
+configured for it (`currentUser` install mode), but it needs the Tauri CLI,
+which is not a dependency of this repo:
+
+```bash
+cargo install tauri-cli --locked
+cargo tauri build          # -> src-tauri/target/release/bundle/nsis/
+```
+
+Installers under `app/dist/` are from the retired Electron build and are kept
+for provenance only.
 
 ---
 
@@ -192,45 +227,47 @@ machine.
 Vessel/
 ├── Modelfile               # ollama create vessel -f Modelfile
 ├── .env.example
-├── src/backend/
-│   ├── server.js           # Express + SSE /chat + REST
-│   ├── db.js               # Turso sync client + schema + embedding codec
-│   ├── memory.js           # summary + retrieval engine
-│   ├── characters.js       # character CRUD
-│   ├── keystore.js         # OS keychain: DB encryption key + Turso token
-│   ├── settings.js         # data/settings.json, atomic write
-│   ├── metrics.js          # generation ring, exposed at GET /metrics
-│   └── inference/          # ollama / llama-server adapters behind one interface
-├── app/                    # Electron + React (Vite)
-│   └── src/
-│       ├── main/           # spawns backend, creates window
-│       ├── preload/
-│       └── renderer/src/   # React UI (Gallery, Chat, Editor, Settings, Memory)
-├── test/                   # node:test suites — see Tests below
+├── src-core/               # vessel-core: the whole application, in Rust
+│   ├── db.rs               # Turso sync client + schema + embedding codec
+│   ├── memory.rs           # summary + retrieval engine
+│   ├── chat.rs             # turn assembly + streaming
+│   ├── characters.rs       # character CRUD
+│   ├── keystore.rs         # OS keychain: DB encryption key + Turso token
+│   ├── settings.rs         # data/settings.json, atomic write
+│   ├── metrics.rs          # generation ring
+│   └── inference/          # ollama / llama-server adapters behind one trait
+├── src-tauri/              # the desktop shell: window + #[tauri::command]s
+├── app/                    # React UI (Vite) — compiled into the Tauri binary
+│   ├── vite.renderer.config.mjs   # the only UI build
+│   └── src/renderer/src/   # React UI (Gallery, Chat, Editor, Settings, Memory)
+├── test/                   # node:test over the renderer's pure modules
 └── docs/
     ├── MASTER.md           # every measured number, in one place
     └── decisions/          # why the load-bearing choices were made
 ```
 
-A Rust port of the backend lives beside this one in `src-core/` (all the logic)
-and `src-tauri/` (a Tauri shell), tracking
-`docs/decisions/0001-target-architecture.md`. It is not what the installer
-builds, and nothing above depends on it.
+`src-core/` holds all the logic and `src-tauri/` the shell, which is what the
+installer builds, tracking `docs/decisions/0001-target-architecture.md`. The
+Node implementation this replaced was removed on 2026-10-03.
 
 ---
 
 ## Tests
 
-Two suites, no test dependencies in either.
+Two suites, no test dependencies in either - the repo installs nothing to run
+them.
 
 ```bash
-npm test                      # 269 tests — the Node backend, unit + integration
-cargo test -p vessel-core     # 201 tests — the Rust core
+cargo test -p vessel-core     # 201 tests — the application
+npm test                      # 32 tests — the renderer's pure modules
 ```
 
-`npm test` spawns its own backend on a scratch database with a fake inference
-engine, so it never touches your real data, your keychain or a model. It needs
-nothing running.
+`cargo test` covers the data layer, memory and retrieval, chat assembly,
+the inference adapters, and a security suite that drives the real code paths;
+every test that touches storage gets its own temporary database. `npm test`
+covers the two renderer modules with logic worth asserting on - prose
+tokenizing and the settings state machine - and opens no database, keychain or
+model.
 
 ---
 

@@ -23,7 +23,8 @@ query, against one query-against-row product for every row in the archive.
 Measured cost is nil — 79–85 ms per probe with the rule and without it, because
 the embed round-trip dominates both.
 
-In both tracks: `src/backend/memory.js` and `src-core/src/memory.rs`.
+In `src-core/src/memory.rs`. (It was in both tracks until the Node one was
+removed on 2026-10-03.)
 
 ## Why
 
