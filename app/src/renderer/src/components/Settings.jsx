@@ -1,44 +1,36 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib/api';
+import { privacyState, syncState } from '../lib/settings-state.mjs';
 import './settings.css';
 
-// Why the local database is not encrypted, in the user's terms. The backend
-// reports the cause (health.unencryptedReason) because "no" alone can't tell an
-// accepted tradeoff apart from a failure that left stories readable on disk.
-const UNENCRYPTED_LABEL = {
-  sync: 'no — cloud sync stores the local file as plaintext',
-  'no-key': 'NO — the OS keychain was unavailable, so no key could be stored',
-  migration: 'NO — encrypting your existing database failed',
-};
+/* Settings holds what a user can act on, and nothing else.
+   Two things qualify: whether their writing is private, and the sync
+   credentials -- the only editable values in the app.
 
-function encryptionLabel(health) {
-  if (health.encryptedAtRest) return 'yes (aes256gcm)';
-  return UNENCRYPTED_LABEL[health.unencryptedReason] || 'no — stored as plaintext';
+   Deliberately NOT here: model ids, host URLs, and the memory tuning numbers.
+   They are real, but they come from `.env`, cannot be changed from this window,
+   and are shown where they are useful anyway -- the chat model in the header,
+   memory internals in the Memory inspector. Printing them here told the user
+   something true and unactionable on the way in.
+
+   One page, not tabs: with the diagnostics gone there are two short sections,
+   and the tab chrome promised depth that was not behind it. */
+
+function Card({ tone = 'plain', title, children }) {
+  return (
+    <div className={`st-card is-${tone}`}>
+      <h3 className="st-card-title">{title}</h3>
+      <p className="st-card-text">{children}</p>
+    </div>
+  );
 }
 
-// Runtime config view + cloud-sync setup. Sync credentials are the user's own
-// Turso database: URL saved to the backend's settings.json, token to the OS
-// keychain (never echoed back — only "saved / not saved"). Changes apply on
-// the next app start, so a successful save offers a restart.
-export default function Settings({ health, onClose }) {
-  const rows = health && health.status === 'ok'
-    ? [
-        ['Chat model', health.model],
-        ['Ollama host', health.ollama],
-        ['Summarizer', health.memory?.summarizer],
-        ['Embedder', health.memory?.embedder],
-        ['Verbatim turns', health.memory?.verbatimTurns],
-        ['Summarize threshold', health.memory?.summarizeThreshold],
-        ['Cloud sync', health.sync?.enabled ? `enabled (${health.sync.interval}s)` : 'local-only'],
-        ['Encrypted at rest', encryptionLabel(health)],
-      ]
-    : [];
-
-  // A silent downgrade to plaintext is the one failure the user must not miss:
-  // stories end up readable on disk. Sync is a tradeoff they chose, so it gets
-  // a plain note; the rest are failures worth a loud warning.
-  const degraded = health?.status === 'ok' && !health.encryptedAtRest &&
-    health.unencryptedReason && health.unencryptedReason !== 'sync';
+// Cloud-sync setup. Credentials are the user's own Turso database: URL saved to
+// settings.json, token to the OS keychain (never echoed back -- only
+// "saved / not saved"). Changes apply on the next app start, so a save that
+// changes the running state says so and offers a restart.
+export default function Settings({ health, onRefreshHealth, onClose }) {
+  const privacy = privacyState(health);
 
   const [cfg, setCfg] = useState(null); // { tursoUrl, tokenSet, keychain, syncActive }
   const [url, setUrl] = useState('');
@@ -46,20 +38,35 @@ export default function Settings({ health, onClose }) {
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
   const [err, setErr] = useState('');
+  // Turning sync off deletes the auth token from the OS keychain, and a
+  // packaged install has no .env to recover it from -- so it is a destructive
+  // action, not a toggle. It costs a typed confirmation.
+  const [confirming, setConfirming] = useState(false);
+  const [confirmText, setConfirmText] = useState('');
 
+  const load = useCallback(
+    () =>
+      api.getSettings()
+        .then((s) => { setCfg(s); setUrl(s.tursoUrl || ''); })
+        .catch((e) => setErr(`Could not load sync settings: ${e.message}`)),
+    [],
+  );
+
+  // Read both when the panel opens, not just at app launch: this panel asserts
+  // live state, and the app's health snapshot may predate whatever has happened
+  // since the window was opened.
   useEffect(() => {
-    api.getSettings()
-      .then((s) => { setCfg(s); setUrl(s.tursoUrl || ''); })
-      .catch((e) => setErr(`Could not load sync settings: ${e.message}`));
-  }, []);
+    load();
+    if (onRefreshHealth) onRefreshHealth();
+  }, [load, onRefreshHealth]);
 
   const save = async (patch) => {
     setBusy(true); setErr(''); setNote('');
     try {
       await api.saveSettings(patch);
-      const s = await api.getSettings();
-      setCfg(s); setUrl(s.tursoUrl || ''); setToken('');
-      setNote('Saved. Restart Vessel to apply.');
+      await load();
+      setToken('');
+      setNote('Saved.');
     } catch (e) {
       setErr(e.message);
     } finally {
@@ -68,14 +75,32 @@ export default function Settings({ health, onClose }) {
   };
 
   const onSave = () => {
+    // Saving a blank URL over a configured one silently disables sync -- the
+    // same outcome as the destructive button, reached by a control labelled
+    // "Save". Route it through the same confirmation instead.
+    if (!url.trim() && (cfg?.tursoUrl || cfg?.tokenSet)) {
+      setConfirming(true);
+      return;
+    }
     const patch = { tursoUrl: url };
     if (token.trim()) patch.tursoToken = token;
     save(patch);
   };
-  const onDisable = () => save({ tursoUrl: '', tursoToken: '' });
+
+  const onDisable = () => {
+    setConfirming(false);
+    setConfirmText('');
+    // confirmClearToken is required by the backend before it will delete the
+    // keychain entry; without it the request is refused outright.
+    save({ tursoUrl: '', tursoToken: '', confirmClearToken: true });
+  };
 
   // Both hosts can restart themselves; a browser-only dev renderer cannot.
   const canRelaunch = Boolean(api.relaunch);
+
+  // Derived in settings-state.mjs so the suite can pin every combination of
+  // saved settings against boot state without a DOM.
+  const { ready, running, configured, pending, wasCleared } = syncState(cfg, health);
 
   return (
     <div className="overlay-backdrop" onClick={onClose}>
@@ -85,103 +110,168 @@ export default function Settings({ health, onClose }) {
             <p className="kicker">Configuration</p>
             <h2 className="overlay-title">Settings</h2>
           </div>
-          <button className="overlay-close" onClick={onClose}>✕</button>
+          <button className="overlay-close" onClick={onClose} aria-label="Close settings">
+            &#10005;
+          </button>
         </div>
 
-        <div className="overlay-body">
-          <div className={`settings-status ${health?.status === 'ok' ? 'ok' : 'down'}`}>
-            <span className="dot" />
-            {health?.status === 'ok' ? 'Backend connected' : 'Backend offline — is Ollama running?'}
-          </div>
-
-          {degraded && (
-            <div className="settings-alert">
-              <strong>Your conversations are being stored unencrypted.</strong>
-              <p>
-                Vessel could not encrypt the local database, so everything you write is
-                readable by anything with access to this machine&rsquo;s files. Restarting the
-                app often fixes it. If it persists, treat the files in your data folder as
-                sensitive and consider full-disk encryption.
-              </p>
-            </div>
+        <div className="overlay-body st-body">
+          {health && health.status !== 'ok' && (
+            <Card tone="danger" title="Vessel is not running">
+              Vessel cannot reach its backend, so what is below may be out of date. If you run
+              models on this machine, check that Ollama is running, then restart the app.
+            </Card>
           )}
 
-          {rows.length > 0 && (
-            <div className="settings-table">
-              {rows.map(([k, v]) => (
-                <div key={k} className="settings-row">
-                  <span className="settings-key">{k}</span>
-                  <span className="settings-val">{String(v)}</span>
-                </div>
-              ))}
-            </div>
+          {/* ── Privacy: the one read-only fact worth stating ────────────── */}
+          {privacy && (
+            <Card tone={privacy.tone} title={privacy.title}>
+              {privacy.detail}
+            </Card>
           )}
 
-          <div className="settings-sync">
-            <p className="kicker">Cloud sync — your own Turso database</p>
-            <p className="settings-sync-blurb">
-              Optional. Create a free database at <code>turso.tech</code>, then paste its URL and
-              an auth token here. Leave blank to stay fully local. The token is stored in the
-              OS keychain, not on disk.
-            </p>
+          {/* ── Sync: the only editable surface ──────────────────────────── */}
+          <section className="st-section">
+            <h3 className="st-section-title">Cloud sync</h3>
 
-            <label className="field-label" htmlFor="turso-url">Database URL</label>
-            <input
-              id="turso-url"
-              className="input"
-              type="text"
-              placeholder="libsql://your-db-your-org.turso.io"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              disabled={busy}
-              spellCheck={false}
-            />
+            {/* Until the settings load, `running` can only fall back to the
+                app's health snapshot -- the stale value this whole change
+                exists to stop trusting. Say nothing rather than flash it. */}
+            <div className={`st-state ${ready && running ? 'is-on' : ''}`}>
+              <span className="st-state-dot" />
+              <div className="st-state-text">
+                <strong>{!ready ? 'Checking sync...' : running ? 'Sync is on' : 'Sync is off'}</strong>
+                <span>
+                  {!ready
+                    ? ''
+                    : running
+                    ? `Pushing and pulling every ${health?.sync?.interval ?? 60} seconds.`
+                    : wasCleared
+                      ? 'Your conversations stay on this machine. The cloud copy is untouched, but the saved token was deleted -- paste it again to resume.'
+                      : 'Your conversations never leave this machine.'}
+                </span>
+              </div>
+            </div>
 
-            <label className="field-label" htmlFor="turso-token">Auth token</label>
-            <input
-              id="turso-token"
-              className="input"
-              type="password"
-              placeholder={cfg?.tokenSet ? 'Saved — type here to replace' : 'Paste your database token'}
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              disabled={busy}
-            />
-
-            {cfg && !cfg.keychain && (
-              <p className="settings-sync-warn">
-                OS keychain unavailable — the token can’t be stored securely, so sync can’t be enabled.
+            {/* Configured and running differ only until the next start, so name
+                which one the user is looking at instead of a bare "restart to
+                apply" that reads as the app being unfinished. */}
+            {pending && (
+              <p className="st-msg is-warn">
+                {configured
+                  ? 'Sync starts the next time you open Vessel.'
+                  : 'Sync stops the next time you open Vessel. It is still running now.'}
+                {canRelaunch && (
+                  <button className="btn btn-ghost st-link st-inline-link" onClick={() => api.relaunch()}>
+                    Restart now
+                  </button>
+                )}
               </p>
             )}
 
-            <div className="settings-sync-actions">
+            <p className="st-prose">
+              Vessel runs no server of its own. Sync copies your conversations to a database
+              <strong> you own</strong> at <code>turso.tech</code>. Leave these blank to stay
+              fully local.
+            </p>
+
+            <div className="st-field">
+              <label className="field-label" htmlFor="turso-url">Database URL</label>
+              <input
+                id="turso-url"
+                className="input"
+                type="text"
+                placeholder="libsql://your-db-your-org.turso.io"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                disabled={busy}
+                spellCheck={false}
+              />
+            </div>
+
+            <div className="st-field">
+              <label className="field-label" htmlFor="turso-token">Auth token</label>
+              <input
+                id="turso-token"
+                className="input"
+                type="password"
+                placeholder={cfg?.tokenSet ? 'Saved - type here to replace' : 'Paste your database token'}
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                disabled={busy}
+              />
+              <p className="st-field-note">
+                {cfg?.tokenSet
+                  ? 'A token is saved in your OS keychain, never on disk.'
+                  : 'Stored in your OS keychain, never on disk.'}
+              </p>
+            </div>
+
+            {cfg && !cfg.keychain && (
+              <p className="st-msg is-danger">
+                Your OS keychain is unavailable, so the token cannot be stored securely and sync
+                cannot be turned on.
+              </p>
+            )}
+
+            <div className="st-actions">
               <button className="btn btn-primary" onClick={onSave} disabled={busy || !cfg}>
-                Save sync settings
+                {busy ? 'Saving...' : 'Save'}
               </button>
-              {(cfg?.tursoUrl || cfg?.tokenSet) && (
-                <button className="btn btn-danger" onClick={onDisable} disabled={busy}>
-                  Disable sync
-                </button>
-              )}
-              {note && canRelaunch && (
-                <button className="btn" onClick={() => api.relaunch()}>
-                  Restart now
+              {(cfg?.tursoUrl || cfg?.tokenSet) && !confirming && (
+                <button
+                  className="btn btn-ghost st-danger-link"
+                  onClick={() => setConfirming(true)}
+                  disabled={busy}
+                >
+                  Turn off sync
                 </button>
               )}
             </div>
 
-            {note && <p className="settings-sync-note">{note}</p>}
-            {err && <p className="settings-sync-warn">{err}</p>}
-          </div>
+            {confirming && (
+              <div className="st-confirm">
+                <h4 className="st-confirm-title">Turn off sync?</h4>
+                <p className="st-confirm-text">
+                  This deletes the saved auth token from your keychain. Vessel cannot get it
+                  back &mdash; you would need to copy it from your Turso dashboard again. Your
+                  conversations stay on this machine and the cloud copy is left untouched.
+                </p>
+                <label className="field-label" htmlFor="confirm-off">
+                  Type <strong>off</strong> to confirm
+                </label>
+                <input
+                  id="confirm-off"
+                  className="input"
+                  type="text"
+                  value={confirmText}
+                  onChange={(e) => setConfirmText(e.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                  disabled={busy}
+                />
+                <div className="st-actions">
+                  <button
+                    className="btn btn-danger"
+                    onClick={onDisable}
+                    disabled={busy || confirmText.trim().toLowerCase() !== 'off'}
+                  >
+                    Turn off sync
+                  </button>
+                  <button
+                    className="btn btn-ghost"
+                    onClick={() => { setConfirming(false); setConfirmText(''); }}
+                    disabled={busy}
+                  >
+                    Keep sync on
+                  </button>
+                </div>
+              </div>
+            )}
 
-          <div className="settings-note">
-            <p className="kicker">Advanced config</p>
-            <p>
-              Models and memory tuning come from the <code>.env</code> file at the project root
-              (dev setups — copy from <code>.env.example</code>). Sync credentials set above
-              override <code>.env</code>. Restart the app after changing either.
-            </p>
-          </div>
+            {note && <p className="st-msg is-ok">{note}</p>}
+            {err && <p className="st-msg is-danger">{err}</p>}
+          </section>
         </div>
       </div>
     </div>

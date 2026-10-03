@@ -333,6 +333,22 @@ test('a bogus sync URL is rejected before it is persisted', async () => {
   assert.ok(/libsql/.test(res.json.error));
 });
 
+test('clearing the auth token needs explicit confirmation', async () => {
+  // Sending tursoToken: '' is the one IRREVERSIBLE call on this route -- it
+  // deletes the keychain entry, and a packaged install has no .env to recover
+  // from. The guard must refuse BEFORE keystore.setTursoToken runs, which is
+  // also why this test is safe to send at all: it never reaches the real OS
+  // keychain. Do NOT add a confirmClearToken: true case here -- that one would.
+  const res = await app.put('/settings', { tursoToken: '' });
+  assert.equal(res.status, 400, 'an unconfirmed clear must be refused');
+  assert.ok(/confirmation/i.test(res.json.error), res.json.error);
+  assert.ok(/confirmClearToken/.test(res.json.detail), res.json.detail);
+
+  // Still present afterwards: the refusal left the stored token alone.
+  const after = (await app.get('/settings')).json;
+  assert.equal(typeof after.tokenSet, 'boolean');
+});
+
 test('the server does not advertise its stack', async () => {
   const res = await app.get('/health');
   assert.equal(res.headers.get('x-powered-by'), null);

@@ -138,8 +138,19 @@ async fn get_settings() -> Cmd<Json> {
 
 /// Accepts either field alone: the renderer saves the URL and the token
 /// separately, and an absent field must not clear the stored one.
+///
+/// `confirm_clear_token` gates the one IRREVERSIBLE operation here. Passing an
+/// empty `turso_token` makes `keystore::set_turso_token` call
+/// `delete_credential`, and a packaged install has no `.env` to recover from -
+/// so the user's credential is simply gone. A dev machine survived one
+/// accidental click only because `.env` still held a copy. Require the caller
+/// to say it means it, so a stray empty field cannot destroy the secret.
 #[tauri::command]
-async fn save_settings(turso_url: Option<String>, turso_token: Option<String>) -> Cmd<Json> {
+async fn save_settings(
+    turso_url: Option<String>,
+    turso_token: Option<String>,
+    confirm_clear_token: Option<bool>,
+) -> Cmd<Json> {
     if let Some(raw) = turso_url {
         let url: String = raw.trim().chars().take(2048).collect();
         if !url.is_empty() && !is_sync_url(&url) {
@@ -153,6 +164,12 @@ async fn save_settings(turso_url: Option<String>, turso_token: Option<String>) -
     }
     if let Some(raw) = turso_token {
         let token: String = raw.trim().chars().take(8192).collect();
+        if clearing_needs_confirmation(&token, confirm_clear_token) {
+            return Err(CmdError::detailed(
+                "Refusing to delete the saved auth token without confirmation.",
+                "Pass confirmClearToken: true to clear it. Omit tursoToken to leave it untouched.",
+            ));
+        }
         if !keystore::set_turso_token(&token) {
             return Err(CmdError::new(
                 "OS keychain unavailable \u{2014} the token cannot be stored securely. Sync stays off.",
@@ -160,6 +177,17 @@ async fn save_settings(turso_url: Option<String>, turso_token: Option<String>) -
         }
     }
     Ok(json!({ "ok": true, "restartRequired": true }))
+}
+
+/// Does this token write need an explicit confirmation before it runs?
+///
+/// True only for the destructive case: an empty token (which deletes the
+/// keychain entry) that the caller has not confirmed. Saving a real token, or
+/// clearing one with confirmation, passes through. Kept separate from
+/// `save_settings` so it can be tested without touching the real credential
+/// store, which a test must never write.
+fn clearing_needs_confirmation(token: &str, confirmed: Option<bool>) -> bool {
+    token.is_empty() && confirmed != Some(true)
 }
 
 /// `^(libsql|https?)://\S+$`, without pulling in a regex engine for one check.
@@ -556,4 +584,36 @@ pub fn run() {
                 tauri::async_runtime::block_on(shutdown());
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Clearing the Turso token deletes it from the OS keychain, and a packaged
+    /// install has no `.env` to recover from. These cases pin the one decision
+    /// that stands between a stray empty field and permanent credential loss.
+    ///
+    /// The keychain write itself is deliberately NOT exercised: `set_turso_token`
+    /// talks to the user's real credential store, so a test that called it would
+    /// destroy their live token.
+    #[test]
+    fn an_unconfirmed_clear_is_refused() {
+        assert!(clearing_needs_confirmation("", None));
+        assert!(clearing_needs_confirmation("", Some(false)));
+    }
+
+    #[test]
+    fn a_confirmed_clear_goes_through() {
+        assert!(!clearing_needs_confirmation("", Some(true)));
+    }
+
+    #[test]
+    fn saving_a_real_token_never_needs_confirmation() {
+        // The common path: confirmation is about deletion only, so a non-empty
+        // token must pass whatever the flag says.
+        assert!(!clearing_needs_confirmation("a-token", None));
+        assert!(!clearing_needs_confirmation("a-token", Some(false)));
+        assert!(!clearing_needs_confirmation("a-token", Some(true)));
+    }
 }

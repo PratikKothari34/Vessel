@@ -55,8 +55,15 @@ const tauriApi = {
   deleteCharacter: (id) => invoke('delete_character', { id }),
 
   getSettings: () => invoke('get_settings'),
+  // confirmClearToken must cross the bridge: save_settings refuses to delete the
+  // stored token without it, so dropping the field here would make the UI's
+  // confirmed "turn off sync" fail instead of apply.
   saveSettings: (patch) =>
-    invoke('save_settings', { tursoUrl: patch.tursoUrl, tursoToken: patch.tursoToken }),
+    invoke('save_settings', {
+      tursoUrl: patch.tursoUrl,
+      tursoToken: patch.tursoToken,
+      confirmClearToken: patch.confirmClearToken,
+    }),
 
   listConversations: (characterId) =>
     invoke('list_conversations', { characterId: characterId || null }).then((d) => d.conversations),

@@ -295,6 +295,18 @@ app.put('/settings', async (req, res) => {
     }
     if (body.tursoToken !== undefined) {
       const token = String(body.tursoToken).trim().slice(0, 8192);
+      // Clearing the token is the only IRREVERSIBLE operation on this route:
+      // setTursoToken('') calls keytar.deletePassword, and a packaged install
+      // has no .env to fall back on, so the user's credential is simply gone.
+      // A dev machine survived one accidental click only because .env happened
+      // to still hold a copy. Require the caller to say it means it, so a
+      // stray empty field or a reused request body can't destroy the secret.
+      if (!token && body.confirmClearToken !== true) {
+        return res.status(400).json({
+          error: 'Refusing to delete the saved auth token without confirmation.',
+          detail: 'Send confirmClearToken: true to clear it. Omit tursoToken to leave it untouched.',
+        });
+      }
       const ok = await keystore.setTursoToken(token);
       if (!ok) {
         return res.status(500).json({

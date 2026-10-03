@@ -30,10 +30,29 @@ export default function App() {
     }
   }, []);
 
+  // Health is the app's only live status source: the header pill reads it and
+  // Settings states whether sync is on and whether the database is encrypted.
+  // Fetching it once at mount made every one of those a launch-time snapshot --
+  // turn sync off and Settings still claimed it was on until the next restart.
+  const refreshHealth = useCallback(
+    () => api.health().then(setHealth).catch(() => setHealth({ status: 'down' })),
+    [],
+  );
+
   useEffect(() => {
     refreshCharacters();
-    api.health().then(setHealth).catch(() => setHealth({ status: 'down' }));
-  }, [refreshCharacters]);
+    refreshHealth();
+  }, [refreshCharacters, refreshHealth]);
+
+  // Re-read on the two events that can invalidate it without a restart: the
+  // backend going up or down while the window sits idle, and the user coming
+  // back to the window after changing something. No polling -- a timer would
+  // wake the machine for a value nobody is looking at.
+  useEffect(() => {
+    const onFocus = () => refreshHealth();
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [refreshHealth]);
 
   const openChat = (character, conversationId = null) => {
     setActiveCharacter(character);
@@ -107,7 +126,13 @@ export default function App() {
         />
       )}
 
-      {showSettings && <Settings health={health} onClose={() => setShowSettings(false)} />}
+      {showSettings && (
+        <Settings
+          health={health}
+          onRefreshHealth={refreshHealth}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
     </div>
   );
 }

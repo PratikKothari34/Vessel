@@ -1,53 +1,154 @@
-.settings-panel { max-width: 560px; }
+/* Settings -- one page, two sections.
+   A privacy statement in plain words, then cloud sync, the only editable
+   surface. Model ids and tuning numbers are deliberately absent: they are
+   read-only, set in `.env`, and surfaced where they are useful (header, Memory
+   inspector). Nothing technical appears before the user asks for it. */
 
-.settings-status {
-  display: flex; align-items: center; gap: 10px;
-  font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.04em;
-  padding: 12px 16px; border-radius: 8px; margin-bottom: 22px;
+.settings-panel { max-width: 580px; }
+
+.st-body { padding-top: 22px; display: flex; flex-direction: column; gap: 16px; }
+
+/* ── Sections ──────────────────────────────────────────────── */
+
+.st-section { display: flex; flex-direction: column; gap: 12px; }
+.st-section-title {
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* ── Cards (General) ────────────────────────────────────────────────────── */
+
+/* One statement per card, in a sentence. The tone carries the severity, so the
+   text never has to shout. */
+.st-card {
   border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--ink-750);
+  padding: 16px 18px;
 }
-.settings-status .dot { width: 8px; height: 8px; border-radius: 50%; }
-.settings-status.ok { color: var(--ok); background: rgba(127, 191, 127, 0.06); border-color: rgba(127, 191, 127, 0.2); }
-.settings-status.ok .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
-.settings-status.down { color: var(--danger); background: rgba(255, 180, 171, 0.06); border-color: rgba(255, 180, 171, 0.2); }
-.settings-status.down .dot { background: var(--danger); }
-
-/* Encryption failed and stories are landing on disk in cleartext — the one
-   status here the user must not scroll past. */
-.settings-alert {
-  border: 1px solid rgba(255, 180, 171, 0.35);
-  background: rgba(255, 180, 171, 0.07);
-  border-left: 3px solid var(--danger);
-  border-radius: 8px;
-  padding: 14px 16px;
-  margin-bottom: 22px;
+.st-card-title {
+  font-family: var(--font-display);
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-bright);
 }
-.settings-alert strong { color: var(--danger); font-size: 13.5px; display: block; }
-.settings-alert p { font-size: 12.5px; color: var(--text-dim); line-height: 1.65; margin-top: 6px; }
+.st-card-text {
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--text-dim);
+  margin-top: 6px;
+}
 
-.settings-table { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 24px; }
-.settings-row { display: flex; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--line); }
-.settings-row:last-child { border-bottom: none; }
-.settings-row:nth-child(odd) { background: var(--surface); }
-.settings-key { font-size: 13px; color: var(--text-dim); }
-.settings-val { font-family: var(--font-mono); font-size: 12px; color: var(--text-bright); }
+.st-card.is-ok { border-color: rgba(127, 209, 160, 0.28); background: rgba(127, 209, 160, 0.05); }
+.st-card.is-ok .st-card-title { color: var(--ok); }
+.st-card.is-warn { border-color: rgba(250, 188, 78, 0.3); background: rgba(250, 188, 78, 0.05); }
+.st-card.is-warn .st-card-title { color: var(--warn); }
+.st-card.is-danger { border-color: rgba(255, 180, 171, 0.32); background: rgba(255, 180, 171, 0.05); }
+.st-card.is-danger .st-card-title { color: var(--danger); }
 
-.settings-sync { margin-bottom: 24px; }
-.settings-sync .field-label { margin-top: 14px; }
-.settings-sync-blurb { font-size: 13px; color: var(--text-dim); line-height: 1.7; margin-top: 8px; }
-.settings-sync-blurb code, .settings-sync-note code {
-  font-family: var(--font-mono); font-size: 11.5px;
+/* An inline jump to another tab -- a link in weight, a button in behaviour. */
+.st-link {
+  padding: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ember-400);
+  border: none;
+  background: none;
+}
+.st-link:hover { background: none; border: none; color: var(--ember-500); text-decoration: underline; }
+
+/* ── Sync ───────────────────────────────────────────────────────────────── */
+
+.st-state {
+  display: flex; align-items: flex-start; gap: 11px;
+  padding: 13px 15px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+.st-state-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-faint);
+  margin-top: 6px;
+  flex: none;
+}
+.st-state.is-on { border-color: rgba(93, 230, 255, 0.25); background: rgba(93, 230, 255, 0.05); }
+.st-state.is-on .st-state-dot { background: var(--steel-400); box-shadow: 0 0 8px var(--steel-400); }
+.st-state-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.st-state-text strong { font-size: 13.5px; font-weight: 600; color: var(--text-bright); }
+.st-state-text span { font-size: 12.5px; color: var(--text-dim); line-height: 1.55; }
+
+.st-field { display: flex; flex-direction: column; }
+.st-field-note { font-size: 11.5px; color: var(--text-faint); margin-top: 7px; line-height: 1.5; }
+
+.st-actions { display: flex; gap: 10px; margin-top: 4px; flex-wrap: wrap; }
+
+.st-msg { font-size: 12.5px; line-height: 1.6; }
+.st-msg.is-ok { color: var(--ok); }
+.st-msg.is-warn { color: var(--warn); }
+.st-msg.is-danger { color: var(--danger); }
+
+/* The restart offer sits in the sentence that explains why it is there. */
+.st-inline-link { margin-left: 7px; vertical-align: baseline; }
+
+/* ── Shared prose ───────────────────────────────────────────────────────── */
+
+.st-prose { font-size: 13px; color: var(--text-dim); line-height: 1.7; }
+.st-prose strong { color: var(--text-base); font-weight: 600; }
+.st-prose code {
+  font-family: var(--font-mono); font-size: 11.5px; font-weight: 500;
   background: var(--ink-850); border: 1px solid var(--line);
   padding: 1px 6px; border-radius: 4px; color: var(--ember-400);
 }
-.settings-sync-actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
-.settings-sync-note { font-size: 12.5px; color: var(--ok); margin-top: 10px; }
-.settings-sync-warn { font-size: 12.5px; color: var(--danger); margin-top: 10px; line-height: 1.6; }
 
-.settings-note { font-size: 13px; color: var(--text-dim); line-height: 1.7; }
-.settings-note p { margin-top: 8px; }
-.settings-note code {
-  font-family: var(--font-mono); font-size: 11.5px;
-  background: var(--ink-850); border: 1px solid var(--line);
-  padding: 1px 6px; border-radius: 4px; color: var(--ember-400);
+@media (max-width: 560px) {
+  .st-actions { flex-direction: column; align-items: stretch; }
 }
+
+/* ── Destructive confirmation ───────────────────────────────────────────── */
+
+/* Turning sync off deletes a keychain secret Vessel cannot regenerate, so the
+   entry point is a quiet link, not a standing red button -- the red appears
+   only once the user is inside the confirmation and has typed the word. */
+.st-danger-link {
+  padding: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-faint);
+  border: none;
+  background: none;
+}
+.st-danger-link:hover {
+  background: none; border: none;
+  color: var(--danger);
+  text-decoration: underline;
+}
+
+.st-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 18px;
+  border: 1px solid rgba(255, 180, 171, 0.32);
+  border-radius: 12px;
+  background: rgba(255, 180, 171, 0.05);
+  animation: rise 0.2s var(--ease) both;
+}
+.st-confirm-title {
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--danger);
+}
+.st-confirm-text {
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--text-dim);
+}
+.st-confirm .field-label strong { color: var(--text-bright); font-weight: 600; }
+.st-confirm .st-actions { margin-top: 2px; }
