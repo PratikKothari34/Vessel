@@ -737,39 +737,6 @@ function encodeEmbeddingInt8(arr) {
 function encodeEmbedding(arr) {
   return EMBED_QUANTIZE ? encodeEmbeddingInt8(arr) : encodeEmbeddingF32(arr);
 }
-function decodeEmbedding(buf) {
-  if (!buf) return null;
-  // rows may hand back Buffer, Uint8Array, or ArrayBuffer depending on the driver.
-  const b = Buffer.isBuffer(buf) ? buf
-    : buf instanceof Uint8Array ? Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength)
-    : Buffer.from(buf);
-
-  // int8 (current format): dequantize against the per-vector scale.
-  if (b.byteLength > EMBED_INT8_HEADER && b[0] === EMBED_BLOB_MAGIC && b[1] === EMBED_BLOB_INT8) {
-    const scale = b.readFloatLE(2);
-    if (!Number.isFinite(scale)) return null;
-    const n = b.byteLength - EMBED_INT8_HEADER;
-    const out = new Float32Array(n);
-    // Same reason as the encode side: a typed view turns n bounds-checked
-    // readInt8 calls into one indexed read. This runs once per archived row on
-    // a cold cache fill, so a 2,000-turn story decodes 1.5M components.
-    const q8 = new Int8Array(b.buffer, b.byteOffset + EMBED_INT8_HEADER, n);
-    for (let i = 0; i < n; i++) out[i] = q8[i] * scale;
-    return out;
-  }
-
-  // legacy f32. guard against a truncated/garbage blob
-  if (b.byteLength % 4 !== 0) return null;
-  // COPY into a fresh, 4-byte-aligned Float32Array rather than viewing over the
-  // source buffer: a driver that returns a BLOB as a slice of a pooled
-  // ArrayBuffer could hand back a non-4-aligned byteOffset, which would make a
-  // Float32Array VIEW constructor throw. A freshly allocated ArrayBuffer is
-  // always aligned; copy the bytes into it (cheap for 768 floats).
-  const ab = new ArrayBuffer(b.byteLength);
-  new Uint8Array(ab).set(b);
-  return new Float32Array(ab);
-}
-
 // Decode a stored blob straight into an int8 row of a caller-owned matrix,
 // WITHOUT dequantizing. Returns true if the row is usable.
 //
@@ -834,7 +801,6 @@ module.exports = {
   isEncryptedAtRest,
   unencryptedReason,
   encodeEmbedding,
-  decodeEmbedding,
   decodeEmbeddingInt8,
   EMBED_DIM,
   EMBED_QUANTIZE,

@@ -68,35 +68,6 @@ pub fn encode(v: &[f32]) -> Vec<u8> {
     }
 }
 
-/// Decode either format. `None` for a truncated or garbage blob, which the
-/// caller treats as "this row has no usable embedding" rather than an error —
-/// one bad row must not stop a retrieval scan.
-pub fn decode(blob: &[u8]) -> Option<Vec<f32>> {
-    if blob.len() > INT8_HEADER && blob[0] == MAGIC && blob[1] == FORMAT_INT8 {
-        let scale = f32::from_le_bytes([blob[2], blob[3], blob[4], blob[5]]);
-        if !scale.is_finite() {
-            return None;
-        }
-        return Some(
-            blob[INT8_HEADER..]
-                .iter()
-                .map(|&b| (b as i8) as f32 * scale)
-                .collect(),
-        );
-    }
-
-    if blob.is_empty() || !blob.len().is_multiple_of(4) {
-        return None;
-    }
-    Some(
-        blob.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect(),
-    )
-}
-
 /// Decode a stored blob into `dim` int8 components appended to `out`, WITHOUT
 /// dequantizing. Returns false and appends nothing if the row is unusable.
 ///
@@ -198,6 +169,20 @@ mod tests {
         v
     }
 
+    /// Dequantize a blob the way production does. `decode_int8` is the only
+    /// decoder the crate ships, and it hands back int8 because cosine does not
+    /// need the per-vector scale. The encode-side properties below are all
+    /// about direction, so recover a float view through it and compare
+    /// directions -- that keeps the coverage pointed at shipping code rather
+    /// than at a decoder nothing but a test would call.
+    fn dequantize(blob: &[u8]) -> Option<Vec<f32>> {
+        let mut out: Vec<i8> = Vec::new();
+        if !decode_int8(blob, 768, &mut out) {
+            return None;
+        }
+        Some(out.into_iter().map(|q| q as f32).collect())
+    }
+
     #[test]
     fn int8_blob_is_the_documented_size() {
         let v = unit_vector(768, 7);
@@ -208,7 +193,7 @@ mod tests {
     #[test]
     fn int8_roundtrip_keeps_cosine_within_tolerance() {
         let v = unit_vector(768, 42);
-        let back = decode(&encode_int8(&v)).expect("decodes");
+        let back = dequantize(&encode_int8(&v)).expect("decodes");
         // The documented bound is <0.002 against the f32 original.
         assert!(cosine(&v, &back) > 0.998, "cosine {}", cosine(&v, &back));
     }
@@ -216,8 +201,9 @@ mod tests {
     #[test]
     fn legacy_f32_blobs_still_decode() {
         let v = unit_vector(768, 3);
-        let back = decode(&encode_f32(&v)).expect("decodes");
-        assert_eq!(v, back, "f32 is lossless");
+        let back = dequantize(&encode_f32(&v)).expect("decodes");
+        // Folded to int8 on the way in, so direction survives, not the bits.
+        assert!(cosine(&v, &back) > 0.998, "cosine {}", cosine(&v, &back));
     }
 
     #[test]
@@ -228,22 +214,20 @@ mod tests {
     }
 
     #[test]
-    fn all_zero_vector_survives_the_roundtrip() {
+    fn an_all_zero_vector_gets_scale_one_rather_than_a_divide_by_zero() {
         let v = vec![0f32; 768];
-        let back = decode(&encode_int8(&v)).expect("decodes");
-        assert!(back.iter().all(|x| *x == 0.0));
+        let blob = encode_int8(&v);
+        let scale = f32::from_le_bytes([blob[2], blob[3], blob[4], blob[5]]);
+        assert_eq!(scale, 1.0, "scale 1 rather than a divide by zero");
+        assert!(
+            blob[INT8_HEADER..].iter().all(|b| *b == 0),
+            "components stay zero, not wrapped"
+        );
+        // The retrieval decoder still accepts it: an int8 row cannot carry
+        // poison, and a zero row scores 0 against everything, which is the
+        // honest answer for a turn with no direction.
+        let back = dequantize(&blob).expect("decodes");
         assert_eq!(cosine(&v, &back), 0.0, "zero norm scores 0, never NaN");
-    }
-
-    #[test]
-    fn garbage_blobs_decode_to_none_rather_than_panicking() {
-        assert!(decode(&[]).is_none());
-        assert!(decode(&[1, 2, 3]).is_none(), "not a multiple of 4");
-        // int8 magic with a non-finite scale.
-        let mut bad = vec![MAGIC, FORMAT_INT8];
-        bad.extend_from_slice(&f32::NAN.to_le_bytes());
-        bad.push(1);
-        assert!(decode(&bad).is_none());
     }
 
     #[test]
