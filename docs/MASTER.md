@@ -447,8 +447,8 @@ Ranked by bytes saved.
 | Q4_K_M -> IQ4_XS | ~0.47 GB disk + VRAM | negligible quality |
 | 384-dim embedder (bge-small / MiniLM) | ~0.18 GB disk, 2x faster cosine | slight recall loss |
 | int8 embeddings in DB | 3072 -> 774 B/turn (3.97x) [M] | **done** — max cosine error 1.2e-3, ranking identical |
-| Electron -> Tauri | 0.19 GB disk, ~150 MB RAM [E] | **runs (stage 4a)** — 239 lines of main+preload became a 524-line shell; window opened and IPC exercised 2026-09-30, see *Stage 4a* |
-| Node backend -> in-process Rust | 0.04 GB disk, ~70 MB RAM [E] | **code-complete (stage 4a)** — 3,996 lines became 5,690, no loopback HTTP left |
+| Electron -> Tauri | 0.19 GB disk, ~150 MB RAM [E] | **runs (stage 4a)** — 239 lines of main+preload became a 569-line shell; window opened and IPC exercised 2026-09-30, see *Stage 4a* |
+| Node backend -> in-process Rust | 0.04 GB disk, ~70 MB RAM [E] | **code-complete (stage 4a)** — 4,764 lines became 8,467, no loopback HTTP left |
 
 **Banked so far:** VRAM 9.52 GB spilling -> **6.03 GB fully resident** [M].
 Decode 13.69 -> **46.4 tok/s p50** end to end on the real GPU [M] — **3.39x**,
@@ -604,30 +604,39 @@ with. Roughly half of the Node security suite defended a perimeter that no
 longer exists - see the module doc on `src-core/tests/security.rs` for which
 tests were carried across and which were deleted, and why.
 
-Re-counted 2026-09-18, after the retrieval fix below landed. The Rust figures are **after** the one-time
-`cargo fmt` pass, which splits long lines and so inflates every Rust row against
-the numbers this table carried before; the Electron rows are unaffected. A Rust
+Re-counted 2026-10-03, after the optimization, bug-fix and red-team passes
+below landed. The Rust figures are **after** the one-time `cargo fmt` pass,
+which splits long lines and so inflates every Rust row against the numbers this
+table carried before 2026-09-18; the Electron rows are unaffected. A Rust
 file's inline `#[cfg(test)]` module counts as test, not production, which is why
 `src-core/src` reads smaller here than `wc -l` over the same files.
 
 | Area | Electron track | Rust track | |
 |---|---|---|---|
-| backend / core, production only | 4,608 | 8,243 | [M] |
+| backend / core, production only | 4,764 | 8,467 | [M] |
 | of which `inference/` | 862 | 3,118 | [M] |
-| shell (main + preload / Tauri) | 239 | 567 | [M] |
-| tests | 4,274 | 4,398 | [M] |
-| test count | 258 | 195 | [M] |
-| renderer JS/JSX | 1,425 | shared, unchanged | [M] |
+| shell (main + preload / Tauri) | 239 | 569 | [M] |
+| tests | 4,549 | 5,027 | [M] |
+| test count, default features | 269 | 201 | [M] |
+| renderer JS/JSX | 1,555 | shared, unchanged | [M] |
 | renderer CSS | 752 | shared, unchanged | [M] |
 
 Rust is longer per unit of behaviour and that is the trade: explicit error
 types, no prototype chain to smuggle a key through, and a compiler that rejects
 the shape of bug the Node suite had to test for. The test counts are close
-because both suites cover the same behaviour; the Rust side folds 164 of its
-195 into the modules they test, so a failure names the function rather than an
+because both suites cover the same behaviour; the Rust side folds 170 of its
+201 into the modules they test, so a failure names the function rather than an
 endpoint. The Electron suite is the larger of the two because it also has to
-test a perimeter the Rust track does not have: 34 of its 258 are red-team tests
+test a perimeter the Rust track does not have: 35 of its 269 are red-team tests
 against the HTTP surface.
+
+"Default features" is load-bearing in that row. `src-core` carries 188 `#[test]`
+attributes in `src-core/src`, but 21 of them sit in
+`inference/llama_local.rs` behind `local-llama`, so a default `cargo test -p
+vessel-core` runs 170 from the library plus 31 from `src-core/tests/` - 201. The
+number only reaches 209 with `--features local-llama`, which needs llama.cpp
+present. Quoting the larger figure as the suite size would be a claim no plain
+checkout can reproduce.
 
 **Verified at runtime on 2026-09-30.** The shell was built and opened on this
 machine: window titled `Vessel` at 1294x882, the React bundle served from
@@ -810,6 +819,98 @@ DB key was a genuinely different value that nothing on disk was encrypted under
 directory). The live keytar pair was verified unchanged afterwards, and the app
 still opens an encrypted database without minting anything.
 
+## The 2026-10-03 pass - optimize, bug-hunt, red-team, clean up
+
+A four-part pass over both tracks. Worth recording for one reason: the bugs it
+found were not the ones either test suite was shaped to catch, and three of the
+four were **divergences in the same direction** - the Rust track had already
+hardened something the Electron track had not.
+
+### What it fixed
+
+| Fix | Track | Why no test caught it |
+|---|---|---|
+| Never mint a DB key when a database already exists | both | Needs a keychain that has lost its entry while the file survives. A fresh keychain and a fresh file both pass. |
+| Stop re-walking the metrics ring and re-parsing settled messages | both | A correctness-neutral cost. Nothing fails; the work is simply done twice. |
+| Say it out loud when a turn gives up on its lock | both | A timed-out lock proceeded unlocked and said nothing. The symptom was a silent interleave, not an error. |
+| Finish an encryption migration a crash cut in half | both | Needs a process kill between two `rename` calls. See below. |
+| Bound the whole chat request, not just the director note | Electron | `express.json()`'s 10 MB body limit made this look covered. It bounds the transport, not the assembled content. |
+| Raise the rustls floor past RUSTSEC-2026-0285 | Rust | A dependency advisory. No test, on either track, is a substitute for `cargo audit`. |
+| Delete the embedding decoder nothing but a test called | both | The opposite failure: the test suite was the only thing keeping it alive. |
+
+### The migration bug is the one that mattered
+
+The plaintext-to-encrypted migration swaps two files: `rename(main, backup)`,
+then `rename(tmp, main)`. A process that dies between them leaves the main DB
+**absent** while `.encrypting` holds the finished encrypted copy and
+`.plaintext-backup` holds the original.
+
+Nothing downstream noticed. `isPlaintextDb` saw no file and returned false, the
+encrypted driver opened the missing path and created an empty database, and the
+app came up with an empty library next to two files holding the real one. No
+error, no warning. The user's story was recoverable by hand and by nothing else.
+
+`completeInterruptedMigration` now runs before anything reads the file or picks
+a driver, and the asymmetry in it is the whole design: it completes the swap
+**only** when the main file is absent. A staged copy must never overwrite a live
+database, because the same `.encrypting` file is also what a migration that died
+*before* its first rename leaves behind - and in that case the main file is
+still the plaintext original the user wants.
+
+The Rust track had the zero-byte half of this guard already. It did not have the
+mid-swap half, so both tracks needed the fix.
+
+### What the red-team pass checked and did not report
+
+The pass spent its budget on new ground rather than re-verifying the six earlier
+ones (see `docs/memory/vessel-security-posture.md`). Audited and found sound:
+middleware order, `killProcessOnPort` argument handling, `safeAvatarSrc`, the
+renderer CSP, settings-file trust, the Tauri IPC boundary, both embedding decode
+paths, and `/health` disclosure.
+
+Two candidates were investigated and **deliberately not reported**:
+
+- **A lock window in the `/chat` terminal path.** Every early return was read;
+  all of them return, and the terminal path releases in a `finally`. A probe had
+  already refuted the socket-disconnect hypothesis. Not a bug.
+- **`isReadQuery` misrouting a statement.** A scanner over every SQL template
+  literal in the backend found zero misroutes. Latent only.
+
+Reporting either would have been noise. The entry is here so a later pass does
+not re-spend the budget on them.
+
+### cargo audit is now part of the toolchain
+
+`cargo-audit` was installed during this pass - Rust dependency advisories had
+never been checked. It found one: `rustls` 0.23.44, RUSTSEC-2026-0285, medium
+(5.3), a TLS 1.3 handshake flaw fixed in 0.23.45. The crate is only present to
+install the process-level `CryptoProvider`, but the caret range had let the lock
+settle on the affected version, and the sync path talks TLS.
+
+After the bump: **no vulnerabilities**. Seven warnings remain, all transitive and
+all unreachable from this workspace's own choices - `glib` (unsound iterator
+impls, GTK), the `unic-*` family and `proc-macro-error` (unmaintained,
+proc-macro build chain). None on the TLS or data path. They are not actionable
+from here; they would go away with a Tauri major-version bump, which is its own
+re-verification.
+
+`npm audit --omit=dev` is clean in both the root and `app/`.
+
+### Two traps in the harness, recorded so they are not re-learned
+
+- **The Node suite has order and state dependence.** A full run reported 263/271
+  while the same files in isolation passed. The cause was a reused scratch
+  `LOCAL_DB_PATH` still holding rows written by an earlier mutation-test run - a
+  dirty database, not a dirty test. Every run in this pass used a pristine path.
+  The dependence itself is pre-existing and still open.
+- **Mutation-testing caught two tests that proved nothing.** The first new
+  request-size test asserted `status === 400 || status === 413` and **passed with
+  the fix removed** - it was testing the body parser. A Rust mutation script
+  asserted on a source line that did not exist, threw before writing, and
+  reported the unmutated suite as a passing "mutated" run. Both were caught by
+  checking that the test fails without the fix. Neither would have been caught by
+  reading the test.
+
 ## Stage 4b result - llama.cpp inside the process
 
 The blocker on this stage was the toolchain, and it is gone: MSVC Build Tools
@@ -848,8 +949,12 @@ CUDA toolchain is only required when CUDA is wanted:
 | `local-llama-cuda` | in-process llama.cpp, CUDA | [M] |
 
 Selecting `INFERENCE_BACKEND=llama-local` in a build without the feature is a
-startup error that says so, not a silent fallback. The feature build adds 20
-tests (the sampler, the emitter, and the parked-cache policy), for 187.
+startup error that says so, not a silent fallback. The feature build adds 21
+tests (the sampler, the emitter, and the parked-cache policy) and removes the
+one that asserts the backend is *absent*, so net +20 against the 201 the
+numbers table quotes - 221. That figure is counted from the `#[test]`
+attributes, not observed: running it needs llama.cpp built, which is why the
+table quotes the default-feature number as the suite size.
 
 What it buys, and what it does not:
 

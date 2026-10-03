@@ -123,7 +123,9 @@ fn database_already_exists() -> bool {
         // always recoverable; minting over someone's key is not.
         return true;
     };
-    std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false)
+    std::fs::metadata(&path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// Resolve the local-DB encryption key (hex), or `None` if encryption cannot be

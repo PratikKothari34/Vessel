@@ -428,7 +428,9 @@ async fn open_local_encrypted(path: &Path, hexkey: &str) -> Result<turso::Databa
 /// Does a real database file exist here? A missing or zero-byte file is not one,
 /// and both are normal on a first run.
 fn file_exists_nonempty(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// Is this file already plaintext? The encrypted driver refuses a plaintext file
@@ -1285,7 +1287,10 @@ mod tests {
         seed_plaintext(&path, &[("a", "Ada"), ("b", "Bo")]).await;
         open_local(&path, Some(KEY_A)).await.unwrap(); // real migration
         std::fs::rename(&path, &tmp).unwrap();
-        assert!(!path.exists(), "the main file is absent, as after the crash");
+        assert!(
+            !path.exists(),
+            "the main file is absent, as after the crash"
+        );
         assert!(tmp.exists() && backup.exists());
 
         complete_interrupted_migration(&path);
@@ -1333,7 +1338,10 @@ mod tests {
         assert!(encrypted);
         assert_eq!(reason, None);
         let backup = PathBuf::from(format!("{}.plaintext-backup", path.display()));
-        assert!(!backup.exists(), "nothing was migrated, so nothing is backed up");
+        assert!(
+            !backup.exists(),
+            "nothing was migrated, so nothing is backed up"
+        );
     }
 
     #[tokio::test]

@@ -40,8 +40,10 @@ Electron main ──spawns──> Node/Express backend (127.0.0.1) ──HTTP─
   (Vite)                   characters / conversations / turns / archive(+embeddings)
 ```
 
-The model's live window is kept small (32K) for speed. Older turns fold out of it
-and are **archived with embeddings** (nomic-embed-text); relevant ones are
+The model's live window is kept small - 12,288 tokens, not the 32,768 the model
+will accept - because that is the single largest speed lever measured: it freed
+3.17 GB of VRAM and tripled decode (`docs/MASTER.md`, Stage 1). Older turns fold
+out of it and are **archived with embeddings** (nomic-embed-text); relevant ones are
 recalled per message by cosine-ranking the stored embeddings in JS (the Turso
 sync engine has no native vector search).
 
@@ -195,6 +197,9 @@ Vessel/
 │   ├── db.js               # Turso sync client + schema + embedding codec
 │   ├── memory.js           # summary + retrieval engine
 │   ├── characters.js       # character CRUD
+│   ├── keystore.js         # OS keychain: DB encryption key + Turso token
+│   ├── settings.js         # data/settings.json, atomic write
+│   ├── metrics.js          # generation ring, exposed at GET /metrics
 │   └── inference/          # ollama / llama-server adapters behind one interface
 ├── app/                    # Electron + React (Vite)
 │   └── src/
@@ -219,8 +224,8 @@ builds, and nothing above depends on it.
 Two suites, no test dependencies in either.
 
 ```bash
-npm test                      # 253 tests — the Node backend, unit + integration
-cargo test -p vessel-core     # 191 tests — the Rust core
+npm test                      # 269 tests — the Node backend, unit + integration
+cargo test -p vessel-core     # 201 tests — the Rust core
 ```
 
 `npm test` spawns its own backend on a scratch database with a fake inference
