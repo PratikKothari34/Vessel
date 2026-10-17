@@ -81,15 +81,15 @@ if ($cmake -match '(?i)msys64|mingw') {
 }
 
 $feature = if ($Cuda) { 'local-llama-cuda' } else { 'local-llama' }
-$args = @($Command, '-p', 'vessel-core', '--features', $feature)
-if ($Example) { $args += @('--example', $Example) }
-if ($Release) { $args += '--release' }
+$cargoArgs = @($Command, '-p', 'vessel-core', '--features', $feature)
+if ($Example) { $cargoArgs += @('--example', $Example) }
+if ($Release) { $cargoArgs += '--release' }
 
 Write-Host "cmake:    $cmake"
 Write-Host "cl:       $((Get-Command cl).Source)"
 Write-Host "features: $feature"
-Write-Host "cargo $($args -join ' ')"
+Write-Host "cargo $($cargoArgs -join ' ')"
 Write-Host ''
 
-& cargo @args
+& cargo @cargoArgs
 exit $LASTEXITCODE

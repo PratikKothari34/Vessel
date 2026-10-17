@@ -71,6 +71,16 @@ measured faster on every axis - decode 46.5 vs 39.4 tok/s, prefill ~2,200 vs
 it. It needs a server you start yourself; `.env.example` has the launch line and
 the flags that matter.
 
+A third backend runs llama.cpp **in this process** rather than talking to a
+server, behind the `local-llama` feature (`local-llama-cuda` for GPU). It is not
+in the default build - `default = []` - and it is not a drop-in replacement: it
+generates but does not embed, so `EMBED_BACKEND` still has to name ollama or
+llama-server. Measured at 45.1 tok/s decode and 2,287 tok/s prefill - parity with
+llama-server, not a speed-up. What it buys is the KV cache: a re-entered
+conversation costs 112 ms instead of a 1,226 ms re-prefill, and no separate
+server to start. `.env.example` has the build line and the knobs; building it needs
+`src-core/build-local-llama.ps1`, not a plain cargo invocation.
+
 A **rolling summary** (gemma3:4b) can narrate what fell out of the window as
 well, but it ships **off**. Measured over 2,000 exchanges it left recall
 unchanged (33.8% vs 39.4%, p=0.30) while cutting accuracy when the model
@@ -216,8 +226,9 @@ cargo install tauri-cli --locked
 cargo tauri build          # -> src-tauri/target/release/bundle/nsis/
 ```
 
-Installers under `app/dist/` are from the retired Electron build and are kept
-for provenance only.
+The retired Electron installers that used to sit under `app/dist/` were deleted
+locally on 2026-10-17. The published ones remain on the GitHub releases
+(v1.0.0-v1.0.3), which is where provenance lives.
 
 ---
 
@@ -228,19 +239,25 @@ Vessel/
 ├── Modelfile               # ollama create vessel -f Modelfile
 ├── .env.example
 ├── src-core/               # vessel-core: the whole application, in Rust
-│   ├── db.rs               # Turso sync client + schema + embedding codec
-│   ├── memory.rs           # summary + retrieval engine
+│   ├── db.rs               # Turso sync client + schema + migration
+│   ├── memory.rs           # fold, archive, retrieval, prompt assembly
 │   ├── chat.rs             # turn assembly + streaming
+│   ├── embed.rs            # int8 embedding codec + cosine
+│   ├── prompt.rs           # persona / director / system message layout
 │   ├── characters.rs       # character CRUD
 │   ├── keystore.rs         # OS keychain: DB encryption key + Turso token
 │   ├── settings.rs         # data/settings.json, atomic write
 │   ├── metrics.rs          # generation ring
-│   └── inference/          # ollama / llama-server adapters behind one trait
+│   ├── config.rs           # environment-derived configuration
+│   ├── util.rs             # ids, ISO/civil dates
+│   └── inference/          # ollama / llama-server / llama-local behind one trait
 ├── src-tauri/              # the desktop shell: window + #[tauri::command]s
 ├── app/                    # React UI (Vite) — compiled into the Tauri binary
 │   ├── vite.renderer.config.mjs   # the only UI build
 │   └── src/renderer/src/   # React UI (Gallery, Chat, Editor, Settings, Memory)
 ├── test/                   # node:test over the renderer's pure modules
+│   ├── guard.mjs           # pre-test hook: never reach the real DB or keychain
+│   └── unit/               # 5 files, no dependencies
 └── docs/
     ├── MASTER.md           # every measured number, in one place
     └── decisions/          # why the load-bearing choices were made
@@ -258,16 +275,17 @@ Two suites, no test dependencies in either - the repo installs nothing to run
 them.
 
 ```bash
-cargo test -p vessel-core     # 201 tests — the application
-npm test                      # 32 tests — the renderer's pure modules
+cargo test -p vessel-core     # 224 tests — the application
+npm test                      # 65 tests — the renderer's pure modules
 ```
 
 `cargo test` covers the data layer, memory and retrieval, chat assembly,
 the inference adapters, and a security suite that drives the real code paths;
 every test that touches storage gets its own temporary database. `npm test`
-covers the two renderer modules with logic worth asserting on - prose
-tokenizing and the settings state machine - and opens no database, keychain or
-model.
+covers the five renderer modules with logic worth asserting on - prose
+tokenizing, the settings state machine, the IPC transport, the shared view
+helpers, and which conversation a finished stream belongs to - and opens no
+database, keychain or model.
 
 ---
 
@@ -281,8 +299,9 @@ strictly opt-in and only activates when you provide Turso credentials.
 
 The local database is encrypted with **aes256gcm** using a 256-bit key generated
 on first run and stored in the OS keychain (Windows Credential Manager). The file
-cannot be opened with a wrong key or no key at all. `/health` reports the live
-state as `encryptedAtRest`, and Settings shows it too.
+cannot be opened with a wrong key or no key at all. The `health` command reports the live
+state as `encryptedAtRest`, and Settings shows it too. There is no HTTP endpoint
+behind it - the Express route of that name went with the Node backend.
 
 > **Cloud sync and local encryption are mutually exclusive right now.** The Turso
 > sync engine has no local-file encryption — it only encrypts the cloud leg — so
@@ -304,11 +323,12 @@ state as `encryptedAtRest`, and Settings shows it too.
 
 **If encryption can't be turned on, Vessel says so.** When a key exists but the
 encrypted database cannot be decrypted with it — a rotated or lost keychain
-entry, a restored backup from another machine, a damaged file — the backend
-refuses to start rather than silently reopening your stories in plaintext. Your
+entry, a restored backup from another machine, a damaged file — the app
+refuses to open the database rather than silently reopening your stories in
+plaintext. Your
 existing data is left untouched and still encrypted, so recovering the original
 key recovers the stories. In the rarer case where no key can be stored at all
-(the OS keychain is unavailable), the app still runs, but `/health` reports *why*
+(the OS keychain is unavailable), the app still runs, but `health` reports *why*
 encryption is off and Settings shows a warning instead of a quiet "no".
 
 ---

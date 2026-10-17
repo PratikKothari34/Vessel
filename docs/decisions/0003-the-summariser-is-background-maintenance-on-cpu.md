@@ -133,3 +133,22 @@ llama-server — points 1 and 2 stand unchanged, and point 3 stands everywhere.
 
 Also amended by 0004: all of the above applies only when `SUMMARY_ENABLED=1`,
 which is no longer the default.
+
+### The shared-weights claim was unreachable until 2026-10-17
+
+The paragraph above describes what `llama_local.rs` does *inside* one instance,
+and it was true there - `Job::Generate` runs on the same worker over the same
+weights with its own KV sequence. It was **not** reachable through
+configuration. `engines()` built one backend per role, so
+`SUMMARIZER_BACKEND=llama-local` beside `INFERENCE_BACKEND=llama-local` started
+two workers and put **two copies of a 4.9 GB model on an 8 GB card** - the exact
+eviction this decision prices, arrived at by following the amendment that says
+it cannot happen. Nothing reported it: no error, no warning, only a throughput
+number that never improved.
+
+Fixed by resolving all three role *names* before building anything and sharing
+one `Arc<Backend>` between roles that name the same backend. Sharing is keyed on
+the name, not on config equality, so two roles naming one backend get one
+engine. Guarded by `two_roles_naming_one_backend_resolve_to_one_name` in
+`src-core/src/inference/mod.rs`, which is the 201 -> 202 step in the suite
+count. The amendment is now true in practice, not only in the engine.

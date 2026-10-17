@@ -256,7 +256,7 @@ design's own high-water mark) bounds how much of the backlog reaches the prompt.
 ## The 2,000-exchange A/B - the summary is off by default
 
 Everything above measures what the summariser *costs*. This measures what it
-*buys*. Decision: `docs/decisions/0004`.
+*buys*. Decision: `docs/decisions/0004-the-rolling-summary-is-off-by-default.md`.
 
 2,000 exchanges per arm, one character, one script, identical models, folding
 and retrieval on in both. 40 planted facts probed at +40, +180, +600 and +1400
@@ -403,7 +403,8 @@ collapses to 20% because float equality fails on rows that are bit-identical.
 0.97 sits mid-plateau, clear of both edges.
 
 Fixed on both tracks. Tests on both sides were verified to fail without the fix
-- 4 of 5 in `test/integration/memory-duplicates.test.js`, 3 of 4 in
+- 4 of 5 in `test/integration/memory-duplicates.test.js` (deleted with the Node
+backend on 2026-10-03; the Rust side is the live guard), 3 of 4 in
 `src-core/src/memory.rs`. The one that passes either way in each suite is the
 regression guard: two turns about one subject are still two memories, which is
 what stops the rule from costing more than the bug did.
@@ -631,46 +632,64 @@ tests were carried across and which were deleted, and why.
 > **Completed 2026-10-03.** The Node tier was removed outright, so the figures
 > below are the last measurements taken while both tracks existed. The 108
 > integration tests went with it, including the ~14 that drove the HTTP
-> perimeter; `npm test` is now 32 renderer-module tests and `cargo test
-> -p vessel-core` is the application's 201.
+> perimeter; `npm test` is now **65** renderer-module tests and `cargo test
+> -p vessel-core` is the application's **224** (both measured 2026-10-17; the
+> 32 this note first carried was never measured, and the 216 it carried next
+> was measured before the loop-3 pass added to both suites).
 
-Re-counted 2026-10-03, after the optimization, bug-fix and red-team passes
-below landed. The Rust figures are **after** the one-time `cargo fmt` pass,
-which splits long lines and so inflates every Rust row against the numbers this
-table carried before 2026-09-18; the Electron rows are unaffected. A Rust
-file's inline `#[cfg(test)]` module counts as test, not production, which is why
-`src-core/src` reads smaller here than `wc -l` over the same files.
+Rust column re-counted **2026-10-17**; the Electron column is frozen at its
+2026-10-03 measurement and cannot move again. The Rust figures are **after** the
+one-time `cargo fmt` pass, which splits long lines and so inflates every Rust
+row against the numbers this table carried before 2026-09-18; the Electron rows
+are unaffected. A Rust file's inline `#[cfg(test)]` module counts as test, not
+production, which is why `src-core/src` reads smaller here than `wc -l` over the
+same files.
 
 | Area | Electron track | Rust track | |
 |---|---|---|---|
-| backend / core, production only | 4,764 | 8,467 | [M] |
-| of which `inference/` | 862 | 3,118 | [M] |
-| shell (main + preload / Tauri) | 239 | 569 | [M] |
-| tests | 4,549 | 5,027 | [M] |
-| test count, default features | 269 | 201 | [M] |
-| renderer JS/JSX | 1,555 | shared, unchanged | [M] |
-| renderer CSS | 752 | shared, unchanged | [M] |
+| backend / core, production only | 4,764 | 8,504 | [M] |
+| of which `inference/` | 862 | 3,010 | [M] |
+| shell (main + preload / Tauri) | 239 | 629 | [M] |
+| tests | 4,549 | 5,810 | [M] |
+| test count, default features | 269 | 224 | [M] |
+| renderer JS/JSX | 1,555 | 1,766 shared | [M] |
+| renderer CSS | 752 | 853 shared | [M] |
+
+The renderer rows are no longer "shared, unchanged": the UI has been worked on
+since the Electron shell went, so the two columns are the same files measured on
+two different dates rather than one number serving both. The Rust test row
+counts `#[cfg(test)]` modules under `src-core/src` (4,225) plus `src-core/tests`
+(1,585).
 
 Rust is longer per unit of behaviour and that is the trade: explicit error
 types, no prototype chain to smuggle a key through, and a compiler that rejects
 the shape of bug the Node suite had to test for. The test counts are close
-because both suites cover the same behaviour; the Rust side folds 170 of its
-201 into the modules they test, so a failure names the function rather than an
+because both suites cover the same behaviour; the Rust side folds 193 of its
+224 into the modules they test, so a failure names the function rather than an
 endpoint. The Electron suite is the larger of the two because it also has to
 test a perimeter the Rust track does not have: 35 of its 269 are red-team tests
 against the HTTP surface.
 
 > **The Electron column is a historical measurement as of 2026-10-03**, taken
 > while both tracks existed. The Node tier has since been deleted: what remains
-> on that side is 32 renderer-module tests. The Rust column is current.
+> on that side is **65** renderer-module tests in 5 files. The Rust column is
+> current.
 
-"Default features" is load-bearing in that row. `src-core` carries 188 `#[test]`
-attributes in `src-core/src`, but 21 of them sit in
-`inference/llama_local.rs` behind `local-llama`, so a default `cargo test -p
-vessel-core` runs 170 from the library plus 31 from `src-core/tests/` - 201. The
-number only reaches 209 with `--features local-llama`, which needs llama.cpp
-present. Quoting the larger figure as the suite size would be a claim no plain
-checkout can reproduce.
+"Default features" is load-bearing in that row. `inference/llama_local.rs` sits
+behind `local-llama` and contributes nothing to a default run, so `cargo test -p
+vessel-core` runs **193** from the library plus 31 from `src-core/tests/` (15
+`chat_turn` + 16 `security`) - **224**, measured 2026-10-17 at the end of the
+loop-3 pass. The 31 in `src-core/tests/` has not moved since 2026-10-03; every
+step in this number has been a library test.
+
+**Do not re-derive this from `#[test]` attributes.** This paragraph previously
+read "188 attributes, 21 gated, so 170", and gave the feature total as 209; the
+memory note gave 221. A recount found 189 attributes (145 `#[test]` + 44
+`#[tokio::test]` - the old grep missed the tokio form), which still does not
+reach the 193 the runner executes. Every derived figure here has been wrong at
+least once. `cargo test -p vessel-core --lib -- --list` is the only answer that
+settles it, and the `--features local-llama` total has not been measured since
+2026-09-17.
 
 **Verified at runtime on 2026-09-30.** The shell was built and opened on this
 machine: window titled `Vessel` at 1294x882, the React bundle served from
@@ -999,10 +1018,12 @@ CUDA toolchain is only required when CUDA is wanted:
 Selecting `INFERENCE_BACKEND=llama-local` in a build without the feature is a
 startup error that says so, not a silent fallback. The feature build adds 21
 tests (the sampler, the emitter, and the parked-cache policy) and removes the
-one that asserts the backend is *absent*, so net +20 against the 201 the
-numbers table quotes - 221. That figure is counted from the `#[test]`
+one that asserts the backend is *absent*, so net +20 against the 216 the
+numbers table quotes - 222. That figure is counted from the `#[test]`
 attributes, not observed: running it needs llama.cpp built, which is why the
-table quotes the default-feature number as the suite size.
+table quotes the default-feature number as the suite size. Attribute counts in
+this file have been wrong before (see the numbers table) - treat 222 as
+unverified until a feature build is actually run.
 
 What it buys, and what it does not:
 

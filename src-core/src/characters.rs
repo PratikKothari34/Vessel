@@ -133,17 +133,14 @@ pub fn clean_list(a: Option<&Json>, max: usize, max_len: usize) -> Vec<String> {
 
 /// Read a stored JSON string array back, applying the same caps the write path
 /// applies. See [`row_to_character`] for why the read path re-cleans at all.
+/// Through [`clean_list`] rather than repeating its body: "the same caps the
+/// write path applies" has to stay true, and two copies of the same four
+/// combinators is how that stops being true. A non-array - or anything that is
+/// not valid JSON at all - lands on `clean_list`'s own empty case.
 fn parse_list(json: Option<&Json>, max: usize, max_len: usize) -> Vec<String> {
     let raw = json.and_then(Json::as_str).unwrap_or("[]");
-    match serde_json::from_str::<Json>(raw) {
-        Ok(Json::Array(a)) => a
-            .iter()
-            .map(|x| cap(x.as_str().unwrap_or("").trim(), max_len))
-            .filter(|s| !s.is_empty())
-            .take(max)
-            .collect(),
-        _ => Vec::new(),
-    }
+    let parsed = serde_json::from_str::<Json>(raw).ok();
+    clean_list(parsed.as_ref(), max, max_len)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -488,6 +485,45 @@ mod tests {
     }
 
     #[test]
+    fn the_name_cap_cannot_split_a_codepoint_or_a_surrogate_pair() {
+        // The open question this answers: can `cap` at CAP_NAME cut mid-UTF-8 or
+        // mid-surrogate? It cannot, and the reason is structural rather than
+        // lucky. `chars()` yields whole `char`s, so no byte-level cut exists to
+        // land badly; and a Rust `str` cannot hold a lone surrogate at all -
+        // serde_json rejects an unpaired \uD800 at parse time, and a paired one
+        // is already a single char here. The cases below are the ones that would
+        // expose a byte-slicing implementation.
+        let four_byte: String = "\u{1F600}".repeat(CAP_NAME + 40); // 4 bytes each
+        let out = cap(&four_byte, CAP_NAME);
+        assert_eq!(out.chars().count(), CAP_NAME);
+        assert_eq!(out.len(), CAP_NAME * 4, "no partial codepoint was kept");
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+
+        // A cut that lands exactly on a multi-byte char: 119 ASCII then an
+        // emoji, so byte 120 is the middle of the emoji.
+        let straddle = format!("{}\u{1F600}tail", "a".repeat(CAP_NAME - 1));
+        let out = cap(&straddle, CAP_NAME);
+        assert!(out.ends_with('\u{1F600}'), "got {out:?}");
+        assert_eq!(out.chars().count(), CAP_NAME);
+
+        // A surrogate pair cannot survive JSON as two halves, so the pair the
+        // JS original would have split is one char by the time it reaches here.
+        let v: Json = serde_json::from_str(r#""\ud83d\ude00""#).unwrap();
+        assert_eq!(v.as_str().unwrap().chars().count(), 1);
+        assert!(
+            serde_json::from_str::<Json>(r#""\ud83d""#).is_err(),
+            "an unpaired surrogate must not reach cap at all"
+        );
+
+        // Combining marks CAN be split - the cap counts codepoints, not
+        // graphemes - but a dangling mark is inert text, not a broken string.
+        let combining = "e\u{301}".repeat(CAP_NAME);
+        let out = cap(&combining, CAP_NAME);
+        assert_eq!(out.chars().count(), CAP_NAME);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
     fn lists_are_trimmed_deduped_of_blanks_and_bounded() {
         let out = clean_list(Some(&json!(["  a  ", "", "   ", "b", 7, null])), 12, 200);
         assert_eq!(out, vec!["a", "b"]);
@@ -495,6 +531,39 @@ mod tests {
         assert_eq!(clean_list(Some(&Json::Array(many)), 12, 40).len(), 12);
         assert_eq!(clean_list(Some(&json!("not an array")), 12, 40).len(), 0);
         assert_eq!(clean_list(None, 12, 40).len(), 0);
+    }
+
+    #[test]
+    fn a_stored_list_is_re_capped_on_the_way_out_not_trusted() {
+        // The read path does not trust the column: a row can arrive from the
+        // sync remote, from an older build, or from a restore, and these lists
+        // are rendered. `parse_list` goes through `clean_list` so the caps are
+        // one implementation rather than two that have to agree.
+        let over: Vec<String> = (0..50).map(|i| format!("t{i}")).collect();
+        let stored = serde_json::to_string(&over).unwrap();
+        let out = parse_list(Some(&json!(stored)), 12, 40);
+        assert_eq!(
+            out.len(),
+            12,
+            "a stored list longer than the cap got through"
+        );
+
+        let long = json!(serde_json::to_string(&["x".repeat(500)]).unwrap());
+        assert_eq!(
+            parse_list(Some(&long), 12, 40)[0].chars().count(),
+            40,
+            "a stored entry longer than the cap was not shortened"
+        );
+
+        // Trimming and blank-dropping are the write path's rules too.
+        let messy = json!(r#"["  a  ", "", "   ", "b", 7, null]"#);
+        assert_eq!(parse_list(Some(&messy), 12, 200), vec!["a", "b"]);
+
+        // Nothing usable reads as an empty list rather than failing the row.
+        for bad in [json!("not json at all"), json!(r#"{"a":1}"#), json!(7)] {
+            assert!(parse_list(Some(&bad), 12, 40).is_empty(), "{bad}");
+        }
+        assert!(parse_list(None, 12, 40).is_empty());
     }
 
     #[test]

@@ -1,5 +1,14 @@
-// Generates the icon set Tauri's bundler expects, from the same source art the
-// Electron icon was cut from. Run from app/ so sharp resolves: `node build/make-tauri-icons.mjs`.
+// Generates the icon set Tauri's bundler expects (`src-tauri/icons/`, listed in
+// tauri.conf.json) from the same source art in this directory.
+//
+// Step 2 of 2: `make-icon.mjs` cuts `icon.ico` + `icon.png` from the source
+// artwork first, and this copies/resizes them into the shape Tauri wants.
+//
+// ONE-SHOT ARTWORK TOOL - `sharp` is deliberately NOT a dependency of this repo
+// (nothing in the app needs an image pipeline at runtime or build time). Install
+// it ad hoc when the artwork actually changes:
+//   cd app && npm i --no-save sharp && node build/make-tauri-icons.mjs
+// The committed PNG/ICO outputs are what the build consumes, not this script.
 import sharp from 'sharp';
 import { mkdirSync, copyFileSync } from 'fs';
 import { dirname, join } from 'path';

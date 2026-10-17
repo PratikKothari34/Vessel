@@ -8,8 +8,11 @@
 #   cargo test -p vessel-core
 #   cargo clippy --workspace --all-targets
 #
-# Measured on that toolchain: 160 unit + 15 chat_turn + 16 security, all green,
-# and clippy silent across the workspace including src-tauri.
+# Verified on that toolchain: the whole suite green and clippy silent across the
+# workspace including src-tauri. The suite total is deliberately not restated
+# here - it moves every pass, this file is not where anyone looks for it, and the
+# figure that was here (160 unit) had rotted by 33. docs/MASTER.md carries the
+# measured number; ask the runner, never a comment.
 #
 # The blocks below exist only for the legacy `+stable-x86_64-pc-windows-gnu`
 # builds that predate the MSVC install. They are target-scoped, so they are inert

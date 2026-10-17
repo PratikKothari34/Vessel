@@ -53,6 +53,7 @@ use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value as Json};
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// One message in the outbound prompt.
 ///
@@ -307,6 +308,11 @@ fn build(kind: &str) -> Result<Backend> {
 /// A typo must not silently fall back to the default: `INFERENCE_BACKEND=llama`
 /// would then run the whole session on Ollama while the user believed otherwise,
 /// and the only symptom would be a performance number that never improved.
+/// Test-only since `engines()` started resolving names before building, so it
+/// can share one instance between roles. The tests keep it because what they
+/// pin is this function's contract: an unknown name is an error rather than a
+/// silent fallback to the default.
+#[cfg(test)]
 fn pick(var: &str, fallback: &str) -> Result<Backend> {
     let raw = std::env::var(var).unwrap_or_default();
     let key = raw.trim().to_ascii_lowercase();
@@ -323,9 +329,29 @@ fn pick(var: &str, fallback: &str) -> Result<Backend> {
 }
 
 struct Engines {
-    chat: Backend,
-    embedder: Backend,
-    summarizer: Backend,
+    chat: Arc<Backend>,
+    embedder: Arc<Backend>,
+    summarizer: Arc<Backend>,
+}
+
+/// Which backend name a role resolves to, without building it.
+///
+/// `build` is not free for every backend - the in-process engine resolves a
+/// GGUF and starts a worker that loads it - so the name has to be known before
+/// deciding whether a role needs its own instance at all.
+fn role_name(var: &str, fallback: &str) -> Result<String> {
+    let raw = std::env::var(var).unwrap_or_default();
+    let key = raw.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return Ok(fallback.to_string());
+    }
+    if !BACKENDS.contains(&key.as_str()) {
+        return Err(anyhow!(
+            "{var}=\"{raw}\" is not a known backend. Use one of: {}.",
+            BACKENDS.join(", ")
+        ));
+    }
+    Ok(key)
 }
 
 /// Built once. A bad backend name is a startup failure, not a per-request one,
@@ -335,17 +361,57 @@ fn engines() -> Result<&'static Engines> {
     ENGINES
         .get_or_init(|| {
             (|| {
+                // Resolve all three NAMES first, then build each distinct one
+                // once and share the handle.
+                //
+                // One instance per role was wrong for the in-process engine,
+                // and wrong in a way nothing reported: `LlamaLocal::from_env`
+                // starts its own worker thread that loads the GGUF, so
+                // `SUMMARIZER_BACKEND=llama-local` beside
+                // `INFERENCE_BACKEND=llama-local` put TWO copies of a 4.9 GB
+                // model on an 8 GB card. That is not a tuning problem, it is
+                // the configuration decision 0003's stage-4b amendment
+                // describes - "it holds exactly one model, so it chats and
+                // summarises off the same resident weights" - being
+                // unreachable in practice. `llama_local.rs` already does the
+                // right thing inside one instance (`Job::Generate` runs on the
+                // same worker, same weights, its own KV sequence); the sharing
+                // just has to reach it.
+                //
+                // Sharing by NAME rather than by config equality is deliberate.
+                // Two roles naming the same backend want the same engine; a
+                // role that wants different weights names a different backend,
+                // which is exactly how `SUMMARIZER_MODEL` is honoured on Ollama
+                // and ignored on the single-model backends.
+                let chat_name = role_name("INFERENCE_BACKEND", "ollama")?;
+                // Whatever chat is not responsible for stays where it was.
+                // Moving the embedder is an independent, separately verifiable
+                // step.
+                let embed_name = role_name("EMBED_BACKEND", "ollama")?;
+                // Same reasoning, plus one of its own: llama-server ignores
+                // the model argument, so pointing the summarizer at it
+                // silently replaces SUMMARIZER_MODEL with the chat model.
+                // Opt in deliberately or not at all.
+                let summ_name = role_name("SUMMARIZER_BACKEND", "ollama")?;
+
+                let chat = Arc::new(build(&chat_name)?);
+                let embedder = if embed_name == chat_name {
+                    Arc::clone(&chat)
+                } else {
+                    Arc::new(build(&embed_name)?)
+                };
+                let summarizer = if summ_name == chat_name {
+                    Arc::clone(&chat)
+                } else if summ_name == embed_name {
+                    Arc::clone(&embedder)
+                } else {
+                    Arc::new(build(&summ_name)?)
+                };
+
                 Ok(Engines {
-                    chat: pick("INFERENCE_BACKEND", "ollama")?,
-                    // Whatever chat is not responsible for stays where it was.
-                    // Moving the embedder is an independent, separately
-                    // verifiable step.
-                    embedder: pick("EMBED_BACKEND", "ollama")?,
-                    // Same reasoning, plus one of its own: llama-server ignores
-                    // the model argument, so pointing the summarizer at it
-                    // silently replaces SUMMARIZER_MODEL with the chat model.
-                    // Opt in deliberately or not at all.
-                    summarizer: pick("SUMMARIZER_BACKEND", "ollama")?,
+                    chat,
+                    embedder,
+                    summarizer,
                 })
             })()
             .map_err(|e: anyhow::Error| e.to_string())
@@ -363,11 +429,22 @@ pub fn chat() -> Result<&'static Backend> {
 /// Deliberately infallible and deliberately silent when the engines are not up:
 /// this is called from the delete path, and a backend that was never started is
 /// holding nothing to forget. All three roles are told rather than just `chat`,
-/// because each is its own instance and a deployment is free to point the
-/// summarizer at the in-process engine too; forgetting twice costs nothing.
+/// because a deployment is free to point the summarizer at the in-process
+/// engine too.
+///
+/// Roles that share one backend are now one `Arc`, so the duplicates are
+/// skipped by pointer rather than told the same thing three times. Forgetting
+/// twice was always harmless; not doing it is simply honest about how many
+/// engines there are.
 pub fn forget_conversation(conversation: &str) {
     let Ok(e) = engines() else { return };
+    let mut told: Vec<*const Backend> = Vec::with_capacity(3);
     for b in [&e.chat, &e.summarizer, &e.embedder] {
+        let ptr = Arc::as_ptr(b);
+        if told.contains(&ptr) {
+            continue;
+        }
+        told.push(ptr);
         b.forget_conversation(conversation);
     }
 }
@@ -466,6 +543,50 @@ mod tests {
                 .unwrap_or("err"),
             "llama-server"
         );
+    }
+
+    #[test]
+    fn two_roles_naming_one_backend_resolve_to_one_name() {
+        // `engines()` shares a single instance between roles whose names match,
+        // and this is the comparison it makes. It matters most for the
+        // in-process engine: a second `LlamaLocal` starts its own worker and
+        // loads the GGUF again, so two roles both naming `llama-local` used to
+        // put two copies of a 4.9 GB model on an 8 GB card. Decision 0003's
+        // stage-4b amendment describes exactly the opposite - one resident
+        // model serving both - so the sharing is the behaviour, not an
+        // optimization.
+        std::env::set_var("VESSEL_TEST_ROLE_A", "llama-local");
+        std::env::set_var("VESSEL_TEST_ROLE_B", "llama-local");
+        let a = role_name("VESSEL_TEST_ROLE_A", "ollama").expect("role a");
+        let b = role_name("VESSEL_TEST_ROLE_B", "ollama").expect("role b");
+        assert_eq!(a, b, "identical names must compare equal or nothing shares");
+
+        // An unset role takes the fallback, which is how the embedder stays on
+        // ollama while chat moves - the case that must NOT share, because
+        // llama-local cannot embed.
+        std::env::remove_var("VESSEL_TEST_ROLE_B");
+        let b = role_name("VESSEL_TEST_ROLE_B", "ollama").expect("role b unset");
+        assert_eq!(b, "ollama");
+        assert_ne!(a, b, "a moved role must not drag an unset one with it");
+
+        // Case and surrounding space are normalised, or two spellings of one
+        // backend would build it twice.
+        std::env::set_var("VESSEL_TEST_ROLE_B", "  Llama-Local  ");
+        assert_eq!(
+            role_name("VESSEL_TEST_ROLE_B", "ollama").expect("role b spaced"),
+            a
+        );
+
+        // And a typo is still an error here, not a silent fallback - this
+        // function is now the one that sees the raw value.
+        std::env::set_var("VESSEL_TEST_ROLE_B", "llama");
+        assert!(role_name("VESSEL_TEST_ROLE_B", "ollama")
+            .unwrap_err()
+            .to_string()
+            .contains("not a known backend"));
+
+        std::env::remove_var("VESSEL_TEST_ROLE_A");
+        std::env::remove_var("VESSEL_TEST_ROLE_B");
     }
 
     #[test]

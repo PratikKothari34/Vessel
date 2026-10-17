@@ -1,8 +1,12 @@
 //! Environment-derived configuration.
 //!
-//! Read once at startup and handed around, rather than re-read at each use, so
-//! there is a single place where a default lives and no chance of two callers
-//! disagreeing about what a variable meant.
+//! Each accessor reads its variable on every call, so a default lives in
+//! exactly one place and two callers cannot disagree about what a variable
+//! meant. Not cached, deliberately: nothing here sits on a per-turn path - the
+//! paths are startup, settings, and once per archived row - and a cache would
+//! only add a way for the process to disagree with its own environment. The
+//! per-turn knobs that DO need caching have it, in `memory::config`, which
+//! snapshots them into a `OnceLock` at first use.
 
 use std::env;
 use std::path::PathBuf;

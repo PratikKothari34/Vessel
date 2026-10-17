@@ -57,8 +57,12 @@ export default function Gallery({ characters, loading, onOpen, onNew, onEdit }) 
                 </p>
                 {c.tags && c.tags.length > 0 && (
                   <div className="card-tags">
-                    {c.tags.slice(0, 3).map((t) => (
-                      <span key={t} className="card-tag">{t}</span>
+                    {/* Keyed on position as well as text: nothing dedupes tags
+                        - the editor splits "rogue, rogue" into two entries and
+                        the core only trims and caps them - and two siblings
+                        with the same key make React drop one of them. */}
+                    {c.tags.slice(0, 3).map((t, i) => (
+                      <span key={`${i}-${t}`} className="card-tag">{t}</span>
                     ))}
                   </div>
                 )}

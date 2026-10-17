@@ -102,5 +102,13 @@ local-llama-cuda = ["local-llama", "llama-cpp-2/cuda"]
 name = "bench-local-llama"
 required-features = ["local-llama"]
 
+# The summariser A/B harness is NOT declared here, and is not in the repo. It
+# `include_str!`s a 1,000-turn prompt script whose content is deliberately
+# explicit, so the harness and its data are local-only (see .gitignore). An
+# [[example]] stanza naming an absent file fails manifest parsing for every
+# cargo command, not just `--examples`, so the stanza goes with the file.
+# What the runs established is written up in docs/MASTER.md and
+# docs/decisions/0003.
+
 [dev-dependencies]
 tempfile = "3"

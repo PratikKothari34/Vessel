@@ -308,6 +308,13 @@ fn complete_interrupted_migration(abs: &Path) {
     };
     if tmp_len == 0 {
         let _ = std::fs::remove_file(&tmp);
+        // Its sidecars go with it. The staging path is REUSED by the next
+        // migration, which opens a fresh empty database there - on top of
+        // another run's `-wal`/`-info` that would be read as corruption rather
+        // than as absence.
+        for suffix in ["-wal", "-info", "-changes", "-wal-revert"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", tmp.display()));
+        }
         return;
     }
 
@@ -1323,6 +1330,38 @@ mod tests {
         assert!(is_plaintext_db(&path).await, "the live file is untouched");
         let (db, _, _) = open_local(&path, Some(KEY_A)).await.unwrap();
         assert_eq!(names(&db.connect().unwrap()).await, vec!["Ada"]);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_staging_file_takes_its_sidecars_with_it() {
+        // A migration can die with `.encrypting` created but empty - the file
+        // is opened before a byte of it is written. That zero-length file is
+        // dropped, but the sidecars the driver had already laid down beside it
+        // are not, and the next migration stages to the SAME path: it opens a
+        // fresh empty database on top of another run's `-wal`/`-info`, which is
+        // the one state the driver reads as corruption rather than as absence.
+        // Both other branches of this function clear the staging sidecars; this
+        // one has to as well.
+        let (_dir, path) = scratch();
+        let disp = path.display().to_string();
+        let tmp = PathBuf::from(format!("{disp}.encrypting"));
+        seed_plaintext(&path, &[("a", "Ada")]).await;
+        std::fs::write(&tmp, b"").unwrap();
+        for suffix in ["-wal", "-info", "-changes", "-wal-revert"] {
+            std::fs::write(format!("{}{suffix}", tmp.display()), b"stale").unwrap();
+        }
+
+        complete_interrupted_migration(&path);
+
+        assert!(!tmp.exists(), "the empty staging file is dropped");
+        for suffix in ["-wal", "-info", "-changes", "-wal-revert"] {
+            let side = format!("{}{suffix}", tmp.display());
+            assert!(
+                !PathBuf::from(&side).exists(),
+                "a staging sidecar outlived its database: {side}"
+            );
+        }
+        assert!(is_plaintext_db(&path).await, "the live file is untouched");
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@ import Avatar from './Avatar.jsx';
 import MessageText from './MessageText.jsx';
 import MemoryInspector from './MemoryInspector.jsx';
 import { relTime } from '../lib/util';
+import { ownsStream } from '../lib/stream-owner.mjs';
 import './chat.css';
 
 // Recognize an inline OOC/director command: leading "//" or "/ooc ".
@@ -137,6 +138,11 @@ export default function Chat({ character, conversationId, onBack, onConversation
         if (meta.conversationId) {
           streamConvId = meta.conversationId;
           if (meta.conversationId !== convId) {
+            // Adopt the server-minted id on the ref SYNCHRONOUSLY. The effect
+            // that mirrors convId only runs after React commits, and a fast
+            // reply can finish before that - which would make the ownership
+            // check below disown the very first turn of a new scenario.
+            convIdRef.current = meta.conversationId;
             setConvId(meta.conversationId);
             onConversation && onConversation(meta.conversationId);
           }
@@ -145,8 +151,20 @@ export default function Chat({ character, conversationId, onBack, onConversation
       },
       onToken: (_t, full) => setStreamText(full),
       onDone: async (full) => {
+        // Abort does not detach the channel, so this can run after the user
+        // clicked another scenario. Everything below writes to the CURRENT
+        // view, while streamConvId is the one this reply was generated for:
+        // without the guard the text lands in the wrong transcript and the
+        // stale reload then overwrites it. Same rule as stopAndReload.
+        const mine = ownsStream(streamConvId, convIdRef.current);
         setStreaming(false);
         setStreamText('');
+        if (!mine) {
+          // Still refresh the rail: the reply WAS persisted, so the other
+          // scenario's preview and timestamp are now out of date.
+          refreshConversations();
+          return;
+        }
         // Optimistic append for a new reply (not regenerate, which updates the
         // existing bubble in place). Immediately reconciled by the reload below,
         // which carries authoritative variant ids/counts. The append is the
@@ -154,15 +172,21 @@ export default function Chat({ character, conversationId, onBack, onConversation
         if (!regenerate && full && full.trim()) {
           setMessages((m) => [...m, { role: 'assistant', content: full.trim() }]);
         }
-        if (streamConvId) await loadConversation(streamConvId);
+        await loadConversation(streamConvId);
         refreshConversations();
       },
       onError: (msg) => {
+        // As in onDone: a failure arriving after a scenario switch must not
+        // touch the view. The rollback below restores the array captured at
+        // send time, which is the OTHER conversation's history - applying it
+        // here put A's turns on screen under B's heading.
+        const mine = ownsStream(streamConvId, convIdRef.current);
         setStreaming(false);
         setStreamText('');
+        if (!mine) return;
         setError(msg);
         // The send failed, so nothing was recorded. Roll back the optimistic
-        // bubble and put the text back in the composer — otherwise the message
+        // bubble and put the text back in the composer - otherwise the message
         // is on screen as if it landed, and vanishes on the next reload with
         // the user's words already cleared from the input.
         if (!regenerate && (storyText || director)) {

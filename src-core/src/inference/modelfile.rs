@@ -93,6 +93,19 @@ fn take_blocks(text: &str, out: &mut Modelfile) -> String {
     }
 }
 
+/// Does `s` begin with `keyword`, ignoring ASCII case?
+///
+/// Compared as BYTES, not by slicing `&s[..keyword.len()]`. Every keyword here
+/// is ASCII, but a line is not: the Modelfile SYSTEM prose is full of em dashes
+/// and a line that STARTS with one puts a byte index in the middle of a
+/// character, and `str` indexing panics there rather than returning false. A
+/// hand-edited separator line (`-- a note`) was one keystroke from taking the
+/// whole process down, because `load()` runs inside a `OnceLock` at startup.
+fn starts_with_keyword(s: &str, keyword: &str) -> bool {
+    let (b, k) = (s.as_bytes(), keyword.as_bytes());
+    b.len() >= k.len() && b[..k.len()].eq_ignore_ascii_case(k)
+}
+
 /// Finds the next block directive opening at a line start. Returns the text
 /// before it, the uppercased key, and the text after the opening quotes.
 fn find_block_head(text: &str) -> Option<(&str, String, &str)> {
@@ -103,7 +116,7 @@ fn find_block_head(text: &str) -> Option<(&str, String, &str)> {
         let t = line.trim_start();
         let indent = line.len() - t.len();
         for key in ["SYSTEM", "TEMPLATE", "ADAPTER"] {
-            if t.len() < key.len() || !t[..key.len()].eq_ignore_ascii_case(key) {
+            if !starts_with_keyword(t, key) {
                 continue;
             }
             let after = &t[key.len()..];
@@ -167,7 +180,7 @@ pub fn parse(text: &str) -> Modelfile {
 
 /// `KEYWORD <value>` at a line start, case-insensitive, with at least one space.
 fn strip_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
-    if line.len() <= keyword.len() || !line[..keyword.len()].eq_ignore_ascii_case(keyword) {
+    if line.len() <= keyword.len() || !starts_with_keyword(line, keyword) {
         return None;
     }
     let rest = &line[keyword.len()..];
@@ -245,6 +258,37 @@ mod tests {
         assert_eq!(m.params.get("stop"), Some(&json!(["<eot>", "<end>"])));
         let m2 = parse("PARAMETER temperature 0.5\nPARAMETER temperature 0.9\n");
         assert_eq!(m2.params.get("temperature"), Some(&json!(0.9)));
+    }
+
+    /// A line that starts with a multi-byte character used to take the process
+    /// down, not fail to parse.
+    ///
+    /// Both scanners compared a keyword by slicing the line at the keyword's
+    /// BYTE length, and a line beginning with two em dashes puts byte 4
+    /// ("FROM".len()) inside the second one. `str` indexing panics there. The
+    /// real Modelfile is already full of em dashes, and `load()` runs inside a
+    /// `OnceLock` during startup - from `LlamaServer::from_env`, from the
+    /// banner, and from `prompt::global_behavior` - so one hand-edited
+    /// separator line would have killed the app before the window opened, with
+    /// a char-boundary panic as the only explanation.
+    #[test]
+    fn a_line_starting_with_a_multi_byte_character_parses_rather_than_panicking() {
+        // Reaches strip_keyword: the remainder, after the block is taken.
+        let after_block = parse(concat!(
+            "FROM m\n",
+            "SYSTEM \"\"\"Be in character.\"\"\"\n",
+            "\u{2014}\u{2014} a trailing note\n",
+        ));
+        assert_eq!(after_block.from.as_deref(), Some("m"));
+        assert_eq!(after_block.system.as_deref(), Some("Be in character."));
+
+        // Reaches find_block_head: four 2-byte characters put byte 6
+        // ("SYSTEM".len()) inside the fourth.
+        let first_scan = parse("\u{e9}\u{e9}\u{e9}\u{e9} note\nPARAMETER temperature 0.4\n");
+        assert_eq!(first_scan.params.get("temperature"), Some(&json!(0.4)));
+
+        // And a keyword still has to be a whole word, not a byte prefix of one.
+        assert!(parse("FROMAGE brie\n").from.is_none());
     }
 
     #[test]

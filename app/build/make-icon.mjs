@@ -5,7 +5,14 @@
 // crop tight (this drops the bottom UI-icon row and the bottom-right watermark) →
 // composite onto a dark rounded-square tile with a subtle radial glow → export.
 //
-// Run from repo root: node app/build/make-icon.mjs
+// Step 1 of 2: this writes `app/build/icon.ico` + `icon.png`; then
+// `make-tauri-icons.mjs` turns those into the `src-tauri/icons/` set that
+// tauri.conf.json actually lists.
+//
+// ONE-SHOT ARTWORK TOOL - `sharp` is deliberately NOT a dependency of this repo.
+// Install it ad hoc when the artwork changes:
+//   cd app && npm i --no-save sharp && node build/make-icon.mjs
+// The committed outputs are what the build consumes, not this script.
 import sharp from 'sharp';
 import fs from 'node:fs';
 import path from 'node:path';
