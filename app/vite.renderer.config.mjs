@@ -20,7 +20,13 @@ const here = dirname(fileURLToPath(import.meta.url));
    hash. */
 
 export default defineConfig({
-  root: resolve(here, 'src/renderer'),
+  // `ui/`, not the old `src/renderer/`. That two-level nesting was Electron's
+  // main-vs-renderer split; Electron went on 2026-10-03 and `src/` was left
+  // holding exactly one child, so the path said `src` twice to reach a leaf.
+  // Flattened 2026-10-17 - verified hash-neutral: `root` only tells vite where
+  // to resolve from, and every import inside the tree is relative to a sibling,
+  // so all four built artifacts hash identically across the move.
+  root: resolve(here, 'ui'),
 
   // Relative asset URLs. A release build loads the page from `tauri://
   // localhost`, a non-http origin where an absolute `/assets/...` resolves to

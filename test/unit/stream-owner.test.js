@@ -24,7 +24,7 @@ const assert = require('node:assert/strict');
 
 let ownsStream;
 test.before(async () => {
-  ({ ownsStream } = await import('../../app/src/renderer/src/lib/stream-owner.mjs'));
+  ({ ownsStream } = await import('../../app/ui/lib/stream-owner.mjs'));
 });
 
 test('a reply that lands while its own conversation is open is still owned', () => {

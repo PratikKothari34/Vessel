@@ -32,7 +32,7 @@ const assert = require('node:assert/strict');
 let hashHue, initials, relTime;
 test.before(async () => {
   ({ hashHue, initials, relTime } = await import(
-    '../../app/src/renderer/src/lib/util.js'
+    '../../app/ui/lib/util.js'
   ));
 });
 

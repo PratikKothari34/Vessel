@@ -254,7 +254,11 @@ Vessel/
 ├── src-tauri/              # the desktop shell: window + #[tauri::command]s
 ├── app/                    # React UI (Vite) — compiled into the Tauri binary
 │   ├── vite.renderer.config.mjs   # the only UI build
-│   └── src/renderer/src/   # React UI (Gallery, Chat, Editor, Settings, Memory)
+│   ├── build/              # one-shot icon tools; `sharp` installed ad hoc
+│   └── ui/                 # Gallery, Chat, Editor, Settings, Memory
+│       ├── index.html      # vite root entry
+│       ├── components/     # one .jsx + its .css per screen
+│       └── lib/            # the pure modules test/unit/ covers
 ├── test/                   # node:test over the renderer's pure modules
 │   ├── guard.mjs           # pre-test hook: never reach the real DB or keychain
 │   └── unit/               # 5 files, no dependencies

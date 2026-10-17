@@ -22,7 +22,7 @@ const { pathToFileURL } = require('node:url');
 const { test } = require('node:test');
 
 const API = pathToFileURL(
-  path.resolve(__dirname, '..', '..', 'app', 'src', 'renderer', 'src', 'lib', 'api.js')
+  path.resolve(__dirname, '..', '..', 'app', 'ui', 'lib', 'api.js')
 ).href;
 
 let seq = 0;

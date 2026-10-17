@@ -18,7 +18,7 @@ const assert = require('node:assert/strict');
 let toBlocks, splitLongBlock, tokenize;
 test.before(async () => {
   ({ toBlocks, splitLongBlock, tokenize } = await import(
-    '../../app/src/renderer/src/lib/prose.mjs'
+    '../../app/ui/lib/prose.mjs'
   ));
 });
 

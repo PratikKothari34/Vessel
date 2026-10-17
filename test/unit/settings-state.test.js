@@ -22,7 +22,7 @@ const assert = require('node:assert/strict');
 let privacyState, syncState;
 test.before(async () => {
   ({ privacyState, syncState } = await import(
-    '../../app/src/renderer/src/lib/settings-state.mjs'
+    '../../app/ui/lib/settings-state.mjs'
   ));
 });
 

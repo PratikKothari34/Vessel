@@ -26,7 +26,7 @@ No Node, no sidecar, no N-API addons, no loopback HTTP.
   moment the backend is Rust. Costs ~250 MB of shell and ~150 MB RAM for
   nothing on the generation path.
 - **React Native Windows. Rejected.** No DOM — ~1,975 lines of JSX and CSS
-  would be rewritten. `app/src/renderer/src/lib/api.js:75` streams with
+  would be rewritten. `app/ui/lib/api.js:75` streams with
   `res.body.getReader()`, which RN's fetch does not implement. Spawning the
   backend needs a hand-written C++/C# native module. Its only performance
   argument is native text rendering, worth microseconds against a ~25 ms
