@@ -28,8 +28,10 @@ pub struct Modelfile {
 }
 
 /// The repo root, relative to the compiled crate. `CARGO_MANIFEST_DIR` is
-/// `src-core`, so the Modelfile sits one level up - the same file the Electron
-/// build reads from three levels up its own tree.
+/// `src-core`, so the Modelfile sits one level up. This is an ASSEMBLED path:
+/// it never appears as a literal anywhere, so a search for "Modelfile" beside
+/// a directory name will not find it. Moving this crate moves what `parent()`
+/// means, and nothing but a run would say so.
 fn default_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

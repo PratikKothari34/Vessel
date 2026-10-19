@@ -280,15 +280,16 @@ them.
 
 ```bash
 cargo test -p vessel-core     # 224 tests — the application
-npm test                      # 65 tests — the renderer's pure modules
+npm test                      # 70 tests — the renderer's pure modules
 ```
 
 `cargo test` covers the data layer, memory and retrieval, chat assembly,
 the inference adapters, and a security suite that drives the real code paths;
 every test that touches storage gets its own temporary database. `npm test`
-covers the five renderer modules with logic worth asserting on - prose
+covers the six renderer modules with logic worth asserting on - prose
 tokenizing, the settings state machine, the IPC transport, the shared view
-helpers, and which conversation a finished stream belongs to - and opens no
+helpers, which conversation a finished stream belongs to, and every
+cross-directory path the repo assembles rather than writes out - and opens no
 database, keychain or model.
 
 ---
@@ -296,8 +297,10 @@ database, keychain or model.
 ## Privacy
 
 Everything is local by default: the LLM, the database, the conversations. No
-telemetry, no external calls except to your own Ollama instance. Cloud sync is
-strictly opt-in and only activates when you provide Turso credentials.
+telemetry, and the only network call is to whichever model host you point it
+at on your own machine - Ollama, a local llama-server, or none at all when
+llama.cpp runs in-process. Cloud sync is strictly opt-in and only activates
+when you provide Turso credentials.
 
 ### Encryption at rest
 
